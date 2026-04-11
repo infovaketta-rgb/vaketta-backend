@@ -1,0 +1,1 @@
+{"version":3,"file":"shouldAutoReply.d.ts","sourceRoot":"","sources":["../../src/automation/shouldAutoReply.ts"],"names":[],"mappings":"AAAA,MAAM,MAAM,aAAa,GAAG,KAAK,GAAG,KAAK,GAAG,OAAO,CAAC;AAEpD,wBAAgB,eAAe,CAC7B,MAAM,EAAE;IACN,gBAAgB,EAAE,OAAO,CAAC;IAC1B,iBAAiB,EAAE,MAAM,CAAC;IAC1B,eAAe,EAAE,MAAM,CAAC;IACxB,QAAQ,EAAE,MAAM,CAAC;CAClB,EACD,kBAAkB,EAAE,OAAO,GAC1B,aAAa,CAuBf"}

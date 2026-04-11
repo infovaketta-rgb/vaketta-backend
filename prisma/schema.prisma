@@ -1,0 +1,410 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Plan {
+  id                      String    @id @default(uuid())
+  name                    String
+  currency                String    @default("USD") // ISO 4217, e.g. "USD", "EUR", "INR"
+  priceMonthly            Int       // in minor units (cents/paise), e.g. 4900 = $49/mo
+  conversationLimit       Int       // 0 = unlimited
+  aiReplyLimit            Int       // 0 = unlimited
+  extraConversationCharge Int       @default(0) // minor units per extra conversation
+  extraAiReplyCharge      Int       @default(0) // minor units per extra AI reply
+  isActive                Boolean   @default(true)
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  hotels            Hotel[]
+  subscriptions     Subscription[]
+}
+
+model Subscription {
+  id                      String    @id @default(uuid())
+  hotelId                 String
+  planId                  String?                   // soft ref — plan may be updated later
+  planName                String                    // snapshot at assignment time
+  currency                String    @default("USD") // snapshot
+  price                   Int                       // snapshot in minor units
+  conversationLimit       Int                       // snapshot
+  aiReplyLimit            Int                       // snapshot
+  extraConversationCharge Int       @default(0)     // snapshot in minor units
+  extraAiReplyCharge      Int       @default(0)     // snapshot in minor units
+  startDate               DateTime
+  endDate                 DateTime?
+  createdAt               DateTime  @default(now())
+
+  hotel             Hotel     @relation(fields: [hotelId], references: [id])
+  plan              Plan?     @relation(fields: [planId], references: [id])
+}
+
+model UsageRecord {
+  id                String    @id @default(uuid())
+  hotelId           String
+  month             String    // "YYYY-MM", e.g. "2026-04"
+  conversationsUsed Int       @default(0)
+  aiRepliesUsed     Int       @default(0)
+  updatedAt         DateTime  @updatedAt
+
+  hotel             Hotel     @relation(fields: [hotelId], references: [id])
+
+  @@unique([hotelId, month])
+  @@index([month])
+}
+
+model Hotel {
+  id           String   @id @default(uuid())
+  name         String
+  phone        String   @unique  // THIS is the tenant key / WhatsApp number
+  apiKey       String?  @unique
+  // profile fields
+  location     String?
+  email        String?
+  description  String?
+  checkInTime  String   @default("14:00")
+  checkOutTime String   @default("11:00")
+  website      String?
+  // billing
+  planId              String?
+  subscriptionStatus  String    @default("trial")  // "active" | "trial" | "expired"
+  billingStartDate    DateTime?
+  billingEndDate      DateTime?
+  createdAt    DateTime @default(now())
+
+  guests               Guest[]
+  bookings             Booking[]
+  messages             Message[]
+  roomTypes            RoomType[]
+  users                User[]
+  conversationSessions ConversationSession[]
+  subscriptions        Subscription[]
+  usageRecords         UsageRecord[]
+  flowDefinitions      FlowDefinition[]
+  inventory            RoomInventory[]
+
+  plan   Plan?       @relation(fields: [planId], references: [id])
+  config HotelConfig?
+  menu   HotelMenu?
+}
+
+model HotelConfig {
+  id                String   @id @default(uuid())
+  hotelId           String   @unique
+
+  autoReplyEnabled      Boolean  @default(true)
+  bookingEnabled        Boolean  @default(true)
+  availabilityEnabled   Boolean  @default(false)
+  bookingFlowId         String?  // when set, custom flow handles BOOKING menu items
+  menuFlowId            String?  // when set, this flow IS the main menu (replaces hardcoded buildMenuMessage)
+  aiEnabled             Boolean  @default(false)  // AI fallback for unrecognised guest messages
+  businessStartHour Int      @default(9)
+  businessEndHour   Int      @default(21)
+  defaultLanguage   String   @default("en")
+  timezone          String   @default("UTC")
+  welcomeMessage    String   @default("👋 Thanks for contacting us! Our team will assist you shortly.")
+  nightMessage      String   @default("🌙 We're currently outside business hours. We'll get back to you when we open!")
+  botMessages       Json     @default("{}")
+
+  // WhatsApp / Meta credentials (per-hotel)
+  metaPhoneNumberId String?   // Meta Phone Number ID from developer console
+  metaAccessToken   String?   // Permanent system user access token
+  metaWabaId        String?   // WhatsApp Business Account ID
+  metaVerifyToken   String?   // Webhook verify token (set in Meta dashboard)
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  hotel             Hotel    @relation(fields: [hotelId], references: [id])
+}
+
+model HotelMenu {
+  id        String   @id @default(uuid())
+  hotelId   String  
+
+  title     String   @default("How can we help you?")
+  isActive  Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  
+  hotel     Hotel    @relation(fields: [hotelId], references: [id])
+  items     HotelMenuItem[]
+
+  @@unique([hotelId])
+}
+
+model HotelMenuItem {
+  id        String   @id @default(uuid())
+  menuId    String
+
+  key       String   // "1", "2", "ROOM", etc
+  label     String   // shown in menu
+  replyText String   // automated reply / opening message
+  type      String   @default("INFO")  // INFO | BOOKING | ENQUIRY | FLOW
+  order     Int
+  isActive  Boolean  @default(true)
+  flowId    String?
+  flow      FlowDefinition? @relation(fields: [flowId], references: [id], onDelete: SetNull)
+
+  menu      HotelMenu @relation(fields: [menuId], references: [id])
+
+  @@index([key])
+}
+
+model ConversationSession {
+  id        String   @id @default(uuid())
+  guestId   String
+  hotelId   String
+  state     String   @default("IDLE")  // IDLE | AWAITING_SELECTION | BOOKING_NAME | BOOKING_ROOM | BOOKING_CHECKIN | BOOKING_CHECKOUT | BOOKING_CONFIRM | ENQUIRY_OPEN
+  data      Json     @default("{}")    // partial booking data collected so far
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  guest Guest @relation(fields: [guestId], references: [id], onDelete: Cascade)
+  hotel Hotel @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+
+  @@unique([guestId, hotelId])
+  @@index([hotelId, state])      // find all active sessions for a hotel
+  @@index([updatedAt])           // session expiry sweep
+}
+
+
+model Guest {
+  id        String   @id @default(uuid())
+  name      String?
+  phone     String
+  createdAt DateTime @default(now())
+
+  lastHandledByStaff Boolean @default(false)
+
+  hotelId String
+  hotel   Hotel  @relation(fields: [hotelId], references: [id])
+
+  bookings             Booking[]
+  messages             Message[]
+  conversationSessions ConversationSession[]
+
+  @@unique([phone, hotelId])
+}
+
+
+enum BookingStatus {
+  PENDING
+  HOLD
+  CONFIRMED
+  CANCELLED
+}
+
+model Booking {
+  id        String   @id @default(uuid())
+  guestName String
+  checkIn   DateTime
+  checkOut  DateTime
+  status    BookingStatus @default(PENDING)
+
+
+  // 🔑 pricing
+  pricePerNight Int        // editable override
+  advancePaid   Int
+  totalPrice    Int
+
+  hotelId String
+  guestId String
+  roomTypeId String
+
+  hotel Hotel @relation(fields: [hotelId], references: [id])
+  guest Guest @relation(fields: [guestId], references: [id])
+  roomType RoomType @relation(fields: [roomTypeId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([hotelId, status])     // dashboard + booking list queries
+  @@index([guestId])             // guest booking history
+  @@index([checkIn, checkOut])   // availability overlap queries
+}
+
+
+
+model RoomType {
+  id          String      @id @default(uuid())
+  name        String
+  description String?
+  amenities   String[]
+  basePrice   Int
+  capacity    Int?        // total guests (adults + children)
+  maxAdults   Int?        // max adults allowed
+  maxChildren Int?        // max children allowed
+  totalRooms  Int         @default(1)
+  hotelId     String
+
+  hotel     Hotel          @relation(fields: [hotelId], references: [id])
+  bookings  Booking[]
+  photos    RoomPhoto[]
+  inventory RoomInventory[]
+
+  createdAt DateTime @default(now())
+
+  @@index([hotelId])
+}
+
+model RoomPhoto {
+  id         String   @id @default(uuid())
+  url        String
+  order      Int      @default(0)
+  roomTypeId String
+  createdAt  DateTime @default(now())
+
+  roomType   RoomType @relation(fields: [roomTypeId], references: [id], onDelete: Cascade)
+
+  @@index([roomTypeId])
+}
+
+model RoomInventory {
+  id             String   @id @default(uuid())
+  hotelId        String
+  roomTypeId     String
+  date           DateTime @db.Date            // date-only, stored as UTC midnight
+  availableRooms Int                          // staff-set count for this date (0 = closed)
+  price          Int?                         // null = inherit basePrice from RoomType
+
+  hotel    Hotel    @relation(fields: [hotelId],    references: [id], onDelete: Cascade)
+  roomType RoomType @relation(fields: [roomTypeId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([roomTypeId, date])
+  @@index([hotelId, date])
+}
+
+
+
+enum MessageStatus {
+  PENDING
+  SENT
+  DELIVERED
+  RECEIVED
+  FAILED
+  READ
+}
+
+
+model Message {
+  id          String   @id @default(uuid())
+  direction   String // "IN" | "OUT"
+  fromPhone   String
+  toPhone     String
+  body        String?
+  messageType String // text, image, video, audio, document
+  mediaUrl    String?  // local path served by /uploads or external URL
+  mimeType    String?  // e.g. "image/jpeg", "video/mp4", "audio/ogg"
+  fileName    String?  // original filename, used for documents
+  wamid       String?  // Meta's message ID — used to map status webhooks
+  timestamp   DateTime @default(now())
+
+  status      MessageStatus @default(PENDING)
+
+  handledAt DateTime?
+
+  hotelId String
+  guestId String?
+
+  hotel Hotel  @relation(fields: [hotelId], references: [id])
+  guest Guest? @relation(fields: [guestId], references: [id])
+
+  @@index([wamid])               // status webhook lookup by Meta message ID
+  @@index([guestId, timestamp])  // conversation history queries (most common read)
+  @@index([hotelId, direction])  // filter IN/OUT per hotel
+  @@index([fromPhone])
+  @@index([toPhone])
+  @@index([hotelId])
+  @@index([status])
+}
+
+// Visual WhatsApp bot conversation flow definition
+model FlowDefinition {
+  id          String   @id @default(uuid())
+  hotelId     String?  // null = global template (Vaketta admin-created)
+  name        String
+  description String?
+  nodes       Json     @default("[]")
+  edges       Json     @default("[]")
+  isActive    Boolean  @default(true)
+  isTemplate  Boolean  @default(false)  // true = global template visible to all hotels
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  hotel     Hotel?          @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  menuItems HotelMenuItem[]
+
+  @@index([hotelId])
+  @@index([isTemplate])
+}
+
+// Platform-wide privacy policy (singleton — only one row ever exists)
+model PrivacyPolicy {
+  id            String   @id @default("global")  // always "global"
+  effectiveDate String   @default("")             // display string, e.g. "April 11, 2026"
+  content       String   @default("")             // HTML body of the policy
+  updatedAt     DateTime @updatedAt
+}
+
+// Platform-wide trial defaults (singleton — only one row ever exists)
+model TrialConfig {
+  id                    String   @id @default("global")  // always "global"
+  durationDays          Int      @default(14)
+  conversationLimit     Int      @default(500)           // 0 = unlimited
+  aiReplyLimit          Int      @default(200)           // 0 = unlimited
+  autoStartOnCreate     Boolean  @default(true)          // give new hotels a trial immediately
+  trialMessage          String   @default("You are on a free trial. Upgrade to a paid plan to continue after the trial ends.")
+  updatedAt             DateTime @updatedAt
+}
+
+// Vaketta platform-level admins — completely separate from hotel staff
+model VakettaAdmin {
+  id        String           @id @default(uuid())
+  name      String
+  email     String           @unique
+  password  String
+  role      VakettaAdminRole @default(ADMIN)
+  createdAt DateTime         @default(now())
+}
+
+enum VakettaAdminRole {
+  SUPER_ADMIN
+  ADMIN
+  SUPPORT
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  MANAGER
+  STAFF
+}
+
+model User {
+  id        String   @id @default(uuid())
+  name      String
+  email     String   @unique
+  password  String
+  role      UserRole @default(STAFF)
+  isActive  Boolean  @default(true)
+
+  hotelId   String
+  hotel     Hotel @relation(fields:[hotelId],references:[id])
+
+  createdAt DateTime @default(now())
+}
