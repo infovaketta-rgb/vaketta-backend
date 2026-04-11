@@ -66,7 +66,7 @@
 
     "jsonwebtoken": "^9.0.3",
 
-    "killnode": "taskkill /IM node.exe /F",
+    
 
     "multer": "^2.1.1",
 
