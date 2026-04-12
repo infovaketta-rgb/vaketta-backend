@@ -14,42 +14,38 @@ export async function getConversations(req: Request, res: Response) {
     }
 
     const guests = await prisma.guest.findMany({
-      where: {
-        hotelId: hotelId,
-      },
+      where: { hotelId },
       include: {
         messages: {
           orderBy: { timestamp: "desc" },
           take: 1,
         },
+        _count: {
+          select: {
+            messages: {
+              where: {
+                direction: "IN",
+                status: MessageStatus.RECEIVED,
+              },
+            },
+          },
+        },
       },
     });
 
-    const result = await Promise.all(
-      guests.map(async (guest) => {
-        const lastMessage = guest.messages[0];
-
-        const unreadCount = await prisma.message.count({
-          where: {
-            hotelId: hotelId,
-            guestId: guest.id,
-            direction: "IN",
-            status: MessageStatus.RECEIVED,
-          },
-        });
-
-        return {
-          guestId: guest.id,
-          phone: guest.phone,
-          lastHandledByStaff: guest.lastHandledByStaff,
-          lastMessage: lastMessage?.body ?? null,
-          lastMessageType: lastMessage?.messageType ?? null,
-          lastDirection: lastMessage?.direction ?? null,
-          lastTimestamp: lastMessage?.timestamp ?? null,
-          unreadCount,
-        };
-      })
-    );
+    const result = guests.map((guest) => {
+      const lastMessage = guest.messages[0];
+      return {
+        guestId: guest.id,
+        phone: guest.phone,
+        lastHandledByStaff: guest.lastHandledByStaff,
+        lastMessage: lastMessage?.body ?? null,
+        lastMessageType: lastMessage?.messageType ?? null,
+        lastDirection: lastMessage?.direction ?? null,
+        lastTimestamp: lastMessage?.timestamp ?? null,
+        unreadCount: guest._count.messages,
+      };
+    });
 
     // ✅ Sort by latest message timestamp — newest first
     result.sort((a, b) => {

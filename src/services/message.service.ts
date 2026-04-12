@@ -154,8 +154,8 @@ export async function sendManualReply(input: {
 
   try {
     const result = await sendTextMessage({ toPhone, fromPhone, hotelId, guestId, text });
-    console.log("[Meta] sendTextMessage result:", JSON.stringify(result));
     wamid = (result as any)?.messages?.[0]?.id ?? undefined;
+    console.log("[Meta] Message sent, wamid:", wamid ?? "unknown");
     finalStatus = MessageStatus.SENT;
   } catch (err) {
     console.error("[Meta] sendTextMessage error:", err);

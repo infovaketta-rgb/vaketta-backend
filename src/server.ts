@@ -1,12 +1,12 @@
+// ⚠️  loadEnv MUST be first — populates process.env before any other module reads it
+import "./loadEnv";
+
 import http from "http";
-import dotenv from "dotenv";
 import { initSocket } from "./socket";
 import app from "./app";
 import { subscribeMessageStatus } from "./realtime/statusBus";
 import { emitToHotel } from "./realtime/emit";
 import prisma from "./db/connect";
-
-dotenv.config();
 
 // ── Startup environment validation ────────────────────────────────────────────
 

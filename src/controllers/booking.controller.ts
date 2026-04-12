@@ -74,20 +74,16 @@ export async function updateBookingStatus(req: Request, res: Response) {
       return res.status(400).json({ error: `status must be one of: ${validStatuses.join(", ")}` });
     }
 
-    const booking = await prisma.booking.findFirst({
-      where: { id: bookingId, hotelId },
-    });
-
-    if (!booking) {
-      return res.status(404).json({ error: "Booking not found" });
-    }
-
-    const updated = await prisma.booking.update({
+    const result = await prisma.booking.updateMany({
       where: { id: bookingId, hotelId },
       data: { status },
     });
 
-    res.json(updated);
+    if (result.count === 0) {
+      return res.status(404).json({ success: false, message: "Booking not found or unauthorized" });
+    }
+
+    return res.json({ success: true });
   } catch (err) {
     console.error("Update booking status failed:", err);
     res.status(500).json({ error: "Failed to update status" });

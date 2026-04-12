@@ -9,7 +9,11 @@ import crypto from "crypto";
 export function verifyWebhookSignature(req: Request, res: Response, next: NextFunction) {
   const appSecret = process.env.WHATSAPP_APP_SECRET;
   if (!appSecret) {
-    console.warn("⚠️  WHATSAPP_APP_SECRET not set — skipping webhook signature verification");
+    if (process.env.NODE_ENV === "production") {
+      console.error("❌ WHATSAPP_APP_SECRET not set in production — rejecting webhook");
+      return res.status(500).json({ error: "Webhook verification unavailable" });
+    }
+    console.warn("⚠️  WHATSAPP_APP_SECRET not set — skipping webhook signature verification (dev only)");
     return next();
   }
 

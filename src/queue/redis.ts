@@ -1,9 +1,11 @@
 import { Redis } from "ioredis";
 
-const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-
 function createRedis(label: string): Redis {
-  const client = new Redis(REDIS_URL, {
+  // Read at call time (not module load time) so dotenv has already run.
+  const url = process.env.REDIS_URL;
+  if (!url) throw new Error("REDIS_URL environment variable is not set");
+
+  const client = new Redis(url, {
     maxRetriesPerRequest: null,           // required by BullMQ
     enableReadyCheck:     false,          // don't block until Redis is ready
     lazyConnect:          false,
