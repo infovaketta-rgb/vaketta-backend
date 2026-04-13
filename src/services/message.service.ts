@@ -17,6 +17,7 @@ type IncomingMessageInput = {
   mediaUrl?:   string | null;
   mimeType?:   string | null;
   fileName?:   string | null;
+  wamid?:      string | null;
   /** Channel this message arrived on. Defaults to "whatsapp". Future: "instagram" | "call" */
   channel?: string;
 };
@@ -31,7 +32,7 @@ type IncomingMessageResult = {
 export async function logIncomingMessage(
   input: IncomingMessageInput
 ): Promise<IncomingMessageResult> {
-  const { fromPhone, toPhone, body, messageType, mediaUrl, mimeType, fileName } = input;
+  const { fromPhone, toPhone, body, messageType, mediaUrl, mimeType, fileName, wamid } = input;
 
   // ── 1. Find hotel ────────────────────────────────────────────────────────────
   const hotel = await prisma.hotel.findUnique({
@@ -39,6 +40,14 @@ export async function logIncomingMessage(
     include: { config: true },
   });
   if (!hotel) throw new Error(`Hotel not found for phone ${toPhone}`);
+
+  // ── Deduplication: Meta re-delivers webhooks on timeout — skip if already seen ─
+  if (wamid) {
+    const existing = await prisma.message.findFirst({ where: { wamid, hotelId: hotel.id } });
+    if (existing) {
+      return { hotelId: hotel.id, guestId: existing.guestId!, autoReply: false, autoReplyMessage: null };
+    }
+  }
 
   // ── 2. Find or create guest (per-hotel scope) ────────────────────────────────
   const guest = await prisma.guest.upsert({
@@ -61,6 +70,7 @@ export async function logIncomingMessage(
       hotelId:     hotel.id,
       guestId:     guest.id,
       status:      MessageStatus.RECEIVED,
+      ...(wamid ? { wamid } : {}),
     },
   });
 

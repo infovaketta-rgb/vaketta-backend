@@ -86,7 +86,8 @@ async function showMenu(
 
   if (menuFlowId) {
     const flow = await prisma.flowDefinition.findUnique({ where: { id: menuFlowId } });
-    const startNode = (flow?.nodes as any[] | undefined)?.find((n: any) => n.type === "start");
+    const nodes = Array.isArray(flow?.nodes) ? (flow!.nodes as any[]) : [];
+    const startNode = nodes.find((n: any) => n.type === "start");
     if (flow?.isActive && startNode) {
       const initState = `FLOW:${flow.id}:${startNode.id}`;
       const initData: SessionData = { flow: { flowId: flow.id, flowVars: {} } };
@@ -164,7 +165,8 @@ async function handleSelection(
 
     if (flowId) {
       const flow = await prisma.flowDefinition.findUnique({ where: { id: flowId } });
-      const startNode = (flow?.nodes as any[] | undefined)?.find((n: any) => n.type === "start");
+      const nodes = Array.isArray(flow?.nodes) ? (flow!.nodes as any[]) : [];
+      const startNode = nodes.find((n: any) => n.type === "start");
       if (flow?.isActive && startNode) {
         const initState = `FLOW:${flow.id}:${startNode.id}`;
         const initData: SessionData = { flow: { flowId: flow.id, flowVars: {} } };
@@ -186,7 +188,8 @@ async function handleSelection(
       return showMenu(hotelId, guestId, sessionData, input);
     }
     const flow = await prisma.flowDefinition.findUnique({ where: { id: item.flowId } });
-    const startNode = (flow?.nodes as any[] | undefined)?.find((n: any) => n.type === "start");
+    const nodes = Array.isArray(flow?.nodes) ? (flow!.nodes as any[]) : [];
+    const startNode = nodes.find((n: any) => n.type === "start");
     if (!flow?.isActive || !startNode) {
       await resetSession(guestId, hotelId);
       return showMenu(hotelId, guestId, sessionData, input);

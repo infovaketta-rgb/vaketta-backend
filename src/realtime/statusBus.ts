@@ -29,10 +29,11 @@ export function publishMessageStatus(payload: StatusUpdatePayload): void {
     .catch((err) => console.error("❌ [StatusBus] Publish error:", err));
 }
 
-/** Called once from the main server process at startup. */
+/** Called once from the main server process at startup.
+ *  Returns a cleanup function — call it during graceful shutdown. */
 export function subscribeMessageStatus(
   onUpdate: (payload: StatusUpdatePayload) => void
-): void {
+): () => void {
   const sub = createRedisClient("status-sub");
   sub.subscribe(CHANNEL, (err) => {
     if (err) console.error("❌ [StatusBus] Subscribe error:", err);
@@ -44,4 +45,5 @@ export function subscribeMessageStatus(
       console.warn("⚠️  [StatusBus] Invalid payload:", raw);
     }
   });
+  return () => { sub.quit().catch(() => {}); };
 }

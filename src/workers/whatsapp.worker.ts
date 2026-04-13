@@ -8,7 +8,7 @@ import "./billing.worker"; // Start billing expiry cron alongside this worker
 
 console.log("🚀 WhatsApp worker booting...");
 
-new Worker(
+const worker = new Worker(
   "whatsapp-out",
   async (job) => {
     const { messageId } = job.data;
@@ -78,3 +78,12 @@ new Worker(
     concurrency: 5,
   }
 );
+
+// Log permanently failed jobs so they are never silently dropped
+worker.on("failed", (job, err) => {
+  console.error(`❌ [Worker] Job ${job?.id} exhausted all retries — messageId: ${job?.data?.messageId}`, err);
+});
+
+worker.on("error", (err) => {
+  console.error("❌ [Worker] Worker error:", err);
+});

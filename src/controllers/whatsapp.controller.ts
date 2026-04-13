@@ -76,6 +76,7 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
     const fromPhone   = normalizePhone(rawFrom);
     const toPhone     = normalizePhone(rawTo);
     const messageType = (message.type as string) || "text";
+    const wamid       = (message.id as string | undefined) ?? null;
 
     // Extract text body (text messages) or caption (media messages)
     const body = message.text?.body ?? message[messageType]?.caption ?? null;
@@ -90,6 +91,7 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
       const downloaded = await downloadMetaMedia(
         mediaInfo.mediaId,
         mediaInfo.mimeType,
+        toPhone,
         mediaInfo.fileName ?? undefined
       );
       if (downloaded) {
@@ -104,7 +106,7 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
       }
     }
 
-    await logIncomingMessage({ fromPhone, toPhone, body, messageType, mediaUrl, mimeType, fileName });
+    await logIncomingMessage({ fromPhone, toPhone, body, messageType, mediaUrl, mimeType, fileName, wamid });
 
     return res.sendStatus(200);
   } catch (err) {

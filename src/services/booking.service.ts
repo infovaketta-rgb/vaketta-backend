@@ -102,6 +102,10 @@ export async function createBookingService({
 const checkInDate = new Date(checkIn);
 const checkOutDate = new Date(checkOut);
 
+if (isNaN(checkInDate.getTime()) || isNaN(checkOutDate.getTime())) {
+  throw new Error("Invalid check-in or check-out date");
+}
+
 if (checkOutDate <= checkInDate) {
   throw new Error("Check-out must be after check-in");
 }

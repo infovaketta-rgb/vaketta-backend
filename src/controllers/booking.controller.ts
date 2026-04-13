@@ -120,18 +120,17 @@ export async function getBookingSummary(req: Request, res: Response) {
   try {
     const hotelId = (req as any).user.hotelId;
 
-    const bookings = await prisma.booking.findMany({
-      where: { hotelId, status: BookingStatus.CONFIRMED },
-    });
-
-    const totalRevenue = bookings.reduce(
-      (sum, b) => sum + b.totalPrice,
-      0
-    );
+    const [count, agg] = await Promise.all([
+      prisma.booking.count({ where: { hotelId, status: BookingStatus.CONFIRMED } }),
+      prisma.booking.aggregate({
+        where: { hotelId, status: BookingStatus.CONFIRMED },
+        _sum:  { totalPrice: true },
+      }),
+    ]);
 
     return res.json({
-      totalBookings: bookings.length,
-      totalRevenue,
+      totalBookings: count,
+      totalRevenue:  Number(agg._sum.totalPrice ?? 0),
     });
   } catch (err) {
     console.error("❌ Summary failed:", err);

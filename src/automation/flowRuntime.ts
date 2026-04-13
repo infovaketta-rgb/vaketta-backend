@@ -19,7 +19,7 @@
 import prisma from "../db/connect";
 import { updateSession, resetSession, SessionData } from "../services/session.service";
 import { buildMenuMessage } from "./buildMenuResponse";
-import { checkRoomAvailability } from "../services/availability.service";
+import { checkRoomAvailability, getCalendarData } from "../services/availability.service";
 import {
   SerializedFlowNode,
   SerializedFlowEdge,
@@ -185,8 +185,8 @@ export async function executeFlowStep(
     return safeMenu(hotelId);
   }
 
-  const nodes = flow.nodes as unknown as SerializedFlowNode[];
-  const edges = flow.edges as unknown as SerializedFlowEdge[];
+  const nodes = Array.isArray(flow.nodes) ? (flow.nodes as unknown as SerializedFlowNode[]) : [];
+  const edges = Array.isArray(flow.edges) ? (flow.edges as unknown as SerializedFlowEdge[]) : [];
   const { nodeMap, adjacency } = buildMaps(nodes, edges);
 
   const flowData = { ...(sessionData.flow ?? { flowId, flowVars: {} }) };
@@ -577,13 +577,21 @@ export async function executeFlowStep(
             const checkOut = d.checkOutVar ? vars[d.checkOutVar] : null;
 
             if (checkIn && checkOut) {
-              const results = await Promise.all(
-                allRooms.map(async (r) => {
-                  const res = await checkRoomAvailability(hotelId, r.id, checkIn, checkOut);
-                  return { ...r, availableCount: res.availableCount, available: res.available };
+              // Single bulk query instead of N×3 per-room queries
+              const calendar = await getCalendarData(hotelId, checkIn, checkOut);
+              displayRooms = allRooms
+                .map((r) => {
+                  const dates = calendar.dates;
+                  let minAvail = Infinity;
+                  for (const ds of dates) {
+                    const cell = calendar.cells[r.id]?.[ds];
+                    const avail = cell?.availableRooms ?? 0;
+                    if (avail < minAvail) minAvail = avail;
+                  }
+                  const availableCount = minAvail === Infinity ? 0 : minAvail;
+                  return { ...r, availableCount, available: availableCount > 0 };
                 })
-              );
-              displayRooms = results.filter((r) => r.available);
+                .filter((r) => r.available);
             }
           }
 

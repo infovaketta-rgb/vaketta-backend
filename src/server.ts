@@ -39,7 +39,7 @@ const server = http.createServer(app);
 export const io = initSocket(server);
 
 // Bridge: worker publishes status updates to Redis → forward to Socket.IO
-subscribeMessageStatus(({ hotelId, messageId, status }) => {
+const unsubscribeStatus = subscribeMessageStatus(({ hotelId, messageId, status }) => {
   emitToHotel(hotelId, "message:status", { messageId, status });
 });
 
@@ -62,6 +62,8 @@ async function shutdown(signal: string) {
   console.log(`\n🛑 ${signal} received — shutting down gracefully...`);
 
   // Stop accepting new connections
+  unsubscribeStatus();
+
   server.close(async () => {
     try {
       await prisma.$disconnect();

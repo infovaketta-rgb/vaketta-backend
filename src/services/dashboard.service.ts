@@ -148,34 +148,46 @@ export async function getDashboardData(hotelId: string): Promise<DashboardRespon
     },
   });
 
+  // Fetch all bookings in the 7-day window in two queries instead of 14
+  const [confirmedLast7, allLast7] = await Promise.all([
+    prisma.booking.findMany({
+      where: {
+        hotelId,
+        status: BookingStatus.CONFIRMED,
+        createdAt: { gte: sevenDaysAgo, lte: todayEnd },
+      },
+      select: { createdAt: true, totalPrice: true },
+    }),
+    prisma.booking.findMany({
+      where: {
+        hotelId,
+        createdAt: { gte: sevenDaysAgo, lte: todayEnd },
+      },
+      select: { createdAt: true },
+    }),
+  ]);
+
+  // Build day-keyed maps
+  const revenueByDay = new Map<string, number>();
+  const countByDay   = new Map<string, number>();
+
+  for (const b of confirmedLast7) {
+    const key = formatDateKey(startOfUtcDay(b.createdAt));
+    revenueByDay.set(key, (revenueByDay.get(key) ?? 0) + Number(b.totalPrice));
+  }
+  for (const b of allLast7) {
+    const key = formatDateKey(startOfUtcDay(b.createdAt));
+    countByDay.set(key, (countByDay.get(key) ?? 0) + 1);
+  }
+
+  // Fill all 7 slots (including days with zero activity)
   const revenueLast7Days: { date: string; revenue: number }[] = [];
   const bookingsLast7Days: { date: string; count: number }[] = [];
 
   for (let i = 6; i >= 0; i--) {
-    const day = startOfUtcDay(addUtcDays(now, -i));
-    const dayEndLoop = endOfUtcDay(day);
-    const key = formatDateKey(day);
-
-    const revAgg = await prisma.booking.aggregate({
-      where: {
-        hotelId,
-        status: BookingStatus.CONFIRMED,
-        createdAt: { gte: day, lte: dayEndLoop },
-      },
-      _sum: { totalPrice: true },
-    });
-    revenueLast7Days.push({
-      date: key,
-      revenue: Number(revAgg._sum.totalPrice ?? 0),
-    });
-
-    const count = await prisma.booking.count({
-      where: {
-        hotelId,
-        createdAt: { gte: day, lte: dayEndLoop },
-      },
-    });
-    bookingsLast7Days.push({ date: key, count });
+    const key = formatDateKey(startOfUtcDay(addUtcDays(now, -i)));
+    revenueLast7Days.push({ date: key, revenue: revenueByDay.get(key) ?? 0 });
+    bookingsLast7Days.push({ date: key, count: countByDay.get(key) ?? 0 });
   }
 
   const recent = await prisma.booking.findMany({

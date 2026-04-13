@@ -1,4 +1,5 @@
 import prisma from "../db/connect";
+import { BookingStatus } from "@prisma/client";
 
 // ── Date helpers ───────────────────────────────────────────────────────────────
 
@@ -70,7 +71,7 @@ export async function getCalendarData(
     prisma.booking.findMany({
       where: {
         hotelId,
-        status: { notIn: ["CANCELLED"] },
+        status: { notIn: [BookingStatus.CANCELLED] },
         checkIn:  { lt: end },
         checkOut: { gt: start },
       },
@@ -195,7 +196,7 @@ export async function checkRoomAvailability(
       where: {
         hotelId,
         roomTypeId,
-        status: { notIn: ["CANCELLED"] },
+        status: { notIn: [BookingStatus.CANCELLED] },
         checkIn:  { lt: co },
         checkOut: { gt: ci },
       },

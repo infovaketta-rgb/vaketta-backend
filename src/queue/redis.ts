@@ -10,11 +10,9 @@ function createRedis(label: string): Redis {
     enableReadyCheck:     false,          // don't block until Redis is ready
     lazyConnect:          false,
     retryStrategy(times) {
-      if (times > 20) {
-        console.error(`❌ [Redis:${label}] Too many retry attempts — giving up`);
-        return null; // stop retrying
-      }
-      const delay = Math.min(times * 200, 5_000);
+      const delay = times > 20
+        ? 30_000  // after 20 fast attempts, keep retrying every 30s indefinitely
+        : Math.min(times * 200, 5_000);
       console.warn(`⚠️  [Redis:${label}] Reconnecting in ${delay}ms (attempt ${times})`);
       return delay;
     },
