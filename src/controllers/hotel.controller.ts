@@ -18,10 +18,13 @@ import { blockToken } from "../utils/tokenBlocklist";
 import { verifyVakettaToken } from "../utils/vakettaJwt";
 
 const COOKIE_NAME = "vaketta_token";
+const isProd = process.env.NODE_ENV === "production";
 const COOKIE_OPTS = {
   httpOnly: true,
-  secure: process.env.NODE_ENV === "production",
-  sameSite: "strict" as const,
+  secure: isProd,
+  // cross-origin in prod (vaketta.com → onrender.com) requires "none" + secure:true
+  // "strict" in dev is fine (both localhost)
+  sameSite: (isProd ? "none" : "strict") as "none" | "strict",
   maxAge: 8 * 60 * 60 * 1000, // 8 hours — matches JWT expiry
 };
 
@@ -48,7 +51,7 @@ export async function adminLogout(req: Request, res: Response) {
       const decoded = verifyVakettaToken(token);
       await blockToken(decoded.jti, decoded.exp);
     }
-    res.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: "strict", secure: process.env.NODE_ENV === "production" });
+    res.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: isProd ? "none" : "strict", secure: isProd });
     res.json({ success: true });
   } catch {
     res.json({ success: true }); // always succeed — cookie cleared regardless
@@ -172,7 +175,7 @@ export async function updateSettingsHandler(req: Request, res: Response) {
           await blockToken(decoded.jti, decoded.exp);
         } catch { /* ignore decode errors */ }
       }
-      res.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: "strict", secure: process.env.NODE_ENV === "production" });
+      res.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: isProd ? "none" : "strict", secure: isProd });
     }
 
     res.json({ admin: updated, passwordChanged: !!newPassword });
