@@ -15,6 +15,7 @@ import roomTypeRoutes from "./routes/roomType.routes";
 import authRoutes from "./routes/auth.routes";
 import dashboardRoutes from "./routes/dashboard.routes";
 import settingsRoutes from "./routes/settings.routes";
+import { publicRouter, adminLeadRouter } from "./routes/lead.routes";
 
 const isProd = process.env.NODE_ENV === "production";
 const app: Application = express();
@@ -165,6 +166,12 @@ app.use("/bookings",       auth, bookingRoutes);
 app.use("/room-types",     auth, roomTypeRoutes);
 app.use("/dashboard",      auth, dashboardRoutes);
 app.use("/hotel-settings", auth, settingsRoutes);
+
+// ── Public lead capture + plans ───────────────────────────────────────────────
+app.use("/public", publicRouter);
+
+// ── Admin leads ───────────────────────────────────────────────────────────────
+app.use("/admin/leads", adminLeadRouter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {

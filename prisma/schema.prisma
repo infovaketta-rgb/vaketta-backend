@@ -353,6 +353,25 @@ model FlowDefinition {
   @@index([isTemplate])
 }
 
+// Lead capture — submitted from the public landing page
+model Lead {
+  id          String   @id @default(uuid())
+  name        String
+  email       String
+  phone       String
+  hotelName   String
+  country     String   @default("")
+  planId      String?  // which plan they selected on landing page
+  message     String?
+  status      String   @default("new")  // "new" | "contacted" | "converted" | "rejected"
+  notes       String?  // internal admin notes
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status])
+  @@index([createdAt])
+}
+
 // Platform-wide privacy policy (singleton — only one row ever exists)
 model PrivacyPolicy {
   id            String   @id @default("global")  // always "global"
