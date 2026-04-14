@@ -132,37 +132,75 @@ export async function setBotEnabled(req: Request, res: Response) {
   }
 }
 
-/** DELETE /messages/:messageId — hard-delete a message + its media */
+/** DELETE /messages/:messageId?everyone=true — delete from DB (+ WhatsApp if everyone=true) */
 export async function deleteMessage(req: Request, res: Response) {
   try {
     const hotelId   = (req as any).user.hotelId as string;
     const messageId = req.params["messageId"] as string;
+    const everyone  = req.query["everyone"] === "true";
 
     const msg = await prisma.message.findFirst({
       where: { id: messageId, hotelId },
+      include: { hotel: { include: { config: true } } },
     });
     if (!msg) return res.status(404).json({ error: "Message not found" });
+
+    // ── Unsend on WhatsApp (Delete for everyone) ───────────────────────────
+    // Only possible for outgoing messages that have a wamid
+    let whatsappDeleted = false;
+    if (everyone && msg.direction === "OUT" && msg.wamid) {
+      const accessToken     = (msg as any).hotel?.config?.metaAccessToken ?? "";
+      const phoneNumberId   = (msg as any).hotel?.config?.metaPhoneNumberId ?? "";
+
+      if (accessToken && phoneNumberId) {
+        try {
+          const waRes = await fetch(
+            `https://graph.facebook.com/v25.0/${phoneNumberId}/messages`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${accessToken}`,
+              },
+              body: JSON.stringify({
+                messaging_product: "whatsapp",
+                status: "deleted",
+                message_id: msg.wamid,
+              }),
+              signal: AbortSignal.timeout(10_000),
+            }
+          );
+          if (waRes.ok) {
+            whatsappDeleted = true;
+          } else {
+            const waErr = await waRes.json().catch(() => ({}));
+            console.warn("⚠️  WhatsApp unsend failed:", waErr);
+          }
+        } catch (waErr) {
+          console.warn("⚠️  WhatsApp unsend error (non-fatal):", waErr);
+        }
+      }
+    }
 
     // ── Delete media file ──────────────────────────────────────────────────
     if (msg.mediaUrl) {
       const publicR2 = process.env.R2_PUBLIC_URL?.replace(/\/$/, "");
       if (publicR2 && msg.mediaUrl.startsWith(publicR2)) {
-        // R2 object — extract key (everything after the base URL + "/")
         const key = msg.mediaUrl.slice(publicR2.length + 1);
         await deleteFromR2(key);
       } else if (msg.mediaUrl.startsWith("/uploads/")) {
-        // Local disk file
         const filePath = path.join(process.cwd(), msg.mediaUrl);
-        await fs.unlink(filePath).catch(() => {}); // ignore if already gone
+        await fs.unlink(filePath).catch(() => {});
       }
     }
 
+    // ── Delete DB record ───────────────────────────────────────────────────
     await prisma.message.delete({ where: { id: messageId } });
 
-    // Notify all dashboard clients so the bubble disappears in real-time
+    // Notify all dashboard clients
     emitToHotel(hotelId, "message:deleted", { messageId, guestId: msg.guestId });
 
-    return res.json({ success: true });
+    return res.json({ success: true, whatsappDeleted });
   } catch (err: any) {
     console.error("❌ deleteMessage:", err);
     return res.status(500).json({ error: "Failed to delete message" });
