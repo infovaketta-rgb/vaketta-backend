@@ -1,9 +1,12 @@
 import { Request, Response } from "express";
+import path from "path";
+import fs from "fs/promises";
 import { sendManualReply } from "../services/message.service";
 import prisma from "../db/connect";
 import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
 import { whatsappQueue } from "../queue/whatsapp.queue";
+import { deleteFromR2 } from "../services/r2.service";
 
 export async function manualReply(req: Request, res: Response) {
   try {
@@ -126,6 +129,43 @@ export async function setBotEnabled(req: Request, res: Response) {
   } catch (err) {
     console.error("❌ setBotEnabled failed:", err);
     return res.status(500).json({ error: "Failed to update bot status" });
+  }
+}
+
+/** DELETE /messages/:messageId — hard-delete a message + its media */
+export async function deleteMessage(req: Request, res: Response) {
+  try {
+    const hotelId   = (req as any).user.hotelId as string;
+    const messageId = req.params["messageId"] as string;
+
+    const msg = await prisma.message.findFirst({
+      where: { id: messageId, hotelId },
+    });
+    if (!msg) return res.status(404).json({ error: "Message not found" });
+
+    // ── Delete media file ──────────────────────────────────────────────────
+    if (msg.mediaUrl) {
+      const publicR2 = process.env.R2_PUBLIC_URL?.replace(/\/$/, "");
+      if (publicR2 && msg.mediaUrl.startsWith(publicR2)) {
+        // R2 object — extract key (everything after the base URL + "/")
+        const key = msg.mediaUrl.slice(publicR2.length + 1);
+        await deleteFromR2(key);
+      } else if (msg.mediaUrl.startsWith("/uploads/")) {
+        // Local disk file
+        const filePath = path.join(process.cwd(), msg.mediaUrl);
+        await fs.unlink(filePath).catch(() => {}); // ignore if already gone
+      }
+    }
+
+    await prisma.message.delete({ where: { id: messageId } });
+
+    // Notify all dashboard clients so the bubble disappears in real-time
+    emitToHotel(hotelId, "message:deleted", { messageId, guestId: msg.guestId });
+
+    return res.json({ success: true });
+  } catch (err: any) {
+    console.error("❌ deleteMessage:", err);
+    return res.status(500).json({ error: "Failed to delete message" });
   }
 }
 
