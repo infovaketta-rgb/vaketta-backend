@@ -82,7 +82,7 @@ export async function updateLead(req: Request, res: Response) {
     }
 
     const lead = await prisma.lead.update({
-      where: { id },
+      where: { id: id as string },
       data: {
         ...(status !== undefined ? { status } : {}),
         ...(notes  !== undefined ? { notes  } : {}),
@@ -107,7 +107,6 @@ export async function listPublicPlans(_req: Request, res: Response) {
         id:                      true,
         name:                    true,
         currency:                true,
-        country:                 true,
         priceMonthly:            true,
         conversationLimit:       true,
         aiReplyLimit:            true,

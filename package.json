@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "nodemon src/server.ts",
     "worker": "ts-node src/workers/whatsapp.worker.ts",
-    "build": "tsc",
+    "build": "prisma generate && tsc",
     "start": "node dist/server.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
