@@ -1,9 +1,4 @@
-import fs      from "fs";
-import path    from "path";
-import FormData from "form-data";
-import prisma  from "../db/connect";
-
-const BACKEND_URL = process.env.BACKEND_URL ?? "";
+import prisma from "../db/connect";
 
 // ── Credentials ───────────────────────────────────────────────────────────────
 
@@ -87,31 +82,6 @@ async function metaPost(
   return data;
 }
 
-async function uploadMediaToMeta(
-  localPath:     string,
-  mimeType:      string,
-  phoneNumberId: string,
-  accessToken:   string,
-): Promise<string> {
-  const form = new FormData();
-  form.append("messaging_product", "whatsapp");
-  form.append("file", fs.createReadStream(localPath), { contentType: mimeType });
-
-  const res  = await fetch(`https://graph.facebook.com/v25.0/${phoneNumberId}/media`, {
-    method:  "POST",
-    headers: { Authorization: `Bearer ${accessToken}`, ...form.getHeaders() },
-    body:    form as any,
-    signal:  AbortSignal.timeout(30_000), // media uploads can be slower
-  });
-  const data = (await res.json()) as { id?: string };
-  if (!res.ok || !data.id) {
-    const err: any = new Error(`Media upload failed ${res.status}: ${JSON.stringify(data)}`);
-    err.status = res.status;
-    throw err;
-  }
-  return data.id;
-}
-
 // ── Text message ──────────────────────────────────────────────────────────────
 
 export async function sendTextMessage(input: {
@@ -158,43 +128,20 @@ export async function sendMediaMessage(input: {
     return null;
   }
 
-  const localPath = mediaUrl.startsWith("/uploads/")
-    ? path.join(process.cwd(), mediaUrl)
-    : null;
-
-  // Try to upload local file to Meta (gets a reusable media ID)
-  let mediaId: string | null = null;
-  if (localPath && fs.existsSync(localPath)) {
-    mediaId = await withRetry(() =>
-      uploadMediaToMeta(localPath, mimeType, phoneNumberId, accessToken)
-    );
+  // All media is stored in R2 — mediaUrl must be a full public https:// URL
+  if (!mediaUrl.startsWith("https://")) {
+    throw new Error(`[WhatsApp] Invalid mediaUrl — expected a public R2 URL, got: ${mediaUrl}`);
   }
 
-  if (mediaId) {
-    return withRetry(() =>
-      metaPost(`${phoneNumberId}/messages`, {
-        messaging_product: "whatsapp",
-        to:   toPhone,
-        type: messageType,
-        [messageType]: {
-          id: mediaId,
-          ...(caption  ? { caption }            : {}),
-          ...(fileName ? { filename: fileName } : {}),
-        },
-      }, accessToken)
-    );
-  }
+  console.log(`[WhatsApp] Sending ${messageType} to ${toPhone} — URL: ${mediaUrl} — MIME: ${mimeType}`);
 
-  // Fallback: send by public URL
-  // If mediaUrl is already absolute (R2), use it directly; otherwise prepend backend URL
-  const publicUrl = mediaUrl.startsWith("http") ? mediaUrl : `${BACKEND_URL}${mediaUrl}`;
   return withRetry(() =>
     metaPost(`${phoneNumberId}/messages`, {
       messaging_product: "whatsapp",
       to:   toPhone,
       type: messageType,
       [messageType]: {
-        link: publicUrl,
+        link:     mediaUrl,
         ...(caption  ? { caption }            : {}),
         ...(fileName ? { filename: fileName } : {}),
       },
