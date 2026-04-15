@@ -25,10 +25,9 @@ export type DownloadedMedia = {
  * @param toPhone - hotel's WhatsApp number, used to resolve the per-hotel access token
  */
 export async function downloadMetaMedia(
-  mediaId:           string,
-  mimeType:          string,
-  toPhone:           string,
-  originalFileName?: string
+  mediaId:  string,
+  mimeType: string,
+  toPhone:  string,
 ): Promise<DownloadedMedia | null> {
   // Resolve per-hotel Meta access token from DB
   const hotel = await prisma.hotel.findUnique({
@@ -66,10 +65,10 @@ export async function downloadMetaMedia(
     const buffer = Buffer.from(await fileRes.arrayBuffer());
 
     // Upload to R2
-    const uploaded = await uploadToR2(buffer, mimeType, originalFileName ?? null);
+    const uploaded = await uploadToR2(buffer, mimeType);
     return {
       localUrl: uploaded.url,
-      mimeType,
+      mimeType: uploaded.mime,  // use detected MIME
       fileName: uploaded.fileName,
     };
   } catch (err) {

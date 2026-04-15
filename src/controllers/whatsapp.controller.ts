@@ -92,7 +92,6 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
         mediaInfo.mediaId,
         mediaInfo.mimeType,
         toPhone,
-        mediaInfo.fileName ?? undefined
       );
       if (downloaded) {
         mediaUrl = downloaded.localUrl;

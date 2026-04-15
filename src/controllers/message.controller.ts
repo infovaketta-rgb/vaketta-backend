@@ -246,16 +246,16 @@ export async function sendMedia(req: Request, res: Response) {
     });
     if (!guest) return res.status(404).json({ error: "Guest not found" });
 
-    const mime = file.mimetype;
+    // ── Upload to R2 (detects real MIME from magic bytes) ───────────────────
+    const uploaded       = await uploadToR2(file.buffer, file.mimetype, { hotelId });
+    const mediaUrl       = uploaded.url;
+    const storedFileName = uploaded.fileName;
+    const mime           = uploaded.mime; // use detected MIME, not client claim
+
     const messageType = mime.startsWith("image/")  ? "image"
                       : mime.startsWith("video/")  ? "video"
                       : mime.startsWith("audio/")  ? "audio"
                       : "document";
-
-    // ── Upload to R2 ─────────────────────────────────────────────────────────
-    const uploaded     = await uploadToR2(file.buffer, mime, file.originalname);
-    const mediaUrl     = uploaded.url;
-    const storedFileName = uploaded.fileName;
 
     // Mark as staff-handled
     await prisma.guest.update({ where: { id: guest.id }, data: { lastHandledByStaff: true } });
