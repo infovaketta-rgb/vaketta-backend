@@ -3,8 +3,8 @@ import { sendManualReply, cancelPendingSend } from "../services/message.service"
 import prisma from "../db/connect";
 import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
-import { whatsappQueue } from "../queue/whatsapp.queue";
 import { uploadToR2, deleteFromR2 } from "../services/r2.service";
+import { sendMediaMessage } from "../services/whatsapp.send.service";
 
 export async function manualReply(req: Request, res: Response) {
   try {
@@ -277,9 +277,34 @@ export async function sendMedia(req: Request, res: Response) {
     });
 
     emitToHotel(hotelId, "message:new", { message });
-    await whatsappQueue.add("send", { messageId: message.id });
 
-    return res.json(message);
+    // Send directly — no queue, same pattern as text replies
+    let wamid: string | undefined;
+    let finalStatus: MessageStatus = MessageStatus.FAILED;
+    try {
+      const result = await sendMediaMessage({
+        toPhone:     guest.phone,
+        hotelId,
+        messageType,
+        mediaUrl,
+        mimeType:    mime,
+        fileName:    storedFileName,
+        caption:     caption ?? null,
+      });
+      wamid = (result as any)?.messages?.[0]?.id ?? undefined;
+      finalStatus = MessageStatus.SENT;
+    } catch (err) {
+      console.error("❌ sendMediaMessage failed:", err);
+    }
+
+    const updated = await prisma.message.update({
+      where: { id: message.id },
+      data:  { status: finalStatus, ...(wamid ? { wamid } : {}) },
+    });
+
+    emitToHotel(hotelId, "message:status", { messageId: message.id, status: finalStatus });
+
+    return res.json(updated);
   } catch (err) {
     console.error("❌ sendMedia failed:", err);
     return res.status(500).json({ error: "Failed to send media" });
