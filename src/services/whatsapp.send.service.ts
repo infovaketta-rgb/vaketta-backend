@@ -3,7 +3,7 @@ import path    from "path";
 import FormData from "form-data";
 import prisma  from "../db/connect";
 
-const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5000";
+const BACKEND_URL = process.env.BACKEND_URL ?? "";
 
 // ── Credentials ───────────────────────────────────────────────────────────────
 
@@ -186,7 +186,8 @@ export async function sendMediaMessage(input: {
   }
 
   // Fallback: send by public URL
-  const publicUrl = `${BACKEND_URL}${mediaUrl}`;
+  // If mediaUrl is already absolute (R2), use it directly; otherwise prepend backend URL
+  const publicUrl = mediaUrl.startsWith("http") ? mediaUrl : `${BACKEND_URL}${mediaUrl}`;
   return withRetry(() =>
     metaPost(`${phoneNumberId}/messages`, {
       messaging_product: "whatsapp",

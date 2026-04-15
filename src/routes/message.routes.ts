@@ -1,17 +1,10 @@
 import { Router } from "express";
 import multer from "multer";
-import path from "path";
-import { randomUUID } from "crypto";
 import { manualReply, getMessages, markMessagesRead, setBotEnabled, sendMedia, deleteMessage, undoSend } from "../controllers/message.controller";
 
-const storage = multer.diskStorage({
-  destination: path.join(process.cwd(), "uploads"),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${randomUUID()}${ext}`);
-  },
-});
-const upload = multer({ storage, limits: { fileSize: 64 * 1024 * 1024 } }); // 64 MB max
+// Use memory storage — the controller decides where to persist the file
+// (R2 in production, local disk in development)
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 64 * 1024 * 1024 } }); // 64 MB max
 
 const router = Router();
 

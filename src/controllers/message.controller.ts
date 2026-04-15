@@ -4,9 +4,7 @@ import prisma from "../db/connect";
 import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
 import { whatsappQueue } from "../queue/whatsapp.queue";
-import { deleteFromR2, isR2Configured } from "../services/r2.service";
-import fs from "fs";
-import path from "path";
+import { uploadToR2, deleteFromR2 } from "../services/r2.service";
 
 export async function manualReply(req: Request, res: Response) {
   try {
@@ -153,28 +151,19 @@ export async function deleteMessage(req: Request, res: Response) {
     });
     const deletedBy = staff?.name ?? "Staff";
 
-    // ── Delete media from storage before wiping the URL ──────────────────────
+    // ── Delete media from R2 before wiping the URL ───────────────────────────
     if (msg.mediaUrl) {
-      if (isR2Configured()) {
-        // R2: extract key from public URL — strip "https://.../" prefix, keep "media/..."
-        const publicUrl = (process.env.R2_PUBLIC_URL ?? "").replace(/\/$/, "");
-        const key = publicUrl && msg.mediaUrl.startsWith(publicUrl)
-          ? msg.mediaUrl.slice(publicUrl.length + 1)   // +1 for the slash
-          : msg.mediaUrl.startsWith("media/")
-            ? msg.mediaUrl
-            : null;
-        if (key) {
-          deleteFromR2(key).catch((err) =>
-            console.error("❌ R2 delete failed for", key, err)
-          );
-        }
-      } else if (msg.mediaUrl.startsWith("/uploads/")) {
-        // Local dev: delete from disk
-        const filePath = path.join(process.cwd(), msg.mediaUrl);
-        fs.unlink(filePath, (err) => {
-          if (err && err.code !== "ENOENT")
-            console.error("❌ Local file delete failed:", filePath, err);
-        });
+      // Extract the R2 object key from the public URL: strip base URL, keep "media/..."
+      const publicBase = (process.env.R2_PUBLIC_URL ?? "").replace(/\/$/, "");
+      const key = publicBase && msg.mediaUrl.startsWith(publicBase)
+        ? msg.mediaUrl.slice(publicBase.length + 1)
+        : msg.mediaUrl.startsWith("media/")
+          ? msg.mediaUrl
+          : null;
+      if (key) {
+        deleteFromR2(key).catch((err) =>
+          console.error("❌ R2 delete failed for", key, err)
+        );
       }
     }
 
@@ -240,7 +229,11 @@ export async function undoSend(req: Request, res: Response) {
 export async function sendMedia(req: Request, res: Response) {
   try {
     const hotelId = (req as any).user.hotelId;
-    const file    = (req as any).file as { mimetype: string; filename: string; originalname: string } | undefined;
+    const file    = (req as any).file as {
+      mimetype:     string;
+      originalname: string;
+      buffer:       Buffer;
+    } | undefined;
 
     if (!file) return res.status(400).json({ error: "No file uploaded" });
 
@@ -259,9 +252,12 @@ export async function sendMedia(req: Request, res: Response) {
                       : mime.startsWith("audio/")  ? "audio"
                       : "document";
 
-    const mediaUrl = `/uploads/${file.filename}`;
+    // ── Upload to R2 ─────────────────────────────────────────────────────────
+    const uploaded     = await uploadToR2(file.buffer, mime, file.originalname);
+    const mediaUrl     = uploaded.url;
+    const storedFileName = uploaded.fileName;
 
-    // Mark as staff-handled and reset bot session
+    // Mark as staff-handled
     await prisma.guest.update({ where: { id: guest.id }, data: { lastHandledByStaff: true } });
 
     const message = await prisma.message.create({
@@ -273,7 +269,7 @@ export async function sendMedia(req: Request, res: Response) {
         messageType,
         mediaUrl,
         mimeType:    mime,
-        fileName:    file.originalname,
+        fileName:    storedFileName,
         hotelId,
         guestId:     guest.id,
         status:      MessageStatus.PENDING,

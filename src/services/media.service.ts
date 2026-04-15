@@ -2,25 +2,18 @@
  * media.service.ts
  *
  * Downloads incoming WhatsApp media from Meta's API and uploads it to R2.
- * Falls back to local disk storage if R2 is not configured (dev mode).
  *
  * Access token is read per-hotel from HotelConfig.metaAccessToken (set via
  * the hotel's WhatsApp integration settings in the frontend).
  */
 
-import fs from "fs";
-import path from "path";
-import { randomUUID } from "crypto";
 import prisma from "../db/connect";
-import { uploadToR2, isR2Configured, mimeToExt } from "./r2.service";
+import { uploadToR2 } from "./r2.service";
 
 const META_API_VERSION = "v25.0";
 
-// Local fallback directory (dev only)
-const UPLOADS_DIR = path.join(process.cwd(), "uploads");
-
 export type DownloadedMedia = {
-  localUrl:  string;   // R2 public URL in prod, "/uploads/..." in dev
+  localUrl:  string;   // R2 public URL
   mimeType:  string;
   fileName:  string;
 };
@@ -72,30 +65,12 @@ export async function downloadMetaMedia(
 
     const buffer = Buffer.from(await fileRes.arrayBuffer());
 
-    // Step 3a: Upload to R2 (production)
-    if (isR2Configured()) {
-      const uploaded = await uploadToR2(buffer, mimeType, originalFileName ?? null);
-      return {
-        localUrl: uploaded.url,
-        mimeType,
-        fileName: uploaded.fileName,
-      };
-    }
-
-    // Step 3b: Save to local disk (development fallback)
-    if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-
-    const ext      = mimeToExt(mimeType);
-    const fileName = originalFileName ?? `${randomUUID()}.${ext}`;
-    const filePath = path.join(UPLOADS_DIR, fileName);
-    fs.writeFileSync(filePath, buffer);
-
-    console.warn("⚠️  R2 not configured — saved media to local disk:", filePath);
-
+    // Upload to R2
+    const uploaded = await uploadToR2(buffer, mimeType, originalFileName ?? null);
     return {
-      localUrl: `/uploads/${fileName}`,
+      localUrl: uploaded.url,
       mimeType,
-      fileName,
+      fileName: uploaded.fileName,
     };
   } catch (err) {
     console.error("❌ Failed to download/store media:", err);
