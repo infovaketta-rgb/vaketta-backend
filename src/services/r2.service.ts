@@ -105,10 +105,12 @@ export async function uploadToR2(
 
   await getClient().send(
     new PutObjectCommand({
-      Bucket:      bucket,
-      Key:         key,
-      Body:        buffer,
-      ContentType: mimeType,
+      Bucket:             bucket,
+      Key:                key,
+      Body:               buffer,
+      ContentType:        mimeType,
+      ContentDisposition: "inline",   // required: WhatsApp fetcher rejects attachment
+      CacheControl:       "public, max-age=31536000, immutable",
     })
   );
 
