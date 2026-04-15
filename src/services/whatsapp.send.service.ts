@@ -128,9 +128,23 @@ export async function sendMediaMessage(input: {
     return null;
   }
 
-  // All media is stored in R2 — mediaUrl must be a full public https:// URL
   if (!mediaUrl.startsWith("https://")) {
     throw new Error(`[WhatsApp] Invalid mediaUrl — expected a public R2 URL, got: ${mediaUrl}`);
+  }
+
+  // WhatsApp supported fields per type:
+  // image    → link, caption
+  // video    → link, caption
+  // audio    → link (no caption, no filename)
+  // document → link, caption, filename
+  const mediaObject: Record<string, any> = { link: mediaUrl };
+
+  if (caption && messageType !== "audio") {
+    mediaObject.caption = caption;
+  }
+
+  if (fileName && messageType === "document") {
+    mediaObject.filename = fileName;
   }
 
   console.log(`[WhatsApp] Sending ${messageType} to ${toPhone} — URL: ${mediaUrl} — MIME: ${mimeType}`);
@@ -140,11 +154,7 @@ export async function sendMediaMessage(input: {
       messaging_product: "whatsapp",
       to:   toPhone,
       type: messageType,
-      [messageType]: {
-        link:     mediaUrl,
-        ...(caption  ? { caption }            : {}),
-        ...(fileName ? { filename: fileName } : {}),
-      },
+      [messageType]: mediaObject,
     }, accessToken)
   );
 }
