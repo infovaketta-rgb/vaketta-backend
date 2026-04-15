@@ -4,6 +4,9 @@ import prisma from "../db/connect";
 import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
 import { whatsappQueue } from "../queue/whatsapp.queue";
+import { deleteFromR2, isR2Configured } from "../services/r2.service";
+import fs from "fs";
+import path from "path";
 
 export async function manualReply(req: Request, res: Response) {
   try {
@@ -149,6 +152,31 @@ export async function deleteMessage(req: Request, res: Response) {
       select: { name: true },
     });
     const deletedBy = staff?.name ?? "Staff";
+
+    // ── Delete media from storage before wiping the URL ──────────────────────
+    if (msg.mediaUrl) {
+      if (isR2Configured()) {
+        // R2: extract key from public URL — strip "https://.../" prefix, keep "media/..."
+        const publicUrl = (process.env.R2_PUBLIC_URL ?? "").replace(/\/$/, "");
+        const key = publicUrl && msg.mediaUrl.startsWith(publicUrl)
+          ? msg.mediaUrl.slice(publicUrl.length + 1)   // +1 for the slash
+          : msg.mediaUrl.startsWith("media/")
+            ? msg.mediaUrl
+            : null;
+        if (key) {
+          deleteFromR2(key).catch((err) =>
+            console.error("❌ R2 delete failed for", key, err)
+          );
+        }
+      } else if (msg.mediaUrl.startsWith("/uploads/")) {
+        // Local dev: delete from disk
+        const filePath = path.join(process.cwd(), msg.mediaUrl);
+        fs.unlink(filePath, (err) => {
+          if (err && err.code !== "ENOENT")
+            console.error("❌ Local file delete failed:", filePath, err);
+        });
+      }
+    }
 
     const updated = await prisma.message.update({
       where: { id: messageId },
