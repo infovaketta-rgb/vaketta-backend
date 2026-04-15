@@ -76,12 +76,20 @@ export async function logIncomingMessage(
 
   emitToHotel(hotel.id, "message:new", { message: inMessage });
 
-  // ── 4. Usage — count only new conversations (IDLE or first message) ──────────
-  const existingSession = await prisma.conversationSession.findUnique({
-    where:  { guestId_hotelId: { guestId: guest.id, hotelId: hotel.id } },
-    select: { state: true },
+  // ── 4. Usage — count only new 24-hour conversation windows ─────────────────
+  // A "new conversation" = first ever message OR last message was >24 h ago.
+  // We exclude the message we just created so we're looking at prior history.
+  const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const lastMessage = await prisma.message.findFirst({
+    where: {
+      guestId: guest.id,
+      hotelId: hotel.id,
+      id:      { not: inMessage.id },
+    },
+    orderBy: { timestamp: "desc" },
+    select:  { timestamp: true },
   });
-  if (!existingSession || existingSession.state === "IDLE") {
+  if (!lastMessage || lastMessage.timestamp < twentyFourHoursAgo) {
     incrementConversationUsage(hotel.id).catch(() => {});
   }
 
