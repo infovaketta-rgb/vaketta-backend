@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { sendManualReply } from "../services/message.service";
+import { sendManualReply, cancelPendingSend } from "../services/message.service";
 import prisma from "../db/connect";
 import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
@@ -192,15 +192,8 @@ export async function undoSend(req: Request, res: Response) {
       return res.status(400).json({ error: "Message has already been sent — cannot undo" });
     }
 
-    // Remove the BullMQ job if it's still waiting
-    if (msg.jobId) {
-      try {
-        const job = await whatsappQueue.getJob(msg.jobId);
-        if (job) await job.remove();
-      } catch {
-        // Job may have already executed — proceed with DB cleanup
-      }
-    }
+    // Cancel the in-process setTimeout registered by sendManualReply
+    cancelPendingSend(messageId);
 
     // Hard-delete the message row (no tombstone — it was never sent)
     await prisma.message.delete({ where: { id: messageId } });

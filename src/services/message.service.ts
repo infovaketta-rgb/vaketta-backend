@@ -140,6 +140,19 @@ export async function logIncomingMessage(
   };
 }
 
+// ── Undo-send registry — maps messageId → active setTimeout handle ────────────
+// Lives in the server process; no separate worker needed for short delays.
+const _pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** Cancel a pending delayed send. Returns true if the timer existed. */
+export function cancelPendingSend(messageId: string): boolean {
+  const timer = _pendingTimers.get(messageId);
+  if (!timer) return false;
+  clearTimeout(timer);
+  _pendingTimers.delete(messageId);
+  return true;
+}
+
 // ── Manual staff reply ────────────────────────────────────────────────────────
 
 export async function sendManualReply(input: {
@@ -166,7 +179,7 @@ export async function sendManualReply(input: {
     : null;
 
   if (delayEnabled && delaySeconds) {
-    // Create PENDING message first
+    // Create PENDING message immediately so it shows in the UI
     const message = await prisma.message.create({
       data: {
         direction:   "OUT",
@@ -180,21 +193,43 @@ export async function sendManualReply(input: {
       },
     });
 
-    // Enqueue with BullMQ delay — job won't run until after delaySeconds
-    const job = await whatsappQueue.add(
-      "send",
-      { messageId: message.id },
-      { delay: delaySeconds * 1000 }
-    );
+    emitToHotel(hotelId, "message:new", { message });
 
-    // Store BullMQ job ID so it can be cancelled via undo-send
-    const updated = await prisma.message.update({
-      where: { id: message.id },
-      data:  { jobId: job.id ?? null },
-    });
+    // Schedule the actual send inside this server process using setTimeout.
+    // No separate worker process required for short delays (1–60s).
+    const timer = setTimeout(async () => {
+      _pendingTimers.delete(message.id);
 
-    emitToHotel(hotelId, "message:new", { message: updated });
-    return { message: updated, delaySeconds };
+      // Guard: message may have been undo-deleted while we were waiting
+      const stillPending = await prisma.message.findFirst({
+        where: { id: message.id, status: MessageStatus.PENDING },
+      });
+      if (!stillPending) return;
+
+      let wamid: string | undefined;
+      let finalStatus: MessageStatus = MessageStatus.FAILED;
+
+      try {
+        const result = await sendTextMessage({ toPhone, fromPhone, hotelId, guestId, text });
+        wamid = (result as any)?.messages?.[0]?.id ?? undefined;
+        finalStatus = MessageStatus.SENT;
+        console.log("[Delay] Message sent, wamid:", wamid ?? "unknown");
+      } catch (err) {
+        console.error("[Delay] sendTextMessage error:", err);
+      }
+
+      await prisma.message.update({
+        where: { id: message.id },
+        data:  { status: finalStatus, ...(wamid ? { wamid } : {}) },
+      });
+
+      // Push status update to all open dashboard tabs
+      emitToHotel(hotelId, "message:status", { messageId: message.id, status: finalStatus });
+    }, delaySeconds * 1000);
+
+    _pendingTimers.set(message.id, timer);
+
+    return { message, delaySeconds };
   }
 
   // ── Immediate send (no delay) ─────────────────────────────────────────────
