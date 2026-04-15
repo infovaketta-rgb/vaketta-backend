@@ -116,6 +116,10 @@ model HotelConfig {
   nightMessage      String   @default("🌙 We're currently outside business hours. We'll get back to you when we open!")
   botMessages       Json     @default("{}")
 
+  // Message delay (undo-send)
+  messageDelayEnabled Boolean @default(false)
+  messageDelaySeconds Int     @default(10)    // 1–60
+
   // WhatsApp / Meta credentials (per-hotel)
   metaPhoneNumberId String?   // Meta Phone Number ID from developer console
   metaAccessToken   String?   // Permanent system user access token
@@ -312,7 +316,12 @@ model Message {
   mimeType    String?  // e.g. "image/jpeg", "video/mp4", "audio/ogg"
   fileName    String?  // original filename, used for documents
   wamid       String?  // Meta's message ID — used to map status webhooks
+  jobId       String?  // BullMQ job ID — set when message is queued with a delay (undo-send)
   timestamp   DateTime @default(now())
+
+  deleted     Boolean   @default(false)
+  deletedBy   String?   // name of the staff member who deleted it
+  deletedAt   DateTime?
 
   status      MessageStatus @default(PENDING)
 

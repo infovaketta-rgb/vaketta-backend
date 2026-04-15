@@ -2,7 +2,7 @@ import { Router } from "express";
 import multer from "multer";
 import path from "path";
 import { randomUUID } from "crypto";
-import { manualReply, getMessages, markMessagesRead, setBotEnabled, sendMedia, deleteMessage } from "../controllers/message.controller";
+import { manualReply, getMessages, markMessagesRead, setBotEnabled, sendMedia, deleteMessage, undoSend } from "../controllers/message.controller";
 
 const storage = multer.diskStorage({
   destination: path.join(process.cwd(), "uploads"),
@@ -17,6 +17,7 @@ const router = Router();
 
 router.post("/reply", manualReply);
 router.post("/send-media", upload.single("file"), sendMedia);
+router.delete("/:messageId/undo-send", undoSend);
 router.delete("/:messageId", deleteMessage);
 router.get("/:guestId", getMessages);
 router.post("/:guestId/read", markMessagesRead);

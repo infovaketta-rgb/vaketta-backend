@@ -34,20 +34,23 @@ export async function patchSettings(req: Request, res: Response) {
       businessStartHour, businessEndHour,
       timezone, defaultLanguage,
       welcomeMessage, nightMessage,
+      messageDelayEnabled, messageDelaySeconds,
     } = req.body;
 
     const config = await updateHotelConfig(hotelId(req), {
-      ...(autoReplyEnabled  !== undefined && { autoReplyEnabled }),
-      ...(bookingEnabled    !== undefined && { bookingEnabled }),
-      ...(bookingFlowId     !== undefined && { bookingFlowId: bookingFlowId || null }),
-      ...(menuFlowId        !== undefined && { menuFlowId:    menuFlowId    || null }),
-      ...(aiEnabled         !== undefined && { aiEnabled }),
-      ...(businessStartHour !== undefined && { businessStartHour: Number(businessStartHour) }),
-      ...(businessEndHour   !== undefined && { businessEndHour:   Number(businessEndHour) }),
-      ...(timezone          !== undefined && { timezone }),
-      ...(defaultLanguage   !== undefined && { defaultLanguage }),
-      ...(welcomeMessage    !== undefined && { welcomeMessage }),
-      ...(nightMessage      !== undefined && { nightMessage }),
+      ...(autoReplyEnabled     !== undefined && { autoReplyEnabled }),
+      ...(bookingEnabled       !== undefined && { bookingEnabled }),
+      ...(bookingFlowId        !== undefined && { bookingFlowId: bookingFlowId || null }),
+      ...(menuFlowId           !== undefined && { menuFlowId:    menuFlowId    || null }),
+      ...(aiEnabled            !== undefined && { aiEnabled }),
+      ...(businessStartHour    !== undefined && { businessStartHour: Number(businessStartHour) }),
+      ...(businessEndHour      !== undefined && { businessEndHour:   Number(businessEndHour) }),
+      ...(timezone             !== undefined && { timezone }),
+      ...(defaultLanguage      !== undefined && { defaultLanguage }),
+      ...(welcomeMessage       !== undefined && { welcomeMessage }),
+      ...(nightMessage         !== undefined && { nightMessage }),
+      ...(messageDelayEnabled  !== undefined && { messageDelayEnabled }),
+      ...(messageDelaySeconds  !== undefined && { messageDelaySeconds: Number(messageDelaySeconds) }),
     });
 
     res.json(config);

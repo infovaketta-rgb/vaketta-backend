@@ -148,7 +148,7 @@ export async function sendManualReply(input: {
   fromPhone: string; // hotel number
   toPhone:   string; // guest number
   text:      string;
-}) {
+}): Promise<{ message: any; delaySeconds: number | null }> {
   const { hotelId, guestId, fromPhone, toPhone, text } = input;
 
   // Mark as handled by staff and reset bot session
@@ -158,7 +158,46 @@ export async function sendManualReply(input: {
   });
   await resetSession(guestId, hotelId);
 
-  // Call Meta API directly — no queue, no worker dependency
+  // ── Check if message delay is enabled for this hotel ──────────────────────
+  const config = await prisma.hotelConfig.findUnique({ where: { hotelId } });
+  const delayEnabled = config?.messageDelayEnabled ?? false;
+  const delaySeconds = delayEnabled
+    ? Math.max(1, Math.min(60, config?.messageDelaySeconds ?? 10))
+    : null;
+
+  if (delayEnabled && delaySeconds) {
+    // Create PENDING message first
+    const message = await prisma.message.create({
+      data: {
+        direction:   "OUT",
+        fromPhone,
+        toPhone,
+        body:        text,
+        messageType: "text",
+        hotelId,
+        guestId,
+        status:      MessageStatus.PENDING,
+      },
+    });
+
+    // Enqueue with BullMQ delay — job won't run until after delaySeconds
+    const job = await whatsappQueue.add(
+      "send",
+      { messageId: message.id },
+      { delay: delaySeconds * 1000 }
+    );
+
+    // Store BullMQ job ID so it can be cancelled via undo-send
+    const updated = await prisma.message.update({
+      where: { id: message.id },
+      data:  { jobId: job.id ?? null },
+    });
+
+    emitToHotel(hotelId, "message:new", { message: updated });
+    return { message: updated, delaySeconds };
+  }
+
+  // ── Immediate send (no delay) ─────────────────────────────────────────────
   let wamid: string | undefined;
   let finalStatus: MessageStatus = MessageStatus.FAILED;
 
@@ -169,7 +208,6 @@ export async function sendManualReply(input: {
     finalStatus = MessageStatus.SENT;
   } catch (err) {
     console.error("[Meta] sendTextMessage error:", err);
-    // Store message as FAILED so staff can see it didn't send
     finalStatus = MessageStatus.FAILED;
   }
 
@@ -193,5 +231,5 @@ export async function sendManualReply(input: {
     throw new Error("WhatsApp delivery failed — message not sent");
   }
 
-  return message;
+  return { message, delaySeconds: null };
 }

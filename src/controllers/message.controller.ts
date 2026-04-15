@@ -1,12 +1,9 @@
 import { Request, Response } from "express";
-import path from "path";
-import fs from "fs/promises";
 import { sendManualReply } from "../services/message.service";
 import prisma from "../db/connect";
 import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
 import { whatsappQueue } from "../queue/whatsapp.queue";
-import { deleteFromR2 } from "../services/r2.service";
 
 export async function manualReply(req: Request, res: Response) {
   try {
@@ -27,7 +24,7 @@ export async function manualReply(req: Request, res: Response) {
       return res.status(404).json({ error: "Guest not found" });
     }
 
-    const message = await sendManualReply({
+    const result = await sendManualReply({
       hotelId,
       guestId,
       fromPhone: guest.hotel.phone,
@@ -35,7 +32,8 @@ export async function manualReply(req: Request, res: Response) {
       text,
     });
 
-    res.json(message);
+    // Return { message, delaySeconds } — frontend uses delaySeconds to show countdown
+    res.json(result);
   } catch (err: any) {
     console.error("❌ manualReply failed:", err);
     res.status(500).json({ error: err?.message ?? "Send failed" });
@@ -132,78 +130,88 @@ export async function setBotEnabled(req: Request, res: Response) {
   }
 }
 
-/** DELETE /messages/:messageId?everyone=true — delete from DB (+ WhatsApp if everyone=true) */
+/** DELETE /messages/:messageId — soft-delete: marks deleted in DB, keeps tombstone */
 export async function deleteMessage(req: Request, res: Response) {
   try {
     const hotelId   = (req as any).user.hotelId as string;
-    const messageId = req.params["messageId"] as string;
-    const everyone  = req.query["everyone"] === "true";
+    const userId    = (req as any).user.id     as string;
+    const messageId = req.params["messageId"]  as string;
 
     const msg = await prisma.message.findFirst({
       where: { id: messageId, hotelId },
-      include: { hotel: { include: { config: true } } },
     });
     if (!msg) return res.status(404).json({ error: "Message not found" });
+    if (msg.deleted) return res.status(400).json({ error: "Message already deleted" });
 
-    // ── Unsend on WhatsApp (Delete for everyone) ───────────────────────────
-    // Only possible for outgoing messages that have a wamid
-    let whatsappDeleted = false;
-    if (everyone && msg.direction === "OUT" && msg.wamid) {
-      const accessToken     = (msg as any).hotel?.config?.metaAccessToken ?? "";
-      const phoneNumberId   = (msg as any).hotel?.config?.metaPhoneNumberId ?? "";
+    // Look up the staff member's name for the tombstone
+    const staff = await prisma.user.findUnique({
+      where:  { id: userId },
+      select: { name: true },
+    });
+    const deletedBy = staff?.name ?? "Staff";
 
-      if (accessToken && phoneNumberId) {
-        try {
-          const waRes = await fetch(
-            `https://graph.facebook.com/v25.0/${phoneNumberId}/messages`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${accessToken}`,
-              },
-              body: JSON.stringify({
-                messaging_product: "whatsapp",
-                status: "deleted",
-                message_id: msg.wamid,
-              }),
-              signal: AbortSignal.timeout(10_000),
-            }
-          );
-          if (waRes.ok) {
-            whatsappDeleted = true;
-          } else {
-            const waErr = await waRes.json().catch(() => ({}));
-            console.warn("⚠️  WhatsApp unsend failed:", waErr);
-          }
-        } catch (waErr) {
-          console.warn("⚠️  WhatsApp unsend error (non-fatal):", waErr);
-        }
-      }
-    }
+    const updated = await prisma.message.update({
+      where: { id: messageId },
+      data: {
+        deleted:   true,
+        deletedBy,
+        deletedAt: new Date(),
+        // wipe content so media / text can't be reconstructed from DB
+        body:      null,
+        mediaUrl:  null,
+        mimeType:  null,
+        fileName:  null,
+      },
+    });
 
-    // ── Delete media file ──────────────────────────────────────────────────
-    if (msg.mediaUrl) {
-      const publicR2 = process.env.R2_PUBLIC_URL?.replace(/\/$/, "");
-      if (publicR2 && msg.mediaUrl.startsWith(publicR2)) {
-        const key = msg.mediaUrl.slice(publicR2.length + 1);
-        await deleteFromR2(key);
-      } else if (msg.mediaUrl.startsWith("/uploads/")) {
-        const filePath = path.join(process.cwd(), msg.mediaUrl);
-        await fs.unlink(filePath).catch(() => {});
-      }
-    }
+    // Push tombstone to all open dashboard tabs in real time
+    emitToHotel(hotelId, "message:deleted", {
+      messageId,
+      guestId:   msg.guestId,
+      deletedBy,
+    });
 
-    // ── Delete DB record ───────────────────────────────────────────────────
-    await prisma.message.delete({ where: { id: messageId } });
-
-    // Notify all dashboard clients
-    emitToHotel(hotelId, "message:deleted", { messageId, guestId: msg.guestId });
-
-    return res.json({ success: true, whatsappDeleted });
+    return res.json({ success: true, message: updated });
   } catch (err: any) {
     console.error("❌ deleteMessage:", err);
     return res.status(500).json({ error: "Failed to delete message" });
+  }
+}
+
+/** DELETE /messages/:messageId/undo-send — cancel a pending delayed message before it sends */
+export async function undoSend(req: Request, res: Response) {
+  try {
+    const hotelId   = (req as any).user.hotelId as string;
+    const messageId = req.params["messageId"]   as string;
+
+    const msg = await prisma.message.findFirst({
+      where: { id: messageId, hotelId },
+    });
+    if (!msg) return res.status(404).json({ error: "Message not found" });
+    if (msg.status !== "PENDING") {
+      return res.status(400).json({ error: "Message has already been sent — cannot undo" });
+    }
+
+    // Remove the BullMQ job if it's still waiting
+    if (msg.jobId) {
+      try {
+        const job = await whatsappQueue.getJob(msg.jobId);
+        if (job) await job.remove();
+      } catch {
+        // Job may have already executed — proceed with DB cleanup
+      }
+    }
+
+    // Hard-delete the message row (no tombstone — it was never sent)
+    await prisma.message.delete({ where: { id: messageId } });
+
+    // Notify all open dashboard tabs to remove the pending bubble
+    emitToHotel(hotelId, "message:undo", { messageId, guestId: msg.guestId });
+
+    return res.json({ success: true });
+  } catch (err: any) {
+    console.error("❌ undoSend:", err);
+    return res.status(500).json({ error: "Failed to undo send" });
   }
 }
 

@@ -42,6 +42,8 @@ export async function updateHotelConfig(
     defaultLanguage?: string;
     welcomeMessage?: string;
     nightMessage?: string;
+    messageDelayEnabled?: boolean;
+    messageDelaySeconds?: number;
   }
 ) {
   const config = await prisma.hotelConfig.upsert({
