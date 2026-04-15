@@ -196,6 +196,14 @@ app.use((_req: Request, res: Response) => {
 // ── Global error handler (must be last) ──────────────────────────────────────
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  // Multer-specific errors — return 400 with a readable message
+  if (err.code === "LIMIT_FILE_SIZE") {
+    return res.status(400).json({ success: false, error: "File too large. Maximum size is 10 MB." });
+  }
+  if (err.code === "LIMIT_UNEXPECTED_FILE" || err.message?.startsWith("Unsupported file type")) {
+    return res.status(400).json({ success: false, error: err.message ?? "Unsupported file type." });
+  }
+
   const status  = err.status ?? err.statusCode ?? 500;
 
   // Never leak internal error details to clients in production
