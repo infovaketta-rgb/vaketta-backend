@@ -1,21 +1,9 @@
 import prisma from "../db/connect";
 import { BookingStatus } from "@prisma/client";
 import { checkRoomAvailability } from "./availability.service";
+import { generateReferenceNumber } from "../utils/booking.utils";
 
-async function generateReferenceNumber(): Promise<string> {
-  const year   = new Date().getFullYear();
-  const prefix = `VKT-${year}-`;
-  const last   = await prisma.booking.findFirst({
-    where:   { referenceNumber: { startsWith: prefix } },
-    orderBy: { referenceNumber: "desc" },
-    select:  { referenceNumber: true },
-  });
-  const lastSeq = last?.referenceNumber
-    ? parseInt(last.referenceNumber.split("-")[2] ?? "0", 10)
-    : 0;
-  const next = String(lastSeq + 1).padStart(5, "0");
-  return `${prefix}${next}`;
-}
+
 
 export async function updateBookingService({
   id,

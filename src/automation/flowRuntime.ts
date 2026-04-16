@@ -33,6 +33,8 @@ import {
   EndNodeData,
   JumpNodeData,
 } from "./flowTypes";
+import { generateReferenceNumber } from "../utils/booking.utils";
+import { BookingStatus } from "@prisma/client";
 
 const MAX_HOPS = 30;
 const DIVIDER  = "━━━━━━━━━━━━━━━━";
@@ -744,19 +746,21 @@ export async function executeFlowStep(
           const nights        = Math.max(1, Math.ceil((checkOutDate.getTime() - checkInDate.getTime()) / 86_400_000));
           const totalPrice    = pricePerNight * nights;
           const advancePaid   = advancePaidRaw ? Math.round(parseFloat(advancePaidRaw)) : 0;
+          const referenceNumber = await generateReferenceNumber();
 
           const booking = await prisma.booking.create({
             data: {
               hotelId, guestId, roomTypeId, guestName,
               checkIn: checkInDate, checkOut: checkOutDate,
-              status: "PENDING", pricePerNight, totalPrice, advancePaid,
+              status: BookingStatus.PENDING, pricePerNight, totalPrice, advancePaid,
+              referenceNumber,
             },
           });
 
           flowData.flowVars = {
             ...flowData.flowVars,
-            bookingRef:    booking.id.slice(0, 8).toUpperCase(),
-            bookingStatus: "PENDING",
+            bookingRef:    booking.referenceNumber ?? booking.id.slice(0, 8).toUpperCase(),
+            bookingStatus: BookingStatus.PENDING,
             bookingId:     booking.id,
           };
 
