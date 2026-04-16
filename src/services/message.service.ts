@@ -1,5 +1,4 @@
 import prisma from "../db/connect";
-import { whatsappQueue } from "../queue/whatsapp.queue";
 import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
 import { shouldAutoReply } from "../automation/shouldAutoReply";
@@ -121,8 +120,25 @@ export async function logIncomingMessage(
     sentReplyText  = menu ? `${nightMsg}\n\n${menu}` : nightMsg;
   }
 
-  // ── 6. Enqueue outbound message ──────────────────────────────────────────────
+  // ── 6. Send outbound bot reply directly (no BullMQ — worker is a separate process) ──
   if (sentReplyText) {
+    let wamid: string | undefined;
+    let finalStatus: MessageStatus = MessageStatus.FAILED;
+
+    try {
+      const result = await sendTextMessage({
+        toPhone:   fromPhone,
+        fromPhone: toPhone,
+        hotelId:   hotel.id,
+        guestId:   guest.id,
+        text:      sentReplyText,
+      });
+      wamid = (result as any)?.messages?.[0]?.id ?? undefined;
+      finalStatus = MessageStatus.SENT;
+    } catch (err) {
+      console.error("❌ [Bot] sendTextMessage failed:", err);
+    }
+
     const outMessage = await prisma.message.create({
       data: {
         direction:   "OUT",
@@ -132,12 +148,12 @@ export async function logIncomingMessage(
         messageType: "text",
         hotelId:     hotel.id,
         guestId:     guest.id,
-        status:      MessageStatus.PENDING,
+        status:      finalStatus,
+        ...(wamid ? { wamid } : {}),
       },
     });
 
     emitToHotel(hotel.id, "message:new", { message: outMessage });
-    await whatsappQueue.add("send", { messageId: outMessage.id });
   }
 
   return {
