@@ -212,11 +212,12 @@ enum BookingStatus {
 }
 
 model Booking {
-  id        String   @id @default(uuid())
-  guestName String
-  checkIn   DateTime
-  checkOut  DateTime
-  status    BookingStatus @default(PENDING)
+  id              String   @id @default(uuid())
+  referenceNumber String?  @unique  // VKT-YYYY-NNNNN
+  guestName       String
+  checkIn         DateTime
+  checkOut        DateTime
+  status          BookingStatus @default(PENDING)
 
 
   // 🔑 pricing

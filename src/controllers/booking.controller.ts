@@ -116,6 +116,25 @@ export async function editBooking(req: Request, res: Response) {
   }
 }
 
+export async function getBookingById(req: Request, res: Response) {
+  try {
+    const hotelId   = (req as any).user.hotelId as string;
+    const { bookingId } = req.params;
+    if (!bookingId) return res.status(400).json({ error: "bookingId required" });
+
+    const booking = await prisma.booking.findFirst({
+      where:   { id: bookingId, hotelId },
+      include: { guest: true, roomType: true },
+    });
+
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    return res.json(booking);
+  } catch (err) {
+    console.error("❌ getBookingById failed:", err);
+    return res.status(500).json({ error: "Failed to fetch booking" });
+  }
+}
+
 export async function getBookingSummary(req: Request, res: Response) {
   try {
     const hotelId = (req as any).user.hotelId;
