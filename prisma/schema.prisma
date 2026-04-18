@@ -17,11 +17,11 @@ model Plan {
   id                      String    @id @default(uuid())
   name                    String
   currency                String    @default("USD") // ISO 4217, e.g. "USD", "EUR", "INR"
-  priceMonthly            Int       // in minor units (cents/paise), e.g. 4900 = $49/mo
+  priceMonthly            Float       // in minor units (cents/paise), e.g. 4900 = $49/mo
   conversationLimit       Int       // 0 = unlimited
   aiReplyLimit            Int       // 0 = unlimited
-  extraConversationCharge Int       @default(0) // minor units per extra conversation
-  extraAiReplyCharge      Int       @default(0) // minor units per extra AI reply
+  extraConversationCharge Float       @default(0) // minor units per extra conversation
+  extraAiReplyCharge      Float      @default(0) // minor units per extra AI reply
   isActive                Boolean   @default(true)
   createdAt               DateTime  @default(now())
   updatedAt               DateTime  @updatedAt
@@ -36,11 +36,11 @@ model Subscription {
   planId                  String?                   // soft ref — plan may be updated later
   planName                String                    // snapshot at assignment time
   currency                String    @default("USD") // snapshot
-  price                   Int                       // snapshot in minor units
+  price                   Float                       // snapshot in minor units
   conversationLimit       Int                       // snapshot
   aiReplyLimit            Int                       // snapshot
-  extraConversationCharge Int       @default(0)     // snapshot in minor units
-  extraAiReplyCharge      Int       @default(0)     // snapshot in minor units
+  extraConversationCharge Float       @default(0)     // snapshot in minor units
+  extraAiReplyCharge      Float       @default(0)     // snapshot in minor units
   startDate               DateTime
   endDate                 DateTime?
   createdAt               DateTime  @default(now())
@@ -117,8 +117,8 @@ model HotelConfig {
   botMessages       Json     @default("{}")
 
   // Message delay (undo-send)
-  messageDelayEnabled Boolean @default(false)
-  messageDelaySeconds Int     @default(10)    // 1–60
+  messageDelayEnabled   Boolean @default(false)
+  messageDelaySeconds   Int     @default(10)    // 1–60
 
   // WhatsApp / Meta credentials (per-hotel)
   metaPhoneNumberId String?   // Meta Phone Number ID from developer console
@@ -221,9 +221,9 @@ model Booking {
 
 
   // 🔑 pricing
-  pricePerNight Int        // editable override
-  advancePaid   Int
-  totalPrice    Int
+  pricePerNight Float        // editable override
+  advancePaid   Float
+  totalPrice    Float
 
   hotelId String
   guestId String
@@ -247,7 +247,7 @@ model RoomType {
   name        String
   description String?
   amenities   String[]
-  basePrice   Int
+  basePrice   Float
   capacity    Int?        // total guests (adults + children)
   maxAdults   Int?        // max adults allowed
   maxChildren Int?        // max children allowed
@@ -282,7 +282,7 @@ model RoomInventory {
   roomTypeId     String
   date           DateTime @db.Date            // date-only, stored as UTC midnight
   availableRooms Int                          // staff-set count for this date (0 = closed)
-  price          Int?                         // null = inherit basePrice from RoomType
+  price          Float?                         // null = inherit basePrice from RoomType
 
   hotel    Hotel    @relation(fields: [hotelId],    references: [id], onDelete: Cascade)
   roomType RoomType @relation(fields: [roomTypeId], references: [id], onDelete: Cascade)
