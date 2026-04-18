@@ -35,6 +35,7 @@ export async function patchSettings(req: Request, res: Response) {
       timezone, defaultLanguage,
       welcomeMessage, nightMessage,
       messageDelayEnabled, messageDelaySeconds,
+      allDay,
     } = req.body;
 
     const config = await updateHotelConfig(hotelId(req), {
@@ -51,6 +52,7 @@ export async function patchSettings(req: Request, res: Response) {
       ...(nightMessage         !== undefined && { nightMessage }),
       ...(messageDelayEnabled  !== undefined && { messageDelayEnabled }),
       ...(messageDelaySeconds  !== undefined && { messageDelaySeconds: Number(messageDelaySeconds) }),
+      ...(allDay               !== undefined && { allDay }),
     });
 
     res.json(config);
