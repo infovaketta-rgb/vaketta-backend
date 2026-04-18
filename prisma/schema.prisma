@@ -110,7 +110,7 @@ model HotelConfig {
   aiEnabled             Boolean  @default(false)  // AI fallback for unrecognised guest messages
   businessStartHour Int      @default(9)
   businessEndHour   Int      @default(21)
-  open24Hours Boolean @default(false)
+  allDay            Boolean @default(false)
   defaultLanguage   String   @default("en")
   timezone          String   @default("UTC")
   welcomeMessage    String   @default("👋 Thanks for contacting us! Our team will assist you shortly.")
