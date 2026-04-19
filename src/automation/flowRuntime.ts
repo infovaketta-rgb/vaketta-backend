@@ -859,7 +859,7 @@ export async function executeFlowStep(
           guestName: guest?.name || flowData.flowVars["guestName"] || guest?.phone || "A guest",
           timestamp: new Date().toISOString(),
         });
-
+        console.log(`[notify_staff] emitted to hotel:${hotelId}`);
         flowData.flowVars = { ...flowData.flowVars, staffNotified: "yes" };
         const next = nextNodeId(currentNodeId, adjacency);
         if (!next) {
