@@ -847,21 +847,34 @@ export async function executeFlowStep(
         // ── notify_staff ───────────────────────────────────────────────────────
         if (d.actionType === "notify_staff") {
           await prisma.guest.update({ where: { id: guestId }, data: { lastHandledByStaff: true } }).catch(() => {});
-          flowData.flowVars = { ...flowData.flowVars, staffNotified: "yes" };
-          const next = nextNodeId(currentNodeId, adjacency);
-          if (!next) {
-            await resetSession(guestId, hotelId);
-            return d.message
-              ? interpolate(d.message, flowData.flowVars)
-              : "Our team has been notified and will be in touch shortly.";
-          }
-          await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
-          const rest = await advance(next);
-          if (d.message) {
-            const note = interpolate(d.message, flowData.flowVars);
-            return rest ? `${note}\n\n${rest}` : note;
-          }
-          return rest;
+  
+          // Browser notification to staff
+        const guest = await prisma.guest.findUnique({ 
+          where: { id: guestId }, 
+          select: { name: true, phone: true } 
+        });
+        const { emitToHotel } = await import("../realtime/emit");
+        emitToHotel(hotelId, "staff:notification", {
+          guestId,
+          guestName: guest?.name || flowData.flowVars["guestName"] || guest?.phone || "A guest",
+          timestamp: new Date().toISOString(),
+        });
+
+        flowData.flowVars = { ...flowData.flowVars, staffNotified: "yes" };
+        const next = nextNodeId(currentNodeId, adjacency);
+        if (!next) {
+          await resetSession(guestId, hotelId);
+        return d.message
+        ? interpolate(d.message, flowData.flowVars)
+        : "Our team has been notified and will be in touch shortly.";
+        }
+        await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+        const rest = await advance(next);
+        if (d.message) {
+          const note = interpolate(d.message, flowData.flowVars);
+          return rest ? `${note}\n\n${rest}` : note;
+        }
+        return rest;
         }
 
         // ── start_booking_flow (removed — booking state machine is gone) ──────────
