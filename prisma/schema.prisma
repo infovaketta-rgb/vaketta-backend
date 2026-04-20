@@ -268,10 +268,12 @@ model RoomType {
 model RoomPhoto {
   id         String   @id @default(uuid())
   url        String
+  isMain     Boolean  @default(false)
   order      Int      @default(0)
   roomTypeId String
   createdAt  DateTime @default(now())
-
+  
+  
   roomType   RoomType @relation(fields: [roomTypeId], references: [id], onDelete: Cascade)
 
   @@index([roomTypeId])
