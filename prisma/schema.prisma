@@ -387,9 +387,25 @@ model Lead {
 
 // Platform-wide privacy policy (singleton — only one row ever exists)
 model PrivacyPolicy {
-  id            String   @id @default("global")  // always "global"
-  effectiveDate String   @default("")             // display string, e.g. "April 11, 2026"
-  content       String   @default("")             // HTML body of the policy
+  id            String   @id @default("global")
+  effectiveDate String   @default("")
+  content       String   @default("")
+  updatedAt     DateTime @updatedAt
+}
+
+// Platform-wide terms of service (singleton)
+model TermsOfService {
+  id            String   @id @default("global")
+  effectiveDate String   @default("")
+  content       String   @default("")
+  updatedAt     DateTime @updatedAt
+}
+
+// Platform-wide data deletion instructions (singleton)
+model DataDeletion {
+  id            String   @id @default("global")
+  effectiveDate String   @default("")
+  content       String   @default("")
   updatedAt     DateTime @updatedAt
 }
 

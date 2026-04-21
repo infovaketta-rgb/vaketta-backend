@@ -37,6 +37,14 @@ import {
   getPrivacyPolicyHandler,
   updatePrivacyPolicyHandler,
 } from "../controllers/privacyPolicy.controller";
+import {
+  getTermsOfServiceHandler,
+  updateTermsOfServiceHandler,
+} from "../controllers/termsOfService.controller";
+import {
+  getDataDeletionHandler,
+  updateDataDeletionHandler,
+} from "../controllers/dataDeletion.controller";
 
 const router = Router();
 
@@ -84,6 +92,14 @@ router.delete("/hotels/:id/users/:userId", vakettaAdminAuth, deleteHotelUserHand
 // Privacy policy — GET is public, PATCH requires admin auth
 router.get("/privacy-policy",   getPrivacyPolicyHandler);
 router.patch("/privacy-policy", vakettaAdminAuth, updatePrivacyPolicyHandler);
+
+// Terms of service — GET is public, PATCH requires admin auth
+router.get("/terms-of-service",   getTermsOfServiceHandler);
+router.patch("/terms-of-service", vakettaAdminAuth, updateTermsOfServiceHandler);
+
+// Data deletion — GET is public, PATCH requires admin auth
+router.get("/data-deletion",   getDataDeletionHandler);
+router.patch("/data-deletion", vakettaAdminAuth, updateDataDeletionHandler);
 
 // Flow definitions (admin-facing — full access across all flows)
 router.get("/flows",        vakettaAdminAuth, adminListFlowsHandler);
