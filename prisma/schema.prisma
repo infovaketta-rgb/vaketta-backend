@@ -204,12 +204,12 @@ model Guest {
   @@unique([phone, hotelId])
 }
 
-
 enum BookingStatus {
-  PENDING
-  HOLD
-  CONFIRMED
-  CANCELLED
+  ENQUIRY    // bot created, no availability checked, hotel confirms manually
+  PENDING    // bot created, availability checked & blocked, hotel confirms manually
+  HOLD       // staff created, availability blocked temporarily
+  CONFIRMED  // active booking, availability blocked
+  CANCELLED  // cancelled, availability released
 }
 
 model Booking {
