@@ -1,6 +1,8 @@
 import { Router } from "express";
 import multer from "multer";
 import { manualReply, getMessages, markMessagesRead, setBotEnabled, sendMedia, deleteMessage, undoSend } from "../controllers/message.controller";
+import { requireRole } from "../middleware/role.middleware";
+import { UserRole } from "@prisma/client";
 
 const ALLOWED_MIME_TYPES = new Set([
   // Images
@@ -31,12 +33,12 @@ const upload = multer({
 
 const router = Router();
 
-router.post("/reply", manualReply);
-router.post("/send-media", upload.single("file"), sendMedia);
-router.delete("/:messageId/undo-send", undoSend);
-router.delete("/:messageId", deleteMessage);
-router.get("/:guestId", getMessages);
+router.post("/reply",     requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), manualReply);
+router.post("/send-media", upload.single("file"), requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), sendMedia);
+router.delete("/:messageId/undo-send", requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER), undoSend);
+router.delete("/:messageId",           requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER), deleteMessage);
+router.get("/:guestId",       getMessages);
 router.post("/:guestId/read", markMessagesRead);
-router.patch("/:guestId/bot", setBotEnabled);
+router.patch("/:guestId/bot", requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER), setBotEnabled);
 
 export default router;

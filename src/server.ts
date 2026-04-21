@@ -10,7 +10,11 @@ import prisma from "./db/connect";
 
 // ── Startup environment validation ────────────────────────────────────────────
 
-const REQUIRED_ENV: string[] = ["JWT_SECRET", "DATABASE_URL"];
+const REQUIRED_ENV: string[] = [
+  "JWT_SECRET",
+  "DATABASE_URL",
+  "WHATSAPP_APP_SECRET", // HMAC verification of Meta webhook payloads
+];
 
 function validateEnv() {
   const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
@@ -19,7 +23,7 @@ function validateEnv() {
     process.exit(1);
   }
 
-  // Warn about optional but important vars
+  // Warn about vars that degrade functionality when absent
   if (!process.env.REDIS_URL) {
     console.warn("⚠️  REDIS_URL not set — using redis://127.0.0.1:6379");
   }
@@ -28,6 +32,12 @@ function validateEnv() {
   }
   if (!process.env.FRONTEND_ORIGIN) {
     console.warn("⚠️  FRONTEND_ORIGIN not set — defaulting to http://localhost:3000");
+  }
+  if (!process.env.R2_BUCKET_NAME || !process.env.R2_PUBLIC_URL) {
+    console.warn("⚠️  R2_BUCKET_NAME / R2_PUBLIC_URL not set — media uploads will fall back to local disk");
+  }
+  if (!process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY) {
+    console.warn("⚠️  R2 credentials not set — media uploads will fall back to local disk");
   }
 }
 

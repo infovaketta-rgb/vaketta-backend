@@ -45,6 +45,38 @@ export async function getUsageHistory(hotelId: string, months = 6) {
   return records.reverse(); // oldest → newest for charts
 }
 
+// ── Quota check ───────────────────────────────────────────────────────────────
+
+/**
+ * Returns true if the hotel has exhausted its monthly conversation quota.
+ * Fails open (returns false) on any DB error — we never silence the bot
+ * due to a quota-check failure.
+ * Convention: conversationLimit === 0 means unlimited.
+ */
+export async function isConversationOverQuota(hotelId: string): Promise<boolean> {
+  try {
+    const hotel = await prisma.hotel.findUnique({
+      where:  { id: hotelId },
+      select: { subscriptionStatus: true },
+    });
+    if (!hotel) return false;
+    if (hotel.subscriptionStatus === "expired") return true;
+
+    const sub = await prisma.subscription.findFirst({
+      where:   { hotelId },
+      orderBy: { startDate: "desc" },
+      select:  { conversationLimit: true },
+    });
+    if (!sub) return false;
+    if (sub.conversationLimit === 0) return false; // 0 = unlimited
+
+    const usage = await getCurrentUsage(hotelId);
+    return usage.conversationsUsed >= sub.conversationLimit;
+  } catch {
+    return false; // fail open — don't silence bot on DB errors
+  }
+}
+
 // ── Admin aggregates ───────────────────────────────────────────────────────────
 
 export async function getPlatformUsageThisMonth() {

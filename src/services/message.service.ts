@@ -5,7 +5,7 @@ import { shouldAutoReply } from "../automation/shouldAutoReply";
 import { processMessage as botProcess } from "../automation/botEngine";
 import { buildMenuMessage } from "../automation/buildMenuResponse";
 import { resetSession } from "./session.service";
-import { incrementConversationUsage } from "./usage.service";
+import { incrementConversationUsage, isConversationOverQuota } from "./usage.service";
 import { sendTextMessage } from "./whatsapp.send.service";
 
 type IncomingMessageInput = {
@@ -89,11 +89,16 @@ export async function logIncomingMessage(
     select:  { timestamp: true },
   });
   if (!lastMessage || lastMessage.timestamp < twentyFourHoursAgo) {
-    incrementConversationUsage(hotel.id).catch(() => {});
+    incrementConversationUsage(hotel.id).catch((err) => console.error("[Usage] incrementConversationUsage failed:", err));
   }
 
   // ── 5. Auto-reply decision ───────────────────────────────────────────────────
   if (!hotel.config) {
+    return { hotelId: hotel.id, guestId: guest.id, autoReply: false, autoReplyMessage: null };
+  }
+
+  if (await isConversationOverQuota(hotel.id)) {
+    console.warn(`[Quota] Hotel ${hotel.id} has exceeded conversation limit — bot silenced`);
     return { hotelId: hotel.id, guestId: guest.id, autoReply: false, autoReplyMessage: null };
   }
 
