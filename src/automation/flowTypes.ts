@@ -123,7 +123,8 @@ export type ActionType =
   | "notify_staff"            // flags guest as staff-handled without stopping the flow
   | "reset_to_menu"           // resets session and shows main menu
   | "set_variable"            // writes a computed/static value into flowVars
-  | "send_review_request";    // sends a review-link message
+  | "send_review_request"     // sends a review-link message
+  | "view_bookings";          // fetches and formats the guest's booking history
 
 export interface ActionNodeData {
   actionType: ActionType;

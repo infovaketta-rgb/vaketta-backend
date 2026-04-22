@@ -13,7 +13,7 @@
  *
  * Action types:
  *   create_booking, update_booking_status, start_booking_flow (legacy),
- *   handoff_to_staff, notify_staff, reset_to_menu, set_variable, send_review_request
+ *   handoff_to_staff, notify_staff, reset_to_menu, set_variable, send_review_request, view_bookings
  */
 
 import prisma from "../db/connect";
@@ -937,6 +937,49 @@ export async function executeFlowStep(
           await resetSession(guestId, hotelId);
           const menu = await safeMenu(hotelId);
           return d.message ? `${d.message}\n\n${menu ?? ""}`.trim() : menu;
+        }
+
+        // ── view_bookings ──────────────────────────────────────────────────────
+        if (d.actionType === "view_bookings") {
+          const bookings = await prisma.booking.findMany({
+            where:   { guestId, hotelId },
+            orderBy: { createdAt: "desc" },
+            select: {
+              referenceNumber: true,
+              roomType:        { select: { name: true } },
+              checkIn:         true,
+              checkOut:        true,
+              status:          true,
+            },
+          });
+
+          let reply: string;
+          if (!bookings.length) {
+            reply = "You have no bookings with us yet.\n\n_Reply *MENU* to see all options._";
+          } else {
+            const STATUS_EMOJI: Record<string, string> = {
+              CONFIRMED: "✅",
+              PENDING:   "⏳",
+              CANCELLED: "❌",
+              COMPLETED: "🏁",
+            };
+            const lines = bookings.map((b) => {
+              const emoji    = STATUS_EMOJI[b.status] ?? "📋";
+              const checkIn  = new Date(b.checkIn).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+              const checkOut = new Date(b.checkOut).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+              return `📋 *${b.referenceNumber ?? b.status}*\nRoom: ${b.roomType?.name ?? "N/A"}\nCheck-in: ${checkIn} · Check-out: ${checkOut}\nStatus: ${b.status} ${emoji}`;
+            });
+            reply = `*Your Bookings*\n\n${lines.join("\n\n")}\n\n_Reply *MENU* to return to the main menu._`;
+          }
+
+          const next = nextNodeId(currentNodeId, adjacency);
+          if (!next) {
+            await resetSession(guestId, hotelId);
+            return reply;
+          }
+          await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+          const rest = await advance(next);
+          return rest ? `${reply}\n\n${rest}` : reply;
         }
 
         // Unknown action — advance silently
