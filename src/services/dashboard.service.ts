@@ -76,96 +76,61 @@ export async function getDashboardData(hotelId: string): Promise<DashboardRespon
   const todayEnd = endOfUtcDay(now);
   const yesterdayStart = startOfUtcDay(addUtcDays(now, -1));
   const yesterdayEnd = endOfUtcDay(addUtcDays(now, -1));
-
-  const todayRevenue = await sumConfirmedRevenueInRange(
-    hotelId,
-    todayStart,
-    todayEnd
-  );
-  const yesterdayRevenue = await sumConfirmedRevenueInRange(
-    hotelId,
-    yesterdayStart,
-    yesterdayEnd
-  );
-
-  const totalBookingsCount = await prisma.booking.count({ where: { hotelId } });
-
   const sevenDaysAgo = addUtcDays(todayStart, -7);
   const fourteenDaysAgo = addUtcDays(todayStart, -14);
-
-  const bookingsLast7d = await prisma.booking.count({
-    where: {
-      hotelId,
-      createdAt: { gte: sevenDaysAgo },
-    },
-  });
-  const bookingsPrev7d = await prisma.booking.count({
-    where: {
-      hotelId,
-      createdAt: { gte: fourteenDaysAgo, lt: sevenDaysAgo },
-    },
-  });
-
   const day24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
   const day48h = new Date(now.getTime() - 48 * 60 * 60 * 1000);
 
-  const activeGuestsRows = await prisma.message.groupBy({
-    by: ["guestId"],
-    where: {
-      hotelId,
-      guestId: { not: null },
-      timestamp: { gte: day24h },
-    },
-  });
-  const activeGuests24h = activeGuestsRows.filter((r) => r.guestId).length;
-
-  const activeGuestsPrevRows = await prisma.message.groupBy({
-    by: ["guestId"],
-    where: {
-      hotelId,
-      guestId: { not: null },
-      timestamp: { gte: day48h, lt: day24h },
-    },
-  });
-  const activeGuestsPrev24h = activeGuestsPrevRows.filter((r) => r.guestId).length;
-
-  const pendingBookings = await prisma.booking.count({
-    where: { hotelId, status: BookingStatus.PENDING },
-  });
-
-  const pendingCreatedLast7d = await prisma.booking.count({
-    where: {
-      hotelId,
-      status: BookingStatus.PENDING,
-      createdAt: { gte: sevenDaysAgo },
-    },
-  });
-  const pendingCreatedPrev7d = await prisma.booking.count({
-    where: {
-      hotelId,
-      status: BookingStatus.PENDING,
-      createdAt: { gte: fourteenDaysAgo, lt: sevenDaysAgo },
-    },
-  });
-
-  // Fetch all bookings in the 7-day window in two queries instead of 14
-  const [confirmedLast7, allLast7] = await Promise.all([
+  // All 10 independent queries run in parallel — reduces wall-clock time from ~10x serial to 1x
+  const [
+    todayRevenue,
+    yesterdayRevenue,
+    totalBookingsCount,
+    bookingsLast7d,
+    bookingsPrev7d,
+    activeGuestsRows,
+    activeGuestsPrevRows,
+    pendingBookings,
+    pendingCreatedLast7d,
+    pendingCreatedPrev7d,
+    confirmedLast7,
+    allLast7,
+    recent,
+  ] = await Promise.all([
+    sumConfirmedRevenueInRange(hotelId, todayStart, todayEnd),
+    sumConfirmedRevenueInRange(hotelId, yesterdayStart, yesterdayEnd),
+    prisma.booking.count({ where: { hotelId } }),
+    prisma.booking.count({ where: { hotelId, createdAt: { gte: sevenDaysAgo } } }),
+    prisma.booking.count({ where: { hotelId, createdAt: { gte: fourteenDaysAgo, lt: sevenDaysAgo } } }),
+    prisma.message.groupBy({
+      by: ["guestId"],
+      where: { hotelId, guestId: { not: null }, timestamp: { gte: day24h } },
+    }),
+    prisma.message.groupBy({
+      by: ["guestId"],
+      where: { hotelId, guestId: { not: null }, timestamp: { gte: day48h, lt: day24h } },
+    }),
+    prisma.booking.count({ where: { hotelId, status: BookingStatus.PENDING } }),
+    prisma.booking.count({ where: { hotelId, status: BookingStatus.PENDING, createdAt: { gte: sevenDaysAgo } } }),
+    prisma.booking.count({ where: { hotelId, status: BookingStatus.PENDING, createdAt: { gte: fourteenDaysAgo, lt: sevenDaysAgo } } }),
     prisma.booking.findMany({
-      where: {
-        hotelId,
-        status: BookingStatus.CONFIRMED,
-        createdAt: { gte: sevenDaysAgo, lte: todayEnd },
-      },
+      where: { hotelId, status: BookingStatus.CONFIRMED, createdAt: { gte: sevenDaysAgo, lte: todayEnd } },
       select: { createdAt: true, totalPrice: true },
     }),
     prisma.booking.findMany({
-      where: {
-        hotelId,
-        createdAt: { gte: sevenDaysAgo, lte: todayEnd },
-      },
+      where: { hotelId, createdAt: { gte: sevenDaysAgo, lte: todayEnd } },
       select: { createdAt: true },
     }),
+    prisma.booking.findMany({
+      where: { hotelId },
+      orderBy: { createdAt: "desc" },
+      take: 12,
+      include: { roomType: { select: { name: true } } },
+    }),
   ]);
+
+  const activeGuests24h     = activeGuestsRows.filter((r) => r.guestId).length;
+  const activeGuestsPrev24h = activeGuestsPrevRows.filter((r) => r.guestId).length;
 
   // Build day-keyed maps
   const revenueByDay = new Map<string, number>();
@@ -189,15 +154,6 @@ export async function getDashboardData(hotelId: string): Promise<DashboardRespon
     revenueLast7Days.push({ date: key, revenue: revenueByDay.get(key) ?? 0 });
     bookingsLast7Days.push({ date: key, count: countByDay.get(key) ?? 0 });
   }
-
-  const recent = await prisma.booking.findMany({
-    where: { hotelId },
-    orderBy: { createdAt: "desc" },
-    take: 12,
-    include: {
-      roomType: { select: { name: true } },
-    },
-  });
 
   const recentBookings = recent.map((b) => ({
     id: b.id,

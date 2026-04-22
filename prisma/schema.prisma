@@ -236,9 +236,10 @@ model Booking {
 
   createdAt DateTime @default(now())
 
-  @@index([hotelId, status])     // dashboard + booking list queries
-  @@index([guestId])             // guest booking history
-  @@index([checkIn, checkOut])   // availability overlap queries
+  @@index([hotelId, status])      // dashboard + booking list queries
+  @@index([hotelId, createdAt])   // dashboard date-range analytics
+  @@index([guestId])              // guest booking history
+  @@index([checkIn, checkOut])    // availability overlap queries
 }
 
 

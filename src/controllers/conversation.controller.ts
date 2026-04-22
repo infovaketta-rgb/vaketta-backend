@@ -38,6 +38,7 @@ export async function getConversations(req: Request, res: Response) {
       return {
         guestId: guest.id,
         phone: guest.phone,
+        name: guest.name ?? null,
         lastHandledByStaff: guest.lastHandledByStaff,
         lastMessage: lastMessage?.body ?? null,
         lastMessageType: lastMessage?.messageType ?? null,
@@ -58,6 +59,33 @@ export async function getConversations(req: Request, res: Response) {
     return res.json(result);
   } catch (err) {
     console.error("❌ Get conversations failed:", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+}
+
+export async function updateGuestName(req: Request, res: Response) {
+  try {
+    const user    = (req as Request & { user?: JwtUser }).user;
+    const hotelId = user?.hotelId;
+    if (!hotelId) return res.status(401).json({ error: "Unauthorized" });
+
+    const { guestId } = req.params as { guestId: string };
+    const { name }    = req.body as { name?: string };
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: "Name is required" });
+    }
+
+    const guest = await prisma.guest.updateMany({
+      where: { id: guestId, hotelId },
+      data:  { name: name.trim() },
+    });
+
+    if (guest.count === 0) return res.status(404).json({ error: "Guest not found" });
+
+    return res.json({ success: true, name: name.trim() });
+  } catch (err) {
+    console.error("❌ Update guest name failed:", err);
     return res.status(500).json({ error: "Internal Server Error" });
   }
 }

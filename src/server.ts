@@ -1,12 +1,24 @@
 // ⚠️  loadEnv MUST be first — populates process.env before any other module reads it
 import "./loadEnv";
 
+import * as Sentry from "@sentry/node";
+
+// Init Sentry before importing app so all Express handlers are instrumented
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn:              process.env.SENTRY_DSN,
+    environment:      process.env.NODE_ENV ?? "development",
+    tracesSampleRate: process.env.NODE_ENV === "production" ? 0.1 : 1.0,
+  });
+}
+
 import http from "http";
 import { initSocket } from "./socket";
 import app from "./app";
 import { subscribeMessageStatus } from "./realtime/statusBus";
 import { emitToHotel } from "./realtime/emit";
 import prisma from "./db/connect";
+import { logger } from "./utils/logger";
 
 // ── Startup environment validation ────────────────────────────────────────────
 
@@ -19,25 +31,25 @@ const REQUIRED_ENV: string[] = [
 function validateEnv() {
   const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
   if (missing.length) {
-    console.error(`❌ FATAL: Missing required env vars: ${missing.join(", ")}`);
+    logger.fatal({ missing }, "missing required env vars — aborting");
     process.exit(1);
   }
 
   // Warn about vars that degrade functionality when absent
   if (!process.env.REDIS_URL) {
-    console.warn("⚠️  REDIS_URL not set — using redis://127.0.0.1:6379");
+    logger.warn("REDIS_URL not set — using redis://127.0.0.1:6379");
   }
   if (!process.env.ANTHROPIC_API_KEY && !process.env.OPENAI_API_KEY) {
-    console.warn("⚠️  No AI API key set — AI fallback will be disabled");
+    logger.warn("no AI API key set — AI fallback will be disabled");
   }
   if (!process.env.FRONTEND_ORIGIN) {
-    console.warn("⚠️  FRONTEND_ORIGIN not set — defaulting to http://localhost:3000");
+    logger.warn("FRONTEND_ORIGIN not set — defaulting to http://localhost:3000");
   }
   if (!process.env.R2_BUCKET_NAME || !process.env.R2_PUBLIC_URL) {
-    console.warn("⚠️  R2_BUCKET_NAME / R2_PUBLIC_URL not set — media uploads will fall back to local disk");
+    logger.warn("R2_BUCKET_NAME / R2_PUBLIC_URL not set — media uploads will fall back to local disk");
   }
   if (!process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY) {
-    console.warn("⚠️  R2 credentials not set — media uploads will fall back to local disk");
+    logger.warn("R2 credentials not set — media uploads will fall back to local disk");
   }
 }
 
@@ -56,9 +68,7 @@ const unsubscribeStatus = subscribeMessageStatus(({ hotelId, messageId, status }
 const PORT = Number(process.env.PORT) || 5000;
 
 server.listen(PORT, () => {
-  console.log(`🚀 Vaketta backend running on port ${PORT}`);
-  console.log(`   Provider: ${process.env.AI_PROVIDER ?? "anthropic"}`);
-  console.log(`   Env:      ${process.env.NODE_ENV ?? "development"}`);
+  logger.info({ port: PORT, env: process.env.NODE_ENV ?? "development", aiProvider: process.env.AI_PROVIDER ?? "anthropic" }, "Vaketta backend started");
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
@@ -69,25 +79,23 @@ async function shutdown(signal: string) {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  console.log(`\n🛑 ${signal} received — shutting down gracefully...`);
+  logger.info({ signal }, "shutdown signal received — closing gracefully");
 
-  // Stop accepting new connections
   unsubscribeStatus();
 
   server.close(async () => {
     try {
       await prisma.$disconnect();
-      console.log("✅ Database connection closed");
+      logger.info("database connection closed");
     } catch (err) {
-      console.error("❌ Error closing DB:", err);
+      logger.error({ err }, "error closing database connection");
     }
-    console.log("✅ Server closed — exiting");
+    logger.info("server closed — exiting");
     process.exit(0);
   });
 
-  // Force exit after 15s if something hangs
   setTimeout(() => {
-    console.error("❌ Forced shutdown after timeout");
+    logger.error("forced shutdown after timeout");
     process.exit(1);
   }, 15_000).unref();
 }
@@ -97,10 +105,10 @@ process.on("SIGINT",  () => shutdown("SIGINT"));
 
 // Log unhandled promise rejections instead of crashing silently
 process.on("unhandledRejection", (reason) => {
-  console.error("⚠️  Unhandled rejection:", reason);
+  logger.error({ reason }, "unhandled promise rejection");
 });
 
 process.on("uncaughtException", (err) => {
-  console.error("❌ Uncaught exception:", err);
+  logger.fatal({ err }, "uncaught exception");
   shutdown("uncaughtException");
 });

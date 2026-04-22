@@ -16,6 +16,11 @@ import authRoutes from "./routes/auth.routes";
 import dashboardRoutes from "./routes/dashboard.routes";
 import settingsRoutes from "./routes/settings.routes";
 import { publicRouter, adminLeadRouter } from "./routes/lead.routes";
+import { logger } from "./utils/logger";
+import prisma from "./db/connect";
+import { redis } from "./queue/redis";
+import { requestId } from "./middleware/requestId.middleware";
+import * as Sentry from "@sentry/node";
 
 const isProd = process.env.NODE_ENV === "production";
 const app: Application = express();
@@ -23,6 +28,9 @@ const app: Application = express();
 // ── Trust proxy (required for correct IP behind Render / Railway / nginx) ─────
 // "1" = trust exactly one hop (the platform's load balancer)
 app.set("trust proxy", 1);
+
+// ── Request ID ────────────────────────────────────────────────────────────────
+app.use(requestId);
 
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use(
@@ -56,7 +64,7 @@ app.use(
         return callback(null, true);
       }
 
-      console.warn(`[CORS] Blocked origin: ${origin}`);
+      logger.warn({ origin }, "CORS blocked origin");
       return callback(new Error(`Origin ${origin} not allowed`));
     },
     credentials: true,
@@ -141,7 +149,7 @@ app.post(
     try {
       req.body = JSON.parse(req.body.toString());
     } catch {
-      console.warn("⚠️  WhatsApp webhook: invalid JSON — ignoring");
+      logger.warn("WhatsApp webhook: invalid JSON body — ignoring");
       return _res.sendStatus(200); // always ACK Meta to prevent retries
     }
     next();
@@ -174,9 +182,18 @@ app.use("/public", publicRouter);
 app.use("/admin/leads", adminLeadRouter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => {
+app.get("/health", async (_req, res) => {
+  const [dbResult, redisResult] = await Promise.allSettled([
+    prisma.$queryRaw`SELECT 1`,
+    redis.ping(),
+  ]);
+  const dbOk    = dbResult.status    === "fulfilled";
+  const redisOk = redisResult.status === "fulfilled";
   res.status(200).json({
-    status:  "ok",
+    status:  dbOk && redisOk ? "ok" : "degraded",
+    db:      dbOk,
+    redis:   redisOk,
+    uptime:  process.uptime(),
     service: "vaketta-backend",
     time:    new Date().toISOString(),
     env:     process.env.NODE_ENV ?? "development",
@@ -212,7 +229,8 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     : err.message ?? "Internal Server Error";
 
   if (status >= 500) {
-    console.error("❌ Unhandled error:", err);
+    logger.error({ err, status }, "unhandled error");
+    if (process.env.SENTRY_DSN) Sentry.captureException(err);
   }
 
   res.status(status).json({ success: false, error: message });

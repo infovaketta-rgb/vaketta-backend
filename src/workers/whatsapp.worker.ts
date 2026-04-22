@@ -5,8 +5,11 @@ import { sendTextMessage, sendMediaMessage } from "../services/whatsapp.send.ser
 import { MessageStatus } from "@prisma/client";
 import { publishMessageStatus } from "../realtime/statusBus";
 import "./billing.worker"; // Start billing expiry cron alongside this worker
+import { logger } from "../utils/logger";
 
-console.log("🚀 WhatsApp worker booting...");
+const log = logger.child({ service: "worker" });
+
+log.info("WhatsApp worker booting...");
 
 const worker = new Worker(
   "whatsapp-out",
@@ -22,8 +25,7 @@ const worker = new Worker(
     });
 
     if (claimed.count === 0) {
-      // Another worker already processed this message — skip
-      console.log(`⚠️  Message ${messageId} already claimed — skipping`);
+      log.warn({ messageId }, "message already claimed by another worker — skipping");
       return;
     }
 
@@ -61,7 +63,7 @@ const worker = new Worker(
       });
 
       publishMessageStatus({ hotelId: message.hotelId, messageId: message.id, status: MessageStatus.SENT });
-      console.log("✅ Message sent:", message.id);
+      log.info({ messageId: message.id, hotelId: message.hotelId }, "message sent");
 
     } catch (err) {
       await prisma.message.update({
@@ -69,7 +71,7 @@ const worker = new Worker(
         data:  { status: MessageStatus.FAILED },
       });
       publishMessageStatus({ hotelId: message.hotelId, messageId: message.id, status: MessageStatus.FAILED });
-      console.error("❌ Message failed:", message.id, err);
+      log.error({ err, messageId: message.id, hotelId: message.hotelId }, "message send failed");
       throw err; // re-throw so BullMQ applies retry policy
     }
   },
@@ -81,9 +83,9 @@ const worker = new Worker(
 
 // Log permanently failed jobs so they are never silently dropped
 worker.on("failed", (job, err) => {
-  console.error(`❌ [Worker] Job ${job?.id} exhausted all retries — messageId: ${job?.data?.messageId}`, err);
+  log.error({ err, jobId: job?.id, messageId: job?.data?.messageId }, "job exhausted all retries");
 });
 
 worker.on("error", (err) => {
-  console.error("❌ [Worker] Worker error:", err);
+  log.error({ err }, "worker error");
 });

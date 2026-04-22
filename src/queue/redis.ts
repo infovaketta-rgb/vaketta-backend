@@ -1,4 +1,5 @@
 import { Redis } from "ioredis";
+import { logger } from "../utils/logger";
 
 function createRedis(label: string): Redis {
   // Read at call time (not module load time) so dotenv has already run.
@@ -13,16 +14,16 @@ function createRedis(label: string): Redis {
       const delay = times > 20
         ? 30_000  // after 20 fast attempts, keep retrying every 30s indefinitely
         : Math.min(times * 200, 5_000);
-      console.warn(`⚠️  [Redis:${label}] Reconnecting in ${delay}ms (attempt ${times})`);
+      logger.warn({ label, attempt: times, delayMs: delay }, "Redis reconnecting");
       return delay;
     },
   });
 
-  client.on("connect",   ()    => console.log(`✅ [Redis:${label}] Connected`));
-  client.on("ready",     ()    => console.log(`✅ [Redis:${label}] Ready`));
-  client.on("error",     (err) => console.error(`❌ [Redis:${label}] Error:`, err.message));
-  client.on("close",     ()    => console.warn(`⚠️  [Redis:${label}] Connection closed`));
-  client.on("reconnecting", () => console.warn(`⚠️  [Redis:${label}] Reconnecting...`));
+  client.on("connect",      ()    => logger.info({ label }, "Redis connected"));
+  client.on("ready",        ()    => logger.info({ label }, "Redis ready"));
+  client.on("error",        (err) => logger.error({ label, err: err.message }, "Redis error"));
+  client.on("close",        ()    => logger.warn({ label }, "Redis connection closed"));
+  client.on("reconnecting", ()    => logger.warn({ label }, "Redis reconnecting"));
 
   return client;
 }

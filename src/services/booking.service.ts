@@ -2,6 +2,7 @@ import prisma from "../db/connect";
 import { BookingStatus } from "@prisma/client";
 import { checkRoomAvailability } from "./availability.service";
 import { generateReferenceNumber } from "../utils/booking.utils";
+import { emitToHotel } from "../realtime/emit";
 
 
 
@@ -140,7 +141,7 @@ const nights = Math.ceil(
 
   const referenceNumber = await generateReferenceNumber();
 
-  return prisma.booking.create({
+  const booking = await prisma.booking.create({
     data: {
       hotelId,
       guestId,
@@ -156,4 +157,8 @@ const nights = Math.ceil(
     },
     include: { guest: true, roomType: true },
   });
+
+  emitToHotel(hotelId, "booking:new", { booking });
+
+  return booking;
 }

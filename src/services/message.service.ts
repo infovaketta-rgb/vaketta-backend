@@ -6,6 +6,9 @@ import { processMessage as botProcess } from "../automation/botEngine";
 import { buildMenuMessage } from "../automation/buildMenuResponse";
 import { resetSession } from "./session.service";
 import { incrementConversationUsage, isConversationOverQuota } from "./usage.service";
+import { logger } from "../utils/logger";
+
+const log = logger.child({ service: "message" });
 import { sendTextMessage } from "./whatsapp.send.service";
 
 type IncomingMessageInput = {
@@ -89,7 +92,7 @@ export async function logIncomingMessage(
     select:  { timestamp: true },
   });
   if (!lastMessage || lastMessage.timestamp < twentyFourHoursAgo) {
-    incrementConversationUsage(hotel.id).catch((err) => console.error("[Usage] incrementConversationUsage failed:", err));
+    incrementConversationUsage(hotel.id).catch((err) => log.error({ err, hotelId: hotel.id }, "incrementConversationUsage failed"));
   }
 
   // ── 5. Auto-reply decision ───────────────────────────────────────────────────
@@ -98,7 +101,7 @@ export async function logIncomingMessage(
   }
 
   if (await isConversationOverQuota(hotel.id)) {
-    console.warn(`[Quota] Hotel ${hotel.id} has exceeded conversation limit — bot silenced`);
+    log.warn({ hotelId: hotel.id }, "conversation quota exceeded — bot silenced");
     return { hotelId: hotel.id, guestId: guest.id, autoReply: false, autoReplyMessage: null };
   }
 
@@ -141,7 +144,7 @@ export async function logIncomingMessage(
       wamid = (result as any)?.messages?.[0]?.id ?? undefined;
       finalStatus = MessageStatus.SENT;
     } catch (err) {
-      console.error("❌ [Bot] sendTextMessage failed:", err);
+      log.error({ err, hotelId: hotel.id, guestId: guest.id }, "bot sendTextMessage failed");
     }
 
     const outMessage = await prisma.message.create({

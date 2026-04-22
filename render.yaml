@@ -1,0 +1,57 @@
+services:
+  # ── Web service ──────────────────────────────────────────────────────────────
+  - type: web
+    name: vaketta-backend
+    runtime: node
+    buildCommand: npm ci && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - fromGroup: vaketta-secrets
+
+  # ── Worker service ────────────────────────────────────────────────────────────
+  - type: worker
+    name: vaketta-worker
+    runtime: node
+    buildCommand: npm ci && npm run build
+    startCommand: node dist/workers/whatsapp.worker.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - fromGroup: vaketta-secrets
+
+envVarGroups:
+  - name: vaketta-secrets
+    envVars:
+      - key: JWT_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: WHATSAPP_APP_SECRET
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: R2_PUBLIC_URL
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_ENDPOINT
+        sync: false
+      - key: SENTRY_DSN
+        sync: false
