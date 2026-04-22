@@ -35,6 +35,7 @@ import {
 } from "./flowTypes";
 import { generateReferenceNumber } from "../utils/booking.utils";
 import { BookingStatus } from "@prisma/client";
+import { shouldAutoReply } from "./shouldAutoReply";
 
 const MAX_HOPS = 30;
 const DIVIDER  = "━━━━━━━━━━━━━━━━";
@@ -227,6 +228,18 @@ export async function executeFlowStep(
     };
   }
 
+  // Fetch hotel config once for the business-hours gate (used inside advance()).
+  const hotelCfg = await prisma.hotelConfig.findUnique({
+    where:  { hotelId },
+    select: {
+      autoReplyEnabled:  true,
+      businessStartHour: true,
+      businessEndHour:   true,
+      timezone:          true,
+      allDay:            true,
+    },
+  });
+
   return advance(nodeId);
 
   async function advance(currentNodeId: string): Promise<string | null> {
@@ -240,6 +253,31 @@ export async function executeFlowStep(
     if (!node) {
       await resetSession(guestId, hotelId);
       return safeMenu(hotelId);
+    }
+
+    // ── Business hours gate ──────────────────────────────────────────────────
+    // Any node can carry businessHoursOnly=true (set via the inspector panel).
+    // We use lastHandledByStaff=false so the check is purely time-based —
+    // staff handling status is irrelevant to whether hours are open.
+    if ((node.data as any).businessHoursOnly === true && hotelCfg) {
+      const mode = shouldAutoReply(
+        {
+          autoReplyEnabled:  hotelCfg.autoReplyEnabled,
+          businessStartHour: hotelCfg.businessStartHour,
+          businessEndHour:   hotelCfg.businessEndHour,
+          timezone:          hotelCfg.timezone,
+          allDay:            hotelCfg.allDay,
+        },
+        false,
+      );
+      if (mode === "NIGHT") {
+        // Keep session at this node so the guest can retry when hours open.
+        await updateSession(guestId, hotelId, state, { ...sessionData, flow: { ...flowData } });
+        const outsideMsg =
+          ((node.data as any).outsideHoursMessage as string | undefined)?.trim() ||
+          "This option is only available during our business hours.";
+        return outsideMsg;
+      }
     }
 
     switch (node.type) {

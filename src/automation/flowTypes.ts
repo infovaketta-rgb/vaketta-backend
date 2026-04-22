@@ -150,6 +150,10 @@ export interface ActionNodeData {
   // ── send_review_request ─────────────────────────────────────────────────────
   reviewUrl?:     string;  // static URL (leave blank to use hotel settings)
   reviewMessage?: string;  // custom text; supports {{interpolation}}
+
+  // ── business hours gate (handoff_to_staff / notify_staff) ─────────────────
+  businessHoursOnly?:    boolean; // if true, skip node outside business hours
+  outsideHoursMessage?:  string;  // reply when blocked; falls back to default if blank
 }
 
 export interface EndNodeData {
