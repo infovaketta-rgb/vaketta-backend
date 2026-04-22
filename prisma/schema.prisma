@@ -117,6 +117,7 @@ model HotelConfig {
   welcomeMessage    String   @default("👋 Thanks for contacting us! Our team will assist you shortly.")
   nightMessage      String   @default("🌙 We're currently outside business hours. We'll get back to you when we open!")
   botMessages       Json     @default("{}")
+  aiInstructions    String?
 
   // Message delay (undo-send)
   messageDelayEnabled   Boolean @default(false)

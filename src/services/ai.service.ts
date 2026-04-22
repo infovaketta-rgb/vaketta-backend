@@ -99,6 +99,7 @@ async function getSystemPrompt(hotelId: string): Promise<string> {
           businessStartHour: true,
           businessEndHour:   true,
           timezone:          true,
+          aiInstructions:    true,
         },
       },
       roomTypes: {
@@ -176,6 +177,11 @@ async function getSystemPrompt(hotelId: string): Promise<string> {
     roomLines.length ? `## Room types\n${roomLines.join("\n")}` : null,
     menuLines.length ? `\n## Menu options\n${menuLines.join("\n")}` : null,
   ].filter((l): l is string => l !== null);
+
+  const aiInstructions = (cfg as any)?.aiInstructions as string | null | undefined;
+  if (aiInstructions?.trim()) {
+    lines.push(``, `## Custom Instructions`, aiInstructions.trim());
+  }
 
   const prompt = lines.join("\n");
   promptCache.set(hotelId, { prompt, builtAt: Date.now() });
