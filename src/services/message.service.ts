@@ -6,6 +6,7 @@ import { processMessage as botProcess } from "../automation/botEngine";
 import { buildMenuMessage } from "../automation/buildMenuResponse";
 import { resetSession } from "./session.service";
 import { incrementConversationUsage, isConversationOverQuota } from "./usage.service";
+import { sendPushToHotelStaff } from "./push.service";
 import { logger } from "../utils/logger";
 
 const log = logger.child({ service: "message" });
@@ -126,6 +127,17 @@ export async function logIncomingMessage(
     const nightMsg = hotel.config.nightMessage;
     const menu     = await buildMenuMessage(hotel.id);
     sentReplyText  = menu ? `${nightMsg}\n\n${menu}` : nightMsg;
+  }
+
+  if (autoReplyMode === "OFF") {
+    const guestLabel = guest.name ?? fromPhone;
+    sendPushToHotelStaff(hotel.id, {
+      title: "New message",
+      body:  `${guestLabel}: ${body?.slice(0, 100) ?? "(media)"}`,
+      icon:  "/vchat icon.png",
+      url:   "/dashboard/chats",
+    }).catch((err) => log.error({ err }, "push notification failed"));
+    emitToHotel(hotel.id, "staff:notification", { guestId: guest.id, guestName: guestLabel, body: body ?? null });
   }
 
   // ── 6. Send outbound bot reply directly (no BullMQ — worker is a separate process) ──

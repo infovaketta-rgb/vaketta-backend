@@ -92,6 +92,7 @@ model Hotel {
   usageRecords         UsageRecord[]
   flowDefinitions      FlowDefinition[]
   inventory            RoomInventory[]
+  pushSubscriptions    PushSubscription[]
 
   plan   Plan?       @relation(fields: [planId], references: [id])
   config HotelConfig?
@@ -455,5 +456,22 @@ model User {
   hotelId   String
   hotel     Hotel @relation(fields:[hotelId],references:[id])
 
+  pushSubscriptions PushSubscription[]
+
   createdAt DateTime @default(now())
+}
+
+model PushSubscription {
+  id        String   @id @default(uuid())
+  userId    String
+  hotelId   String
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  hotel Hotel @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+
+  @@index([hotelId])
 }
