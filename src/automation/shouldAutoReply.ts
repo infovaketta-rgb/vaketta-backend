@@ -6,11 +6,14 @@ export function shouldAutoReply(
     businessStartHour: number;
     businessEndHour: number;
     timezone: string;
+    allDay?: boolean;
   },
   lastHandledByStaff: boolean
 ): AutoReplyMode {
   if (!config.autoReplyEnabled) return "OFF";
   if (lastHandledByStaff) return "OFF";
+
+  if (config.allDay) return "DAY"; 
 
   // Bug 4: use hotel timezone instead of server local time
   let hour: number;
@@ -26,7 +29,7 @@ export function shouldAutoReply(
     hour = new Date().getUTCHours();
   }
 
-  if (hour < config.businessStartHour || hour >= config.businessEndHour) {
+  if (!config.allDay && (hour < config.businessStartHour || hour >= config.businessEndHour)) {
     return "NIGHT";
   }
 

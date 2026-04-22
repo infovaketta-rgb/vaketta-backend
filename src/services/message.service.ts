@@ -112,6 +112,7 @@ export async function logIncomingMessage(
       businessStartHour: hotel.config.businessStartHour,
       businessEndHour:   hotel.config.businessEndHour,
       timezone:          hotel.config.timezone,
+      allDay:            (hotel.config as any).allDay ?? false,
     },
     guest.lastHandledByStaff
   );
