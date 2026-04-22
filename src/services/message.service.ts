@@ -3,7 +3,6 @@ import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
 import { shouldAutoReply } from "../automation/shouldAutoReply";
 import { processMessage as botProcess } from "../automation/botEngine";
-import { buildMenuMessage } from "../automation/buildMenuResponse";
 import { resetSession } from "./session.service";
 import { incrementConversationUsage, isConversationOverQuota } from "./usage.service";
 import { sendPushToHotelStaff } from "./push.service";
@@ -124,10 +123,9 @@ export async function logIncomingMessage(
   }
 
   if (autoReplyMode === "NIGHT") {
-    // Show the night message AND the menu so guests can still browse services
+    const botReply = await botProcess(hotel.id, guest.id, body ?? null);
     const nightMsg = hotel.config.nightMessage;
-    const menu     = await buildMenuMessage(hotel.id);
-    sentReplyText  = menu ? `${nightMsg}\n\n${menu}` : nightMsg;
+    sentReplyText  = botReply ? `${nightMsg}\n\n${botReply}` : nightMsg;
   }
 
   if (autoReplyMode === "OFF") {
