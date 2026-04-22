@@ -13,6 +13,14 @@ const META_STATUS_MAP: Record<string, MessageStatus> = {
   failed:    MessageStatus.FAILED,
 };
 
+const STATUS_RANK: Record<string, number> = {
+  RECEIVED:  0,
+  SENT:      1,
+  DELIVERED: 2,
+  READ:      3,
+  FAILED:    4,
+};
+
 // Bug 1: GET handler for Meta webhook verification challenge
 export function verifyWhatsAppWebhook(req: Request, res: Response) {
   const mode      = req.query["hub.mode"] as string | undefined;
@@ -46,14 +54,20 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
       if (wamid && newStatus) {
         const updated = await prisma.message.findFirst({ where: { wamid } });
         if (updated) {
-          await prisma.message.update({
-            where: { id: updated.id },
-            data: { status: newStatus },
-          });
-          emitToHotel(updated.hotelId, "message:status", {
-            messageId: updated.id,
-            status: newStatus,
-          });
+          const currentRank = STATUS_RANK[updated.status] ?? 0;
+          const newRank     = STATUS_RANK[newStatus]       ?? 0;
+
+          if (newRank > currentRank) {
+            await prisma.message.update({
+              where: { id: updated.id },
+              data:  { status: newStatus },
+            });
+            emitToHotel(updated.hotelId, "message:status", {
+              messageId: updated.id,
+              status:    newStatus,
+            });
+          }
+          // else: ignore out-of-order or duplicate webhook
         }
       }
       return res.sendStatus(200);
