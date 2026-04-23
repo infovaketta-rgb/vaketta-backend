@@ -71,7 +71,7 @@ export async function getCalendarData(
     prisma.booking.findMany({
       where: {
         hotelId,
-        status: { notIn: [BookingStatus.CANCELLED] },
+        status: { in: [BookingStatus.CONFIRMED, BookingStatus.HOLD] },
         checkIn:  { lt: end },
         checkOut: { gt: start },
       },
@@ -196,7 +196,7 @@ export async function checkRoomAvailability(
       where: {
         hotelId,
         roomTypeId,
-        status: { notIn: [BookingStatus.CANCELLED] },
+        status: { in: [BookingStatus.CONFIRMED, BookingStatus.HOLD] },
         checkIn:  { lt: co },
         checkOut: { gt: ci },
       },
