@@ -884,8 +884,7 @@ export async function executeFlowStep(
 
         // ── notify_staff ───────────────────────────────────────────────────────
         if (d.actionType === "notify_staff") {
-          await prisma.guest.update({ where: { id: guestId }, data: { lastHandledByStaff: true } }).catch(() => {});
-  
+            
           // Browser notification to staff
         const guest = await prisma.guest.findUnique({ 
           where: { id: guestId }, 
