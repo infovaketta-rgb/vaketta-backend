@@ -27,9 +27,9 @@ type AllowedMime =
   | "application/pdf";
 
 const MIME_CONFIG: Record<AllowedMime, { ext: string; maxBytes: number }> = {
-  "image/jpeg":       { ext: "jpg",  maxBytes: 5  * 1024 * 1024 },
-  "image/png":        { ext: "png",  maxBytes: 5  * 1024 * 1024 },
-  "image/webp":       { ext: "webp", maxBytes: 5  * 1024 * 1024 },
+  "image/jpeg":       { ext: "jpg",  maxBytes: 16 * 1024 * 1024 },
+  "image/png":        { ext: "png",  maxBytes: 16 * 1024 * 1024 },
+  "image/webp":       { ext: "webp", maxBytes: 16 * 1024 * 1024 },
   "video/mp4":        { ext: "mp4",  maxBytes: 16 * 1024 * 1024 },
   "video/3gpp":       { ext: "3gp",  maxBytes: 16 * 1024 * 1024 },
   "audio/ogg":        { ext: "ogg",  maxBytes: 16 * 1024 * 1024 },
@@ -113,13 +113,15 @@ export async function uploadToR2(
   if (!publicBase) throw new Error("R2_PUBLIC_URL is not set");
 
   // 1. Detect MIME from magic bytes
-  const mime = await detectMime(buffer, mimeHint) as AllowedMime;
+  const mimeType = await detectMime(buffer, mimeHint);
+  const baseMime = mimeType.split(";")[0]!.trim() as AllowedMime;
+  const mime = mimeType; // preserve original (with any codec params) for ContentType
 
   // 2. Validate type
-  const config = MIME_CONFIG[mime];
+  const config = MIME_CONFIG[baseMime];
   if (!config) {
     throw Object.assign(
-      new Error(`Unsupported media type: ${mime}. Allowed: ${Object.keys(MIME_CONFIG).join(", ")}`),
+      new Error(`Unsupported media type: ${mimeType}. Allowed: ${Object.keys(MIME_CONFIG).join(", ")}`),
       { status: 415 }
     );
   }
@@ -128,7 +130,7 @@ export async function uploadToR2(
   if (buffer.byteLength > config.maxBytes) {
     const limitMB = (config.maxBytes / 1024 / 1024).toFixed(0);
     throw Object.assign(
-      new Error(`File too large for ${mime}: max ${limitMB} MB, got ${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB`),
+      new Error(`File too large for ${baseMime}: max ${limitMB} MB, got ${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB`),
       { status: 413 }
     );
   }
@@ -187,7 +189,7 @@ export async function uploadToR2(
     }
   }
 
-  return { url, key, mime, fileName };
+  return { url, key, mime: baseMime, fileName };
 }
 
 /**
