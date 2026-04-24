@@ -265,6 +265,9 @@ export async function sendMedia(req: Request, res: Response) {
                       : mime.startsWith("audio/")  ? "audio"
                       : "document";
 
+    // WhatsApp only accepts audio/ogg and audio/mpeg — remap webm for sending
+    const whatsappMime = mime === "audio/webm" ? "audio/ogg" : mime;
+
     // Mark as staff-handled
     await prisma.guest.update({ where: { id: guest.id }, data: { lastHandledByStaff: true } });
 
@@ -295,7 +298,7 @@ export async function sendMedia(req: Request, res: Response) {
         hotelId,
         messageType,
         mediaUrl,
-        mimeType:    mime,
+        mimeType:    whatsappMime,  // Meta API only — DB stores original mime above
         fileName:    storedFileName,
         caption:     caption ?? null,
       });
