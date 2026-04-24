@@ -21,9 +21,11 @@ const ALLOWED_MIME_TYPES = new Set([
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB — per-type limits enforced in controller
   fileFilter: (_req, file, cb) => {
-    if (ALLOWED_MIME_TYPES.has(file.mimetype)) {
+    // Strip codec params (e.g. "audio/webm;codecs=opus" → "audio/webm") before allowlist check
+    const base = file.mimetype.split(";")[0]!.trim();
+    if (ALLOWED_MIME_TYPES.has(base)) {
       cb(null, true);
     } else {
       cb(new Error(`Unsupported file type: ${file.mimetype}`));
