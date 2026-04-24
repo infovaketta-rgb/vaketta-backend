@@ -5,6 +5,7 @@ import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
 import { uploadToR2, deleteFromR2 } from "../services/r2.service";
 import { sendMediaMessage } from "../services/whatsapp.send.service";
+import { getMediaLimit, formatBytes } from "../utils/mediaLimits";
 
 export async function manualReply(req: Request, res: Response) {
   try {
@@ -245,6 +246,13 @@ export async function sendMedia(req: Request, res: Response) {
       include: { hotel: true },
     });
     if (!guest) return res.status(404).json({ error: "Guest not found" });
+
+    // ── Pre-upload size check ───────────────────────────────────────────────
+    const baseMime = file.mimetype.split(";")[0]!.trim();
+    const sizeLimit = getMediaLimit(baseMime);
+    if (file.buffer.length > sizeLimit) {
+      return res.status(413).json({ error: `File too large: max ${formatBytes(sizeLimit)} for ${baseMime}` });
+    }
 
     // ── Upload to R2 (detects real MIME from magic bytes) ───────────────────
     const uploaded       = await uploadToR2(file.buffer, file.mimetype, { hotelId });

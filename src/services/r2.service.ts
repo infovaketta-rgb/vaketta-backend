@@ -11,6 +11,7 @@
 
 import { S3Client, PutObjectCommand, DeleteObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { randomUUID } from "crypto";
+import { getMediaLimit, formatBytes } from "../utils/mediaLimits";
 
 // ── Allowed media types ───────────────────────────────────────────────────────
 
@@ -127,10 +128,10 @@ export async function uploadToR2(
   }
 
   // 3. Validate size
-  if (buffer.byteLength > config.maxBytes) {
-    const limitMB = (config.maxBytes / 1024 / 1024).toFixed(0);
+  const limit = getMediaLimit(baseMime);
+  if (buffer.byteLength > limit) {
     throw Object.assign(
-      new Error(`File too large for ${baseMime}: max ${limitMB} MB, got ${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB`),
+      new Error(`File too large for ${baseMime}: max ${formatBytes(limit)}, got ${formatBytes(buffer.byteLength)}`),
       { status: 413 }
     );
   }
