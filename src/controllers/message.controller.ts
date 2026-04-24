@@ -6,6 +6,7 @@ import { emitToHotel } from "../realtime/emit";
 import { uploadToR2, deleteFromR2 } from "../services/r2.service";
 import { sendMediaMessage } from "../services/whatsapp.send.service";
 import { getMediaLimit, formatBytes } from "../utils/mediaLimits";
+import { transcodeWebmToOgg } from "../utils/transcode";
 
 export async function manualReply(req: Request, res: Response) {
   try {
@@ -254,12 +255,19 @@ export async function sendMedia(req: Request, res: Response) {
       return res.status(413).json({ error: `File too large: max ${formatBytes(sizeLimit)} for ${baseMime}` });
     }
 
-    // ── Upload to R2 (detects real MIME from magic bytes) ───────────────────
-    // For webm audio: store as audio/ogg so R2 serves Content-Type: audio/ogg.
-    // Without this, R2 serves Content-Type: audio/webm which causes Meta to reject
-    // the message even when we declare audio/ogg in the API call.
-    const uploadMimeHint = baseMime === "audio/webm" ? "audio/ogg" : file.mimetype;
-    const uploaded       = await uploadToR2(file.buffer, uploadMimeHint, { hotelId });
+    // ── Transcode WebM audio → OGG before upload ────────────────────────────
+    // WhatsApp Cloud API accepts audio/ogg (Opus) but not audio/webm. Browsers record
+    // as audio/webm. We transcode to an actual OGG/Opus container so R2 serves real
+    // OGG bytes — not WebM bytes with a lying Content-Type header.
+    let uploadBuffer   = file.buffer;
+    let uploadMimeHint = file.mimetype;
+    if (baseMime === "audio/webm") {
+      uploadBuffer   = await transcodeWebmToOgg(file.buffer);
+      uploadMimeHint = "audio/ogg";
+    }
+
+    // ── Upload to R2 ────────────────────────────────────────────────────────
+    const uploaded       = await uploadToR2(uploadBuffer, uploadMimeHint, { hotelId });
     const mediaUrl       = uploaded.url;
     const storedFileName = uploaded.fileName;
     const mime           = uploaded.mime; // use detected MIME, not client claim
@@ -269,9 +277,8 @@ export async function sendMedia(req: Request, res: Response) {
                       : mime.startsWith("audio/")  ? "audio"
                       : "document";
 
-    // WhatsApp only accepts audio/ogg and audio/mpeg — remap webm for sending
-    // video/webm is also remapped: file-type can misdetect audio/webm as video/webm
-    const whatsappMime = (mime === "audio/webm" || mime === "video/webm") ? "audio/ogg" : mime;
+    // After transcoding, mime is audio/ogg — already accepted by WhatsApp
+    const whatsappMime = mime;
 
     // Mark as staff-handled
     await prisma.guest.update({ where: { id: guest.id }, data: { lastHandledByStaff: true } });
