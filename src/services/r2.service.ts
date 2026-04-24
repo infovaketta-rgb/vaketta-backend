@@ -20,6 +20,7 @@ type AllowedMime =
   | "image/png"
   | "image/webp"
   | "video/mp4"
+  | "video/webm"
   | "video/3gpp"
   | "audio/ogg"
   | "audio/mpeg"
@@ -32,6 +33,7 @@ const MIME_CONFIG: Record<AllowedMime, { ext: string; maxBytes: number }> = {
   "image/png":        { ext: "png",  maxBytes: 16 * 1024 * 1024 },
   "image/webp":       { ext: "webp", maxBytes: 16 * 1024 * 1024 },
   "video/mp4":        { ext: "mp4",  maxBytes: 16 * 1024 * 1024 },
+  "video/webm":       { ext: "webm", maxBytes: 16 * 1024 * 1024 },
   "video/3gpp":       { ext: "3gp",  maxBytes: 16 * 1024 * 1024 },
   "audio/ogg":        { ext: "ogg",  maxBytes: 16 * 1024 * 1024 },
   "audio/mpeg":       { ext: "mp3",  maxBytes: 16 * 1024 * 1024 },
@@ -74,11 +76,19 @@ async function detectMime(buffer: Buffer, hint: string): Promise<string> {
   try {
     const { fileTypeFromBuffer } = await import("file-type");
     const result = await fileTypeFromBuffer(buffer);
-    if (result?.mime) return result.mime;
+    if (result?.mime) {
+      // file-type returns video/webm for all .webm containers (audio or video).
+      // If the client said audio/* and detection says video/webm, trust the hint.
+      const hintBase = hint.split(";")[0]!.trim();
+      if (result.mime === "video/webm" && hintBase.startsWith("audio/")) {
+        return hintBase;
+      }
+      return result.mime;
+    }
   } catch {
     // file-type unavailable — fall through to hint
   }
-  return hint;
+  return hint.split(";")[0]!.trim();
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

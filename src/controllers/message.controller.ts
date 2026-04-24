@@ -266,7 +266,8 @@ export async function sendMedia(req: Request, res: Response) {
                       : "document";
 
     // WhatsApp only accepts audio/ogg and audio/mpeg — remap webm for sending
-    const whatsappMime = mime === "audio/webm" ? "audio/ogg" : mime;
+    // video/webm is also remapped: file-type can misdetect audio/webm as video/webm
+    const whatsappMime = (mime === "audio/webm" || mime === "video/webm") ? "audio/ogg" : mime;
 
     // Mark as staff-handled
     await prisma.guest.update({ where: { id: guest.id }, data: { lastHandledByStaff: true } });
