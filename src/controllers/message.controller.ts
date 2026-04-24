@@ -255,7 +255,11 @@ export async function sendMedia(req: Request, res: Response) {
     }
 
     // ── Upload to R2 (detects real MIME from magic bytes) ───────────────────
-    const uploaded       = await uploadToR2(file.buffer, file.mimetype, { hotelId });
+    // For webm audio: store as audio/ogg so R2 serves Content-Type: audio/ogg.
+    // Without this, R2 serves Content-Type: audio/webm which causes Meta to reject
+    // the message even when we declare audio/ogg in the API call.
+    const uploadMimeHint = baseMime === "audio/webm" ? "audio/ogg" : file.mimetype;
+    const uploaded       = await uploadToR2(file.buffer, uploadMimeHint, { hotelId });
     const mediaUrl       = uploaded.url;
     const storedFileName = uploaded.fileName;
     const mime           = uploaded.mime; // use detected MIME, not client claim
