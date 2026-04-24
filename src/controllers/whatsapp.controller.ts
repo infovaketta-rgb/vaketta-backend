@@ -119,6 +119,13 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
       }
     }
 
+    const SUPPORTED_TYPES = new Set(["text", "image", "video", "audio", "document", "sticker"]);
+
+    if (!SUPPORTED_TYPES.has(messageType)) {
+      console.log(`[Webhook] Skipping unsupported message type: ${messageType}`);
+    return res.sendStatus(200);
+}
+
     await logIncomingMessage({ fromPhone, toPhone, body, messageType, mediaUrl, mimeType, fileName, wamid });
 
     return res.sendStatus(200);

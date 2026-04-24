@@ -58,6 +58,11 @@ export async function logIncomingMessage(
     create: { phone: fromPhone, hotelId: hotel.id },
   });
 
+  // Skip saving if message has no content at all
+  if (!body && !mediaUrl) {
+    return { hotelId: hotel.id, guestId: guest.id, autoReply: false, autoReplyMessage: null };
+  }
+
   // ── 3. Persist incoming message ──────────────────────────────────────────────
   const inMessage = await prisma.message.create({
     data: {
