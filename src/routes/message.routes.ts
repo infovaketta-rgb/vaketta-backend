@@ -1,6 +1,6 @@
 import { Router } from "express";
 import multer from "multer";
-import { manualReply, getMessages, markMessagesRead, setBotEnabled, sendMedia, deleteMessage, undoSend } from "../controllers/message.controller";
+import { manualReply, getMessages, markMessagesRead, setBotEnabled, sendMedia, deleteMessage, undoSend, sendMediaFromUrl } from "../controllers/message.controller";
 import { requireRole } from "../middleware/role.middleware";
 import { UserRole } from "@prisma/client";
 import prisma from "../db/connect";
@@ -79,6 +79,7 @@ router.get("/media", async (req, res) => {
   }
 });
 
+router.post("/send-media-url", requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), sendMediaFromUrl);
 router.post("/reply",     requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), manualReply);
 router.post("/send-media", upload.single("file"), requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), sendMedia);
 router.delete("/:messageId/undo-send", requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER), undoSend);

@@ -333,3 +333,68 @@ export async function sendMedia(req: Request, res: Response) {
     return res.status(500).json({ error: "Failed to send media" });
   }
 }
+
+/** POST /messages/send-media-url — resend an existing R2 media URL to a guest */
+export async function sendMediaFromUrl(req: Request, res: Response) {
+  try {
+    const hotelId = (req as any).user.hotelId;
+    const { guestId, mediaUrl, mimeType, fileName, messageType } = req.body;
+
+    if (!guestId || !mediaUrl) return res.status(400).json({ error: "guestId and mediaUrl required" });
+
+    const guest = await prisma.guest.findFirst({
+      where: { id: guestId, hotelId },
+      include: { hotel: true },
+    });
+    if (!guest) return res.status(404).json({ error: "Guest not found" });
+
+    await prisma.guest.update({ where: { id: guest.id }, data: { lastHandledByStaff: true } });
+
+    const message = await prisma.message.create({
+      data: {
+        direction:   "OUT",
+        fromPhone:   guest.hotel.phone,
+        toPhone:     guest.phone,
+        body:        null,
+        messageType: messageType ?? "image",
+        mediaUrl,
+        mimeType:    mimeType ?? null,
+        fileName:    fileName ?? null,
+        hotelId,
+        guestId:     guest.id,
+        status:      MessageStatus.PENDING,
+      },
+    });
+
+    emitToHotel(hotelId, "message:new", { message });
+
+    let wamid: string | undefined;
+    let finalStatus: MessageStatus = MessageStatus.FAILED;
+    try {
+      const result = await sendMediaMessage({
+        toPhone:     guest.phone,
+        hotelId,
+        messageType: messageType ?? "image",
+        mediaUrl,
+        mimeType:    mimeType ?? "image/jpeg",
+        fileName:    fileName ?? null,
+        caption:     null,
+      });
+      wamid = (result as any)?.messages?.[0]?.id ?? undefined;
+      finalStatus = MessageStatus.SENT;
+    } catch (err) {
+      console.error("❌ sendMediaFromUrl WhatsApp send failed:", err);
+    }
+
+    const updated = await prisma.message.update({
+      where: { id: message.id },
+      data:  { status: finalStatus, ...(wamid ? { wamid } : {}) },
+    });
+
+    emitToHotel(hotelId, "message:status", { messageId: message.id, status: finalStatus });
+    return res.json(updated);
+  } catch (err: any) {
+    console.error("❌ sendMediaFromUrl:", err);
+    return res.status(500).json({ error: "Failed to send media" });
+  }
+}
