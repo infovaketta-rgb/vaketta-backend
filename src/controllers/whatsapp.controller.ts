@@ -95,42 +95,75 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
     // Extract text body (text messages) or caption (media messages)
     const body = message.text?.body ?? message[messageType]?.caption ?? null;
 
-    // Download media if this is a media message
-    let mediaUrl: string | null = null;
-    let mimeType: string | null = null;
-    let fileName: string | null = null;
-
-    const mediaInfo = extractMediaFromWebhookMessage(message);
-    if (mediaInfo) {
-      const downloaded = await downloadMetaMedia(
-        mediaInfo.mediaId,
-        mediaInfo.mimeType,
-        toPhone,
-      );
-      if (downloaded) {
-        mediaUrl = downloaded.localUrl;
-        mimeType = downloaded.mimeType;
-        fileName = downloaded.fileName;
-      } else {
-        // No credentials — store mediaId as placeholder so type info is preserved
-        mediaUrl = `meta://${mediaInfo.mediaId}`;
-        mimeType = mediaInfo.mimeType;
-        fileName = mediaInfo.fileName;
-      }
-    }
-
     const SUPPORTED_TYPES = new Set(["text", "image", "video", "audio", "document", "sticker"]);
 
     if (!SUPPORTED_TYPES.has(messageType)) {
       console.log(`[Webhook] Skipping unsupported message type: ${messageType}`);
-    return res.sendStatus(200);
-}
+      return res.sendStatus(200);
+    }
 
-    await logIncomingMessage({ fromPhone, toPhone, body, messageType, mediaUrl, mimeType, fileName, wamid });
+    const mediaInfo = extractMediaFromWebhookMessage(message);
+
+    if (mediaInfo) {
+      // Save immediately with placeholder so the UI bubble appears at once
+      await logIncomingMessage({
+        fromPhone, toPhone, body, messageType,
+        mediaUrl: `pending://${mediaInfo.mediaId}`,
+        mimeType: mediaInfo.mimeType,
+        fileName: mediaInfo.fileName,
+        wamid,
+      });
+
+      // Upload to R2 in the background — never blocks the webhook ACK
+      downloadAndStoreMedia(mediaInfo, toPhone).catch((err) =>
+        console.error("[Media] Background upload failed:", err)
+      );
+
+      return res.sendStatus(200);
+    }
+
+    // Non-media message — existing flow unchanged
+    await logIncomingMessage({ fromPhone, toPhone, body, messageType, mediaUrl: null, mimeType: null, fileName: null, wamid });
 
     return res.sendStatus(200);
   } catch (err) {
     console.error("❌ WhatsApp webhook error:", err);
     return res.sendStatus(200); // always ACK to prevent Meta retries
   }
+}
+
+async function downloadAndStoreMedia(
+  mediaInfo: { mediaId: string; mimeType: string; fileName: string | null },
+  toPhone: string,
+): Promise<void> {
+  const hotel = await prisma.hotel.findUnique({
+    where:   { phone: toPhone },
+    include: { config: true },
+  });
+  if (!hotel) return;
+
+  const message = await prisma.message.findFirst({
+    where:   { mediaUrl: `pending://${mediaInfo.mediaId}`, hotelId: hotel.id },
+    orderBy: { timestamp: "desc" },
+  });
+  if (!message) return;
+
+  const downloaded = await downloadMetaMedia(mediaInfo.mediaId, mediaInfo.mimeType, toPhone);
+  if (!downloaded) return;
+
+  const updated = await prisma.message.update({
+    where: { id: message.id },
+    data: {
+      mediaUrl: downloaded.localUrl,
+      mimeType: downloaded.mimeType,
+      fileName: downloaded.fileName,
+    },
+  });
+
+  emitToHotel(hotel.id, "message:media_ready", {
+    messageId: updated.id,
+    mediaUrl:  downloaded.localUrl,
+    mimeType:  downloaded.mimeType,
+    fileName:  downloaded.fileName,
+  });
 }

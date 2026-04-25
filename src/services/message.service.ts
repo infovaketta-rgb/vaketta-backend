@@ -83,6 +83,11 @@ export async function logIncomingMessage(
 
   emitToHotel(hotel.id, "message:new", { message: inMessage });
 
+  // Pending media: bubble already shown — skip bot until R2 upload completes
+  if (mediaUrl?.startsWith("pending://")) {
+    return { hotelId: hotel.id, guestId: guest.id, autoReply: false, autoReplyMessage: null };
+  }
+
   // ── 4. Usage — count only new 24-hour conversation windows ─────────────────
   // A "new conversation" = first ever message OR last message was >24 h ago.
   // We exclude the message we just created so we're looking at prior history.
