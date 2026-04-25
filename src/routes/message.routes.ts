@@ -3,6 +3,7 @@ import multer from "multer";
 import { manualReply, getMessages, markMessagesRead, setBotEnabled, sendMedia, deleteMessage, undoSend } from "../controllers/message.controller";
 import { requireRole } from "../middleware/role.middleware";
 import { UserRole } from "@prisma/client";
+import prisma from "../db/connect";
 
 const ALLOWED_MIME_TYPES = new Set([
   // Images
@@ -34,6 +35,49 @@ const upload = multer({
 });
 
 const router = Router();
+
+router.get("/media", async (req, res) => {
+  try {
+    const hotelId = (req as any).user.hotelId;
+    const page  = parseInt(req.query.page as string) || 1;
+    const limit = 50;
+
+    const where = {
+      hotelId,
+      mediaUrl: { not: null as null },
+      deleted:  false,
+      NOT: [
+        { mediaUrl: { startsWith: "meta://" } },
+        { mediaUrl: { startsWith: "pending://" } },
+      ],
+    };
+
+    const [messages, total] = await Promise.all([
+      prisma.message.findMany({
+        where,
+        orderBy: { timestamp: "desc" },
+        skip:    (page - 1) * limit,
+        take:    limit,
+        select: {
+          id:          true,
+          mediaUrl:    true,
+          mimeType:    true,
+          fileName:    true,
+          messageType: true,
+          timestamp:   true,
+          direction:   true,
+          guest:       { select: { phone: true, name: true } },
+        },
+      }),
+      prisma.message.count({ where }),
+    ]);
+
+    res.json({ data: messages, total, page, pages: Math.ceil(total / limit) });
+  } catch (err) {
+    console.error("❌ GET /messages/media failed:", err);
+    res.status(500).json({ error: "Failed to fetch media" });
+  }
+});
 
 router.post("/reply",     requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), manualReply);
 router.post("/send-media", upload.single("file"), requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), sendMedia);
