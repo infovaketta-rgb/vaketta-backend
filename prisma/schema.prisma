@@ -127,7 +127,13 @@ model HotelConfig {
   metaPhoneNumberId String?   // Meta Phone Number ID from developer console
   metaAccessToken   String?   // Permanent system user access token
   metaWabaId        String?   // WhatsApp Business Account ID
-  metaVerifyToken   String?   // Webhook verify token (set in Meta dashboard)
+
+  instagramBusinessAccountId     String? @unique
+  instagramWebhookActive         Boolean @default(false)
+
+  instagramAccessTokenEncrypted  String?
+  instagramTokenUpdatedAt        DateTime?
+  instagramTokenExpiresAt        DateTime?
 
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
@@ -475,4 +481,27 @@ model PushSubscription {
   hotel Hotel @relation(fields: [hotelId], references: [id], onDelete: Cascade)
 
   @@index([hotelId])
+}
+
+model WebhookEvent {
+  id            String   @id @default(uuid())
+  provider      String   // instagram
+  externalEventId String @unique // mid
+  hotelId       String?
+  payloadHash   String
+  processed     Boolean  @default(false)
+  attempts      Int      @default(0)
+  receivedAt    DateTime @default(now())
+  processedAt   DateTime?
+
+  @@index([provider, externalEventId])
+}
+
+model DeadLetterEvent {
+  id          String @id @default(uuid())
+  provider    String
+  payload     Json
+  error       String
+  failedAt    DateTime @default(now())
+  retries     Int @default(0)
 }
