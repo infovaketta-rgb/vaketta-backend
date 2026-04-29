@@ -425,6 +425,13 @@ model DataDeletion {
   updatedAt     DateTime @updatedAt
 }
 
+// Platform-wide settings singleton (embed URLs, OAuth config, etc.)
+model PlatformSettings {
+  id                String   @id @default("global")
+  instagramEmbedUrl String   @default("")
+  updatedAt         DateTime @updatedAt
+}
+
 // Platform-wide trial defaults (singleton — only one row ever exists)
 model TrialConfig {
   id                    String   @id @default("global")  // always "global"

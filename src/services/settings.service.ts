@@ -1,4 +1,5 @@
 import prisma from "../db/connect";
+import { encryptInstagramToken } from "./instagram.service";
 
 export async function getHotelSettings(hotelId: string) {
   const hotel = await prisma.hotel.findUnique({
@@ -206,5 +207,110 @@ export async function updateHotelProfile(
       checkOutTime: true,
       website: true,
     },
+  });
+}
+
+// ── Instagram ────────────────────────────────────────────────────────────────
+
+export async function getInstagramConfig(hotelId: string) {
+  const [config, platform] = await Promise.all([
+    prisma.hotelConfig.findUnique({ where: { hotelId } }),
+    prisma.platformSettings.findUnique({ where: { id: "global" } }),
+  ]);
+
+  return {
+    igAccountId: config?.instagramBusinessAccountId ?? null,
+    accessToken: config?.instagramAccessTokenEncrypted ? "••••••••••••••••" : null,
+    connected: !!(config?.instagramBusinessAccountId && config?.instagramAccessTokenEncrypted),
+    embedUrl: platform?.instagramEmbedUrl ?? "",
+  };
+}
+
+export async function updateInstagramConfig(
+  hotelId: string,
+  data: { igAccountId?: string | null; accessToken?: string | null }
+) {
+  const patch: Record<string, unknown> = {};
+  if (data.igAccountId !== undefined) {
+    patch.instagramBusinessAccountId = data.igAccountId || null;
+  }
+  if (data.accessToken !== undefined && !data.accessToken?.startsWith("••")) {
+    patch.instagramAccessTokenEncrypted = data.accessToken
+      ? encryptInstagramToken(data.accessToken)
+      : null;
+    patch.instagramTokenUpdatedAt = new Date();
+  }
+
+  await prisma.hotelConfig.upsert({
+    where:  { hotelId },
+    update: patch,
+    create: { hotelId, ...patch },
+  });
+
+  return getInstagramConfig(hotelId);
+}
+
+export async function exchangeInstagramCode(hotelId: string, code: string) {
+  const appId     = process.env.INSTAGRAM_APP_ID ?? "";
+  const appSecret = process.env.INSTAGRAM_APP_SECRET ?? "";
+  const redirectUri = process.env.INSTAGRAM_REDIRECT_URI ?? "https://vaketta.com/dashboard/";
+
+  if (!appId || !appSecret) throw new Error("Instagram app credentials not configured");
+
+  // Short-lived token exchange
+  const tokenRes = await fetch("https://api.instagram.com/oauth/access_token", {
+    method:  "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body:    new URLSearchParams({ client_id: appId, client_secret: appSecret,
+                                   grant_type: "authorization_code", redirect_uri: redirectUri, code }),
+  });
+  const tokenData = await tokenRes.json() as any;
+  if (!tokenRes.ok || !tokenData.access_token) {
+    throw new Error(tokenData.error_message ?? tokenData.error?.message ?? "Failed to exchange Instagram code");
+  }
+
+  const shortToken = String(tokenData.access_token);
+  const igUserId   = String(tokenData.user_id ?? "");
+
+  // Upgrade to long-lived token
+  const llRes = await fetch(
+    `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${appSecret}&access_token=${shortToken}`
+  );
+  const llData = await llRes.json() as any;
+  const finalToken = (llRes.ok && llData.access_token) ? String(llData.access_token) : shortToken;
+
+  await prisma.hotelConfig.upsert({
+    where:  { hotelId },
+    update: {
+      instagramAccessTokenEncrypted: encryptInstagramToken(finalToken),
+      instagramBusinessAccountId:   igUserId || null,
+      instagramTokenUpdatedAt:       new Date(),
+    },
+    create: {
+      hotelId,
+      instagramAccessTokenEncrypted: encryptInstagramToken(finalToken),
+      instagramBusinessAccountId:   igUserId || null,
+      instagramTokenUpdatedAt:       new Date(),
+    },
+  });
+
+  return { igAccountId: igUserId };
+}
+
+// ── Platform settings (admin-level) ─────────────────────────────────────────
+
+export async function getPlatformSettings() {
+  return prisma.platformSettings.upsert({
+    where:  { id: "global" },
+    update: {},
+    create: { id: "global" },
+  });
+}
+
+export async function updatePlatformSettings(data: { instagramEmbedUrl?: string }) {
+  return prisma.platformSettings.upsert({
+    where:  { id: "global" },
+    update: data,
+    create: { id: "global", ...data },
   });
 }

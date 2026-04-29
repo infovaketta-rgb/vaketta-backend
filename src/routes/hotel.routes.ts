@@ -26,6 +26,7 @@ import {
 } from "../controllers/plan.controller";
 import { getAnalytics, listHotelsWithBilling } from "../controllers/analytics.controller";
 import { getTrialConfigHandler, updateTrialConfigHandler } from "../controllers/trialConfig.controller";
+import { getPlatformSettingsHandler, patchPlatformSettingsHandler } from "../controllers/settings.controller";
 import {
   adminListFlowsHandler,
   adminGetFlowHandler,
@@ -83,6 +84,10 @@ router.get("/hotels-billing",    vakettaAdminAuth, listHotelsWithBilling);
 // Trial plan configuration (global defaults)
 router.get("/trial-config",      vakettaAdminAuth, getTrialConfigHandler);
 router.patch("/trial-config",    vakettaAdminAuth, updateTrialConfigHandler);
+
+// Platform-wide settings (Instagram embed URL, etc.)
+router.get("/platform-settings",   vakettaAdminAuth, getPlatformSettingsHandler);
+router.patch("/platform-settings", vakettaAdminAuth, patchPlatformSettingsHandler);
 
 // Hotel user management
 router.post("/hotels/:id/users",           vakettaAdminAuth, createHotelUserHandler);

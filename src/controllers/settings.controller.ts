@@ -12,6 +12,11 @@ import {
   getWhatsAppConfig,
   updateWhatsAppConfig,
   testWhatsAppConnection,
+  getInstagramConfig,
+  updateInstagramConfig,
+  exchangeInstagramCode,
+  getPlatformSettings,
+  updatePlatformSettings,
 } from "../services/settings.service";
 import { invalidatePromptCache } from "../services/ai.service";
 
@@ -184,5 +189,59 @@ export async function patchHotelProfile(req: Request, res: Response) {
     res.json(hotel);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
+  }
+}
+
+// ── Instagram ─────────────────────────────────────────────────────────────────
+
+export async function getInstagramHandler(req: Request, res: Response) {
+  try {
+    res.json(await getInstagramConfig(hotelId(req)));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+export async function patchInstagramHandler(req: Request, res: Response) {
+  try {
+    const { accessToken, igAccountId } = req.body;
+    res.json(await updateInstagramConfig(hotelId(req), {
+      ...(accessToken !== undefined && { accessToken }),
+      ...(igAccountId !== undefined && { igAccountId }),
+    }));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+export async function instagramOAuthExchangeHandler(req: Request, res: Response) {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: "code is required" });
+    const result = await exchangeInstagramCode(hotelId(req), code);
+    res.json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
+  }
+}
+
+// ── Platform settings (Vaketta admin) ────────────────────────────────────────
+
+export async function getPlatformSettingsHandler(_req: Request, res: Response) {
+  try {
+    res.json(await getPlatformSettings());
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+export async function patchPlatformSettingsHandler(req: Request, res: Response) {
+  try {
+    const { instagramEmbedUrl } = req.body;
+    res.json(await updatePlatformSettings({
+      ...(instagramEmbedUrl !== undefined && { instagramEmbedUrl: String(instagramEmbedUrl).trim() }),
+    }));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
 }
