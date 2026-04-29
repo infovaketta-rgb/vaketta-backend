@@ -1,5 +1,5 @@
 import prisma from "../db/connect";
-import { encryptInstagramToken } from "./instagram.service";
+import { encryptInstagramToken, decryptInstagramToken } from "./instagram.service";
 
 export async function getHotelSettings(hotelId: string) {
   const hotel = await prisma.hotel.findUnique({
@@ -295,6 +295,58 @@ export async function exchangeInstagramCode(hotelId: string, code: string) {
   });
 
   return { igAccountId: igUserId };
+}
+
+// ── Instagram webhook subscription ──────────────────────────────────────────
+
+const META_VERSION = "v25.0";
+
+async function getIgCredentials(hotelId: string) {
+  const config = await prisma.hotelConfig.findUnique({ where: { hotelId } });
+  const accountId = config?.instagramBusinessAccountId;
+  const encrypted = config?.instagramAccessTokenEncrypted;
+  if (!accountId || !encrypted) throw new Error("Instagram not connected");
+  return { accountId, token: decryptInstagramToken(encrypted) };
+}
+
+export async function getIgSubscriptionStatus(hotelId: string): Promise<{ subscribed: boolean }> {
+  const { accountId, token } = await getIgCredentials(hotelId);
+  const res = await fetch(
+    `https://graph.facebook.com/${META_VERSION}/${accountId}/subscribed_apps?access_token=${token}`
+  );
+  const data = await res.json() as any;
+  if (!res.ok) throw new Error(data?.error?.message ?? "Failed to check subscription status");
+  const subscribed = Array.isArray(data.data) && data.data.length > 0;
+  return { subscribed };
+}
+
+export async function subscribeIgWebhook(hotelId: string): Promise<{ success: boolean }> {
+  const { accountId, token } = await getIgCredentials(hotelId);
+  const res = await fetch(
+    `https://graph.facebook.com/${META_VERSION}/${accountId}/subscribed_apps`,
+    {
+      method:  "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body:    new URLSearchParams({
+        subscribed_fields: "messages,messaging_postbacks",
+        access_token:      token,
+      }),
+    }
+  );
+  const data = await res.json() as any;
+  if (!res.ok) throw new Error(data?.error?.message ?? "Failed to subscribe");
+  return { success: true };
+}
+
+export async function unsubscribeIgWebhook(hotelId: string): Promise<{ success: boolean }> {
+  const { accountId, token } = await getIgCredentials(hotelId);
+  const res = await fetch(
+    `https://graph.facebook.com/${META_VERSION}/${accountId}/subscribed_apps?access_token=${token}`,
+    { method: "DELETE" }
+  );
+  const data = await res.json() as any;
+  if (!res.ok) throw new Error(data?.error?.message ?? "Failed to unsubscribe");
+  return { success: true };
 }
 
 // ── Platform settings (admin-level) ─────────────────────────────────────────

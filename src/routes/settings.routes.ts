@@ -20,6 +20,9 @@ import {
   getInstagramHandler,
   patchInstagramHandler,
   instagramOAuthExchangeHandler,
+  getIgSubscriptionStatusHandler,
+  subscribeIgWebhookHandler,
+  unsubscribeIgWebhookHandler,
 } from "../controllers/settings.controller";
 import {
   getHotelFlowsHandler,
@@ -47,9 +50,12 @@ router.get("/whatsapp",             getWhatsAppHandler);
 router.patch("/whatsapp",           patchWhatsAppHandler);
 router.post("/whatsapp/test",       testWhatsAppHandler);
 
-router.get("/instagram",                  getInstagramHandler);
-router.patch("/instagram",                patchInstagramHandler);
-router.post("/instagram/oauth-exchange",  instagramOAuthExchangeHandler);
+router.get("/instagram",                       getInstagramHandler);
+router.patch("/instagram",                     patchInstagramHandler);
+router.post("/instagram/oauth-exchange",       instagramOAuthExchangeHandler);
+router.get("/instagram/subscribe/status",      getIgSubscriptionStatusHandler);
+router.post("/instagram/subscribe",            subscribeIgWebhookHandler);
+router.delete("/instagram/subscribe",          unsubscribeIgWebhookHandler);
 
 // Billing / subscription (hotel-side, JWT-protected via auth middleware in app.ts)
 router.get("/billing/subscription", getSubscription);
