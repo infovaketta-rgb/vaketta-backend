@@ -4,7 +4,8 @@ import { redis } from "../queue/redis";
 import { sendTextMessage, sendMediaMessage } from "../services/whatsapp.send.service";
 import { MessageStatus } from "@prisma/client";
 import { publishMessageStatus } from "../realtime/statusBus";
-import "./billing.worker"; // Start billing expiry cron alongside this worker
+import "./billing.worker";   // Start billing expiry cron alongside this worker
+import "./instagram.worker"; // Start Instagram inbound processor alongside this worker
 import { logger } from "../utils/logger";
 
 const log = logger.child({ service: "worker" });

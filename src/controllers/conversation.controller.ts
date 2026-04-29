@@ -22,6 +22,13 @@ export async function getConversations(req: Request, res: Response) {
         messages: {
           orderBy: { timestamp: "desc" },
           take: 1,
+          select: {
+            body: true,
+            messageType: true,
+            direction: true,
+            timestamp: true,
+            channel: true,
+          },
         },
         _count: {
           select: {
@@ -47,6 +54,7 @@ export async function getConversations(req: Request, res: Response) {
         lastMessageType: lastMessage?.messageType ?? null,
         lastDirection: lastMessage?.direction ?? null,
         lastTimestamp: lastMessage?.timestamp ?? null,
+        channel: lastMessage?.channel ?? "WHATSAPP",
         unreadCount: guest._count.messages,
       };
     });

@@ -2,7 +2,7 @@ import { Queue } from "bullmq";
 import { redis } from "./redis";
 
 export const instagramQueue = new Queue(
-  "instagram-in",
+  "instagram-inbound",
   {
     connection: redis,
     defaultJobOptions:{
