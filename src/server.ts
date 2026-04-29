@@ -20,6 +20,7 @@ import { emitToHotel } from "./realtime/emit";
 import prisma from "./db/connect";
 import { logger } from "./utils/logger";
 import { MessageStatus } from "@prisma/client";
+import "./workers/instagram.worker";
 
 // ── Startup environment validation ────────────────────────────────────────────
 
