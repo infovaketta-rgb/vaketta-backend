@@ -9,6 +9,10 @@ export function verifyInstagramWebhook(
  req:Request,
  res:Response
 ){
+
+  console.log("[Instagram] RAW HIT", JSON.stringify(req.body).slice(0, 300));
+  res.sendStatus(200);
+
  const mode=
  req.query["hub.mode"];
 
