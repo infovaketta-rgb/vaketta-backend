@@ -65,5 +65,7 @@ envVarGroups:
         sync: false
       - key: INSTAGRAM_APP_SECRET
         sync: false
-      - key: INSTAGRAM_REDIRECT_URI
+      - key: INSTAGRAM_REDIRECT_URL
+        sync: false
+      - key: INSTAGRAM_VERIFY_TOKEN
         sync: false

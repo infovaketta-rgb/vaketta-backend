@@ -20,48 +20,43 @@ router.get(
 );
 
 /**
- * Incoming Instagram webhook events
- * raw body -> signature verify -> parse -> controller
- *
- * Route registration is deferred until runtime so that a missing
- * INSTAGRAM_APP_SECRET env var degrades gracefully (webhook disabled,
- * logged as a warning) instead of throwing synchronously and crashing
- * the server process — which would also take down WhatsApp and all REST routes.
+ * Incoming Instagram webhook events — always registered.
+ * Signature verification is enforced when INSTAGRAM_APP_SECRET is set;
+ * if missing, the request is accepted but a warning is logged.
  */
 const instagramAppSecret = process.env.INSTAGRAM_APP_SECRET;
 
-if (instagramAppSecret) {
-  router.post(
-    "/webhook/instagram",
-
-    express.raw({
-      type: "application/json",
-      limit: "1mb"
-    }),
-
-    (req:any, res, next) => {
-      req.rawBody = req.body;
-
-      try {
-        req.body = JSON.parse(req.body.toString());
-      } catch {
-        logger.warn("[Instagram] Invalid JSON payload");
-        // always ACK Meta to avoid retries
-        return res.sendStatus(200);
-      }
-
-      next();
-    },
-
-    verifyWebhookSignature(instagramAppSecret),
-
-    handleInstagramWebhook
-  );
-} else {
+if (!instagramAppSecret) {
   logger.warn(
-    "INSTAGRAM_APP_SECRET not set — POST /webhook/instagram is disabled. " +
-    "Set the env var and redeploy to enable Instagram messaging."
+    "INSTAGRAM_APP_SECRET not set — Instagram webhook signature verification is DISABLED. " +
+    "Set the env var in production to secure the endpoint."
   );
 }
+
+router.post(
+  "/webhook/instagram",
+
+  express.raw({ type: "application/json", limit: "1mb" }),
+
+  // Parse raw body → JSON, keep rawBody for signature check
+  (req: any, res: any, next: any) => {
+    req.rawBody = req.body;
+    try {
+      req.body = JSON.parse(req.body.toString());
+    } catch {
+      logger.warn("[Instagram] Invalid JSON payload — ACKing to prevent Meta retries");
+      return res.sendStatus(200);
+    }
+    next();
+  },
+
+  // Signature verification — skip only when secret is not configured (dev/unconfigured)
+  (req: any, res: any, next: any) => {
+    if (!instagramAppSecret) return next();
+    return verifyWebhookSignature(instagramAppSecret)(req, res, next);
+  },
+
+  handleInstagramWebhook
+);
 
 export default router;
