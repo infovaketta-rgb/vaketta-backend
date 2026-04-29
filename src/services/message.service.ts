@@ -79,11 +79,25 @@ export async function logIncomingMessage(
   }
 
   // ── 2. Find or create guest (per-hotel scope) ────────────────────────────────
-  const guest = await prisma.guest.upsert({
+  // Replace the guest upsert with this retry-safe version
+let guest;
+try {
+  guest = await prisma.guest.upsert({
     where:  { phone_hotelId: { phone: fromPhone, hotelId: hotel.id } },
     update: {},
     create: { phone: fromPhone, hotelId: hotel.id },
   });
+} catch (err: any) {
+  if (err?.code === "P2002") {
+    // Race condition — another job created the guest, just fetch it
+    guest = await prisma.guest.findUnique({
+      where: { phone_hotelId: { phone: fromPhone, hotelId: hotel.id } },
+    });
+    if (!guest) throw err;
+  } else {
+    throw err;
+  }
+}
 
   // Skip saving if message has no content at all
   if (!body && !mediaUrl) {
