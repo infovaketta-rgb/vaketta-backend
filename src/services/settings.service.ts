@@ -253,7 +253,7 @@ export async function updateInstagramConfig(
 export async function exchangeInstagramCode(hotelId: string, code: string) {
   const appId     = process.env.INSTAGRAM_APP_ID ?? "";
   const appSecret = process.env.INSTAGRAM_APP_SECRET ?? "";
-  const redirectUri = process.env.INSTAGRAM_REDIRECT_URL ?? "";
+  const redirectUri = process.env.INSTAGRAM_REDIRECT_URL ?? "https://vaketta.com/dashboard/configuration";
 
   if (!appId || !appSecret) throw new Error("Instagram app credentials not configured");
 
