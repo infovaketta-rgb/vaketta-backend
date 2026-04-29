@@ -257,6 +257,9 @@ export async function exchangeInstagramCode(hotelId: string, code: string) {
 
   if (!appId || !appSecret) throw new Error("Instagram app credentials not configured");
 
+  // Log so it's visible in Render logs — must match Meta App Dashboard exactly
+  console.log(`[Instagram OAuth] exchange redirect_uri="${redirectUri}"`);
+
   // Short-lived token exchange
   const tokenRes = await fetch("https://api.instagram.com/oauth/access_token", {
     method:  "POST",
@@ -294,7 +297,7 @@ export async function exchangeInstagramCode(hotelId: string, code: string) {
     },
   });
 
-  return { igAccountId: igUserId };
+  return { igAccountId: igUserId, redirectUri };
 }
 
 // ── Instagram webhook subscription ──────────────────────────────────────────
