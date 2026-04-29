@@ -17,6 +17,7 @@ async function resolveInstagramCredentials(hotelId:string){
     accessToken: decryptInstagramToken(
       config.instagramAccessTokenEncrypted
     ),
+    igAccountId: config.instagramBusinessAccountId ?? null,
     mockMode:
       process.env.MOCK_INSTAGRAM_SEND==="true"
   };
@@ -58,11 +59,12 @@ async function withRetry<T>(
 }
 
 async function metaPost(
+ igAccountId:string,
  body:any,
  accessToken:string
 ){
  const res=await fetch(
- "https://graph.facebook.com/v25.0/me/messages",
+ `https://graph.facebook.com/v25.0/${igAccountId}/messages`,
  {
    method:"POST",
    headers:{
@@ -108,6 +110,7 @@ export async function sendInstagramTextMessage(
 
  const {
    accessToken,
+   igAccountId,
    mockMode
  }=
  await resolveInstagramCredentials(
@@ -119,7 +122,11 @@ export async function sendInstagramTextMessage(
    return null;
  }
 
- return withRetry(()=>metaPost({
+ if(!igAccountId){
+   throw new Error("Instagram business account ID not configured");
+ }
+
+ return withRetry(()=>metaPost(igAccountId,{
    recipient:{
      id:toPhone
    },
