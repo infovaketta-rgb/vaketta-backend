@@ -4,7 +4,7 @@ services:
     name: vaketta-backend
     runtime: node
     buildCommand: npm ci && npm run build
-    startCommand: node dist/server.js
+    startCommand: npx prisma migrate deploy && node dist/server.js
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
