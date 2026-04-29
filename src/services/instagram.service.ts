@@ -47,6 +47,7 @@ export function decryptInstagramToken(payload: string): string {
 }
 
 export async function processInstagramInboundEvent(event: any): Promise<void> {
+  console.log("[Instagram] recipient:", event.recipient?.id, "sender:", event.sender?.id, "mid:", event.message?.mid);
   const senderId    = event.sender?.id    as string | undefined;
   const recipientId = event.recipient?.id as string | undefined;
   const mid         = event.message?.mid  as string | undefined;
