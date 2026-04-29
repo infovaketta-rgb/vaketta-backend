@@ -126,8 +126,7 @@ export async function getWhatsAppConfig(hotelId: string) {
     metaAccessToken:   config?.metaAccessToken
       ? "••••••••••••••••" + config.metaAccessToken.slice(-6)
       : null,
-    metaWabaId:        config?.metaWabaId        ?? null,
-    metaVerifyToken:   config?.metaVerifyToken   ?? null,
+    metaWabaId:        config?.metaWabaId ?? null,
     connected: !!(config?.metaPhoneNumberId && config?.metaAccessToken),
   };
 }
@@ -161,14 +160,12 @@ export async function updateWhatsAppConfig(
     metaPhoneNumberId?: string;
     metaAccessToken?:   string;
     metaWabaId?:        string;
-    metaVerifyToken?:   string;
   }
 ) {
   // Strip masked placeholder — if token starts with bullets, it hasn't changed
   const patch: Record<string, string> = {};
   if (data.metaPhoneNumberId !== undefined) patch.metaPhoneNumberId = data.metaPhoneNumberId;
   if (data.metaWabaId        !== undefined) patch.metaWabaId        = data.metaWabaId;
-  if (data.metaVerifyToken   !== undefined) patch.metaVerifyToken   = data.metaVerifyToken;
   if (data.metaAccessToken !== undefined && !data.metaAccessToken.startsWith("••")) {
     patch.metaAccessToken = data.metaAccessToken;
   }

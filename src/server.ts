@@ -66,7 +66,7 @@ async function sweepStalePendingMessages() {
     where: {
       direction: "OUT",
       status:    MessageStatus.PENDING,
-      createdAt: { lt: cutoff },
+      timestamp: { lt: cutoff },
     },
     data: { status: MessageStatus.FAILED },
   });
