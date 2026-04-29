@@ -21,6 +21,9 @@
  */
 
 import { Request, Response } from "express";
+import { logger } from "../utils/logger";
+
+const log = logger.child({ service: "call" });
 
 // ── Incoming call webhook (POST) ──────────────────────────────────────────────
 
@@ -33,7 +36,7 @@ export async function handleIncomingCall(req: Request, res: Response) {
     const hotelNumber  = req.body?.To     as string | undefined;
     const callSid      = req.body?.CallSid as string | undefined;
 
-    console.log("[Call] Incoming call:", { from: callerNumber, to: hotelNumber, callSid });
+    log.info({ from: callerNumber, to: hotelNumber, callSid }, "incoming call");
 
     // TODO: implement when call channel is live
     // 1. Look up hotel by hotelNumber
@@ -53,7 +56,7 @@ export async function handleIncomingCall(req: Request, res: Response) {
 </Response>`);
 
   } catch (err) {
-    console.error("❌ [Call] Webhook handler error:", err);
+    log.error({ err }, "incoming call webhook error");
     // Hang up gracefully on error
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response><Hangup/></Response>`);
@@ -70,11 +73,7 @@ export async function handleMissedCall(req: Request, res: Response) {
     const hotelNumber  = req.body?.To            as string | undefined;
     const transcript   = req.body?.TranscriptionText as string | undefined;
 
-    console.log("[Call] Missed call / voicemail:", {
-      from:       callerNumber,
-      to:         hotelNumber,
-      transcript: transcript?.slice(0, 100),
-    });
+    log.info({ from: callerNumber, to: hotelNumber, transcript: transcript?.slice(0, 100) }, "missed call / voicemail");
 
     // TODO: implement when call channel is live
     // 1. Look up hotel by hotelNumber
@@ -84,6 +83,6 @@ export async function handleMissedCall(req: Request, res: Response) {
     // await sendWhatsAppMissedCallNotification(hotelId, callerNumber, transcript);
 
   } catch (err) {
-    console.error("❌ [Call] Missed call handler error:", err);
+    log.error({ err }, "missed call webhook error");
   }
 }

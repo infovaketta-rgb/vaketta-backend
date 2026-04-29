@@ -2,6 +2,9 @@ import { Request, Response } from "express";
 import { createBookingService, updateBookingService } from "../services/booking.service";
 import prisma from "../db/connect";
 import { BookingStatus } from "@prisma/client";
+import { logger } from "../utils/logger";
+
+const log = logger.child({ service: "booking" });
 
 export async function createBooking(req: Request, res: Response) {
   try {
@@ -23,6 +26,11 @@ export async function createBooking(req: Request, res: Response) {
       });
     }
 
+    const guestOwned = await prisma.guest.findFirst({ where: { id: guestId, hotelId } });
+    if (!guestOwned) {
+      return res.status(404).json({ error: "Guest not found" });
+    }
+
     const booking = await createBookingService({
       hotelId,
       guestId,
@@ -36,7 +44,7 @@ export async function createBooking(req: Request, res: Response) {
 
     res.json(booking);
   } catch (err: any) {
-    console.error("❌ Create booking failed", err.message);
+    log.error({ err: err.message }, "create booking failed");
     res.status(500).json({ error: "Create booking failed" });
   }
 }
@@ -62,7 +70,7 @@ export async function getBookings(req: Request, res: Response) {
 
     return res.json({ data: bookings, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
-    console.error("❌ Get bookings failed:", err);
+    log.error({ err }, "get bookings failed");
     return res.status(500).json({ error: "Failed to fetch bookings" });
   }
 }
@@ -91,7 +99,7 @@ export async function updateBookingStatus(req: Request, res: Response) {
 
     return res.json({ success: true });
   } catch (err) {
-    console.error("Update booking status failed:", err);
+    log.error({ err }, "update booking status failed");
     res.status(500).json({ error: "Failed to update status" });
   }
 }
@@ -117,7 +125,7 @@ export async function editBooking(req: Request, res: Response) {
 
     res.json(booking);
   } catch (err: any) {
-    console.error("Edit booking failed:", err.message);
+    log.error({ err: err.message }, "edit booking failed");
     res.status(400).json({ error: err.message || "Failed to edit booking" });
   }
 }
@@ -136,7 +144,7 @@ export async function getBookingById(req: Request, res: Response) {
     if (!booking) return res.status(404).json({ error: "Booking not found" });
     return res.json(booking);
   } catch (err) {
-    console.error("❌ getBookingById failed:", err);
+    log.error({ err }, "get booking by id failed");
     return res.status(500).json({ error: "Failed to fetch booking" });
   }
 }
@@ -148,6 +156,9 @@ export async function bulkUpdateBookingStatus(req: Request, res: Response) {
 
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: "ids must be a non-empty array" });
+    }
+    if (ids.length > 500) {
+      return res.status(400).json({ error: "Maximum 500 booking IDs per request" });
     }
     const validStatuses = Object.values(BookingStatus);
     if (!status || !validStatuses.includes(status as BookingStatus)) {
@@ -161,7 +172,7 @@ export async function bulkUpdateBookingStatus(req: Request, res: Response) {
 
     return res.json({ updated: result.count });
   } catch (err) {
-    console.error("❌ Bulk status update failed:", err);
+    log.error({ err }, "bulk booking status update failed");
     return res.status(500).json({ error: "Failed to update bookings" });
   }
 }
@@ -171,16 +182,26 @@ export async function exportBookingsCsv(req: Request, res: Response) {
     const hotelId = (req as any).user.hotelId;
     const { from, to } = req.query as { from?: string; to?: string };
 
+    const fromDate = from ? new Date(from) : undefined;
+    const toDate   = to   ? new Date(to)   : undefined;
+    if (fromDate && isNaN(fromDate.getTime())) {
+      return res.status(400).json({ error: "Invalid from date" });
+    }
+    if (toDate && isNaN(toDate.getTime())) {
+      return res.status(400).json({ error: "Invalid to date" });
+    }
+
     const where: any = { hotelId };
-    if (from || to) {
+    if (fromDate || toDate) {
       where.createdAt = {};
-      if (from) where.createdAt.gte = new Date(from);
-      if (to)   where.createdAt.lte = new Date(to);
+      if (fromDate) where.createdAt.gte = fromDate;
+      if (toDate)   where.createdAt.lte = toDate;
     }
 
     const bookings = await prisma.booking.findMany({
       where,
       orderBy: { createdAt: "desc" },
+      take:    10_000,
       include: { roomType: { select: { name: true } } },
     });
 
@@ -213,7 +234,7 @@ export async function exportBookingsCsv(req: Request, res: Response) {
     res.setHeader("Content-Disposition", `attachment; filename="bookings-${Date.now()}.csv"`);
     return res.send(csv);
   } catch (err) {
-    console.error("❌ CSV export failed:", err);
+    log.error({ err }, "bookings CSV export failed");
     return res.status(500).json({ error: "Failed to export bookings" });
   }
 }
@@ -235,7 +256,7 @@ export async function getBookingSummary(req: Request, res: Response) {
       totalRevenue:  Number(agg._sum.totalPrice ?? 0),
     });
   } catch (err) {
-    console.error("❌ Summary failed:", err);
+    log.error({ err }, "booking summary failed");
     return res.status(500).json({ error: "Failed to fetch summary" });
   }
 }

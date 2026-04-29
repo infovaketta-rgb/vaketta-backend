@@ -2,46 +2,88 @@ import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
 
 /**
- * Verifies the X-Hub-Signature-256 header that Meta signs every webhook payload with.
- * Rejects requests that don't match — prevents fake webhook injections.
- * Requires WHATSAPP_APP_SECRET in env (your Meta App Secret).
+ * Meta webhook signature verification middleware
  */
-export function verifyWebhookSignature(req: Request, res: Response, next: NextFunction) {
-  const appSecret = process.env.WHATSAPP_APP_SECRET;
-  if (!appSecret) {
-    if (process.env.NODE_ENV === "production") {
-      console.error("❌ WHATSAPP_APP_SECRET not set in production — rejecting webhook");
-      return res.status(500).json({ error: "Webhook verification unavailable" });
+export function verifyWebhookSignature(
+  appSecret:string
+){
+
+  if(!appSecret){
+    throw new Error(
+      "Webhook app secret missing"
+    );
+  }
+
+  return function(
+    req:Request,
+    res:Response,
+    next:NextFunction
+  ){
+
+    const signature =
+      req.get(
+        "x-hub-signature-256"
+      );
+
+    if(!signature){
+      console.warn(
+       "[Webhook] Missing signature"
+      );
+
+      return res.status(401).json({
+        error:"Missing webhook signature"
+      });
     }
-    console.warn("⚠️  WHATSAPP_APP_SECRET not set — skipping webhook signature verification (dev only)");
-    return next();
-  }
 
-  const signature = req.headers["x-hub-signature-256"] as string | undefined;
-  if (!signature) {
-    return res.status(401).json({ error: "Missing webhook signature" });
-  }
+    const rawBody =
+      (req as any).rawBody as
+      Buffer | undefined;
 
-  // Body must be the raw Buffer — express.json() must NOT have parsed it yet
-  const rawBody = (req as any).rawBody as Buffer | undefined;
-  if (!rawBody) {
-    return res.status(500).json({ error: "Raw body unavailable for signature check" });
-  }
+    if(!rawBody){
+      return res.status(500).json({
+        error:
+         "Raw body unavailable for signature verification"
+      });
+    }
 
-  const expected = "sha256=" + crypto
-    .createHmac("sha256", appSecret)
-    .update(rawBody)
-    .digest("hex");
+    const expected =
+      "sha256=" +
+      crypto
+       .createHmac(
+         "sha256",
+         appSecret
+       )
+       .update(rawBody)
+       .digest("hex");
 
-  const sigBuffer = Buffer.from(signature);
-  const expectedBuffer = Buffer.from(expected);
+    const sigBuffer=
+      Buffer.from(
+        signature,
+        "utf8"
+      );
 
-  if (
-    sigBuffer.length !== expectedBuffer.length ||
-    !crypto.timingSafeEqual(sigBuffer, expectedBuffer)
-  ) {
-    return res.status(401).json({ error: "Invalid webhook signature" });
-  }
+    const expectedBuffer=
+      Buffer.from(
+        expected,
+        "utf8"
+      );
 
-  next();
+    if(
+      sigBuffer.length !== expectedBuffer.length ||
+      !crypto.timingSafeEqual(
+        sigBuffer,
+        expectedBuffer
+      )
+    ){
+      console.warn(
+        "[Webhook] Invalid signature"
+      );
+
+      return res.status(401).json({
+        error:"Invalid webhook signature"
+      });
+    }
+
+    next();
+  };
 }

@@ -38,7 +38,11 @@
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI    from "openai";
 import prisma    from "../db/connect";
+import { redis } from "../queue/redis";
+import { logger } from "../utils/logger";
 import { getCalendarData } from "./availability.service";
+
+const log = logger.child({ service: "ai" });
 
 // ── Provider selection ────────────────────────────────────────────────────────
 
@@ -73,6 +77,22 @@ const ANTHROPIC_MODEL = "claude-haiku-4-5-20251001";
 const OPENAI_MODEL    = "gpt-4o-mini";
 const MAX_TOKENS      = 260;
 const HISTORY_LEN     = 6;
+
+// ── Per-guest AI rate limit ───────────────────────────────────────────────────
+
+const AI_RATE_LIMIT_MAX  = 5;   // max AI calls per guest
+const AI_RATE_LIMIT_SECS = 60;  // within this window (seconds)
+
+async function checkAIRateLimit(hotelId: string, guestId: string): Promise<boolean> {
+  try {
+    const key = `ai:rl:${hotelId}:${guestId}`;
+    const results = await redis.pipeline().incr(key).expire(key, AI_RATE_LIMIT_SECS).exec();
+    const count = (results?.[0]?.[1] as number) ?? 0;
+    return count <= AI_RATE_LIMIT_MAX;
+  } catch {
+    return true; // fail open — never block AI if Redis is unavailable
+  }
+}
 
 // ── Layer 1: Cached system prompt ─────────────────────────────────────────────
 
@@ -283,7 +303,7 @@ async function callAnthropic(
 ): Promise<string | null> {
   const client = getAnthropicClient();
   if (!client) {
-    console.warn("[AI] ANTHROPIC_API_KEY not set");
+    log.warn("ANTHROPIC_API_KEY not set");
     return null;
   }
 
@@ -323,7 +343,7 @@ async function callOpenAI(
 ): Promise<string | null> {
   const client = getOpenAIClient();
   if (!client) {
-    console.warn("[AI] OPENAI_API_KEY not set");
+    log.warn("OPENAI_API_KEY not set");
     return null;
   }
 
@@ -363,6 +383,9 @@ export async function getAIReply(
   guestId:     string,
   userMessage: string,
 ): Promise<AIReplyResult | null> {
+  const allowed = await checkAIRateLimit(hotelId, guestId);
+  if (!allowed) return null;
+
   const provider = activeProvider();
   const needsAvailability = AVAILABILITY_KEYWORDS.test(userMessage);
 
@@ -395,7 +418,7 @@ export async function getAIReply(
     if (!raw) return null;
     return parseReply(raw);
   } catch (err: any) {
-    console.error(`[AI:${provider}] API error:`, err?.message ?? err);
+    log.error({ provider, err: err?.message ?? err }, "AI API error");
     return null;
   }
 }

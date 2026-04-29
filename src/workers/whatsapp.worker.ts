@@ -81,9 +81,20 @@ const worker = new Worker(
   }
 );
 
-// Log permanently failed jobs so they are never silently dropped
-worker.on("failed", (job, err) => {
+// Persist permanently failed jobs to the dead-letter table so they are
+// never silently dropped and can be inspected / replayed by an operator.
+worker.on("failed", async (job, err) => {
   log.error({ err, jobId: job?.id, messageId: job?.data?.messageId }, "job exhausted all retries");
+
+  await prisma.deadLetterEvent.create({
+    data: {
+      provider: "whatsapp",
+      payload:  job?.data ?? {},
+      error:    String(err),
+    },
+  }).catch((dbErr) =>
+    log.error({ dbErr }, "dead-letter write failed")
+  );
 });
 
 worker.on("error", (err) => {

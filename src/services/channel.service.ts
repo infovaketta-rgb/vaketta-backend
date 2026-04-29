@@ -18,7 +18,7 @@
  *   "sms"       — SMS via Twilio / AWS SNS         🔜 future
  * ─────────────────────────────────────────────────────────────────────────────
  */
-
+/*
 import { sendTextMessage as waSendText } from "./whatsapp.send.service";
 
 export type OutboundPayload = {
@@ -29,11 +29,12 @@ export type OutboundPayload = {
   channel?:  string;   // defaults to "whatsapp"
   guestId?:  string | null;
 };
-
+*/
 /**
  * Send a text message to a guest on the appropriate channel.
  * Returns the provider response (or null in mock mode).
- */
+ **/
+/*
 export async function dispatchOutboundMessage(
   payload: OutboundPayload,
 ): Promise<unknown> {
@@ -66,3 +67,4 @@ export async function dispatchOutboundMessage(
       return null;
   }
 }
+*/

@@ -7,20 +7,36 @@
  *
  * Runs every 30 minutes — safe to run frequently because the DB query only
  * updates rows where billingEndDate < now AND status is "active" or "trial".
+ *
+ * A Redis SET NX lock prevents duplicate runs when multiple worker replicas
+ * are deployed. The lock TTL (5 min) exceeds the expected job duration and is
+ * shorter than the cron interval, so it always expires before the next tick.
  */
 
 import { expireOverdueSubscriptions } from "../services/billing.service";
+import { redis } from "../queue/redis";
+import { logger } from "../utils/logger";
 
-const INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const log = logger.child({ service: "billing-worker" });
+
+const INTERVAL_MS    = 30 * 60 * 1000; // 30 minutes
+const LOCK_KEY       = "billing:lock:expiry";
+const LOCK_TTL_SECS  = 5 * 60; // 5 minutes — auto-expires if job crashes
 
 async function runExpiry() {
+  // Acquire distributed lock — only one worker instance runs per interval
+  const acquired = await redis.set(LOCK_KEY, "1", "EX", LOCK_TTL_SECS, "NX");
+  if (!acquired) return;
+
   try {
     const count = await expireOverdueSubscriptions();
     if (count > 0) {
-      console.log(`✅ [BillingWorker] Expired ${count} overdue subscription(s)`);
+      log.info({ count }, "expired overdue subscriptions");
     }
   } catch (err) {
-    console.error("❌ [BillingWorker] Expiry job failed:", err);
+    log.error({ err }, "billing expiry job failed");
+  } finally {
+    await redis.del(LOCK_KEY);
   }
 }
 
@@ -28,4 +44,4 @@ async function runExpiry() {
 runExpiry();
 setInterval(runExpiry, INTERVAL_MS);
 
-console.log("🕐 Billing expiry worker started (runs every 30 min)");
+log.info({ intervalMs: INTERVAL_MS }, "billing expiry worker started");

@@ -7,9 +7,39 @@ import { resetSession } from "./session.service";
 import { incrementConversationUsage, isConversationOverQuota } from "./usage.service";
 import { sendPushToHotelStaff } from "./push.service";
 import { logger } from "../utils/logger";
+import { MessageChannel } from "@prisma/client";
 
+import { sendChannelMessage } from "./channel.send.service";
 const log = logger.child({ service: "message" });
-import { sendTextMessage } from "./whatsapp.send.service";
+
+// ── Channel-aware hotel resolution ───────────────────────────────────────────
+// WhatsApp  → hotel matched by its phone number (the Meta-registered number)
+// Instagram → hotel matched via HotelConfig.instagramBusinessAccountId
+async function resolveHotelByChannel(channel: MessageChannel, recipientId: string) {
+  if (channel === MessageChannel.INSTAGRAM) {
+    const cfg = await prisma.hotelConfig.findUnique({
+      where:   { instagramBusinessAccountId: recipientId },
+      include: { hotel: { include: { config: true } } },
+    });
+    return cfg?.hotel ?? null;
+  }
+  // Default: WHATSAPP — look up hotel by phone
+  return prisma.hotel.findUnique({
+    where:   { phone: recipientId },
+    include: { config: true },
+  });
+}
+
+// ── Provider message-id extraction ───────────────────────────────────────────
+// Centralises the channel-specific response shape differences so call sites
+// don't need to branch on channel themselves.
+function extractProviderMessageId(result: unknown, channel: MessageChannel): string | undefined {
+  if (channel === MessageChannel.INSTAGRAM) {
+    return (result as any)?.message_id ?? (result as any)?.recipient_id ?? undefined;
+  }
+  // WhatsApp
+  return (result as any)?.messages?.[0]?.id;
+}
 
 type IncomingMessageInput = {
   fromPhone:   string;
@@ -21,7 +51,7 @@ type IncomingMessageInput = {
   fileName?:   string | null;
   wamid?:      string | null;
   /** Channel this message arrived on. Defaults to "whatsapp". Future: "instagram" | "call" */
-  channel?: string;
+  channel?: MessageChannel;
 };
 
 type IncomingMessageResult = {
@@ -34,14 +64,11 @@ type IncomingMessageResult = {
 export async function logIncomingMessage(
   input: IncomingMessageInput
 ): Promise<IncomingMessageResult> {
-  const { fromPhone, toPhone, body, messageType, mediaUrl, mimeType, fileName, wamid } = input;
+  const { fromPhone, toPhone, body, messageType, mediaUrl, mimeType, fileName, wamid ,channel = MessageChannel.WHATSAPP} = input;
 
   // ── 1. Find hotel ────────────────────────────────────────────────────────────
-  const hotel = await prisma.hotel.findUnique({
-    where:   { phone: toPhone },
-    include: { config: true },
-  });
-  if (!hotel) throw new Error(`Hotel not found for phone ${toPhone}`);
+  const hotel = await resolveHotelByChannel(channel, toPhone);
+  if (!hotel) throw new Error(`Hotel not found for channel ${channel}, recipient ${toPhone}`);
 
   // ── Deduplication: Meta re-delivers webhooks on timeout — skip if already seen ─
   if (wamid) {
@@ -77,6 +104,7 @@ export async function logIncomingMessage(
       hotelId:     hotel.id,
       guestId:     guest.id,
       status:      MessageStatus.RECEIVED,
+      channel,
       ...(wamid ? { wamid } : {}),
     },
   });
@@ -155,14 +183,15 @@ export async function logIncomingMessage(
     let finalStatus: MessageStatus = MessageStatus.FAILED;
 
     try {
-      const result = await sendTextMessage({
+      const result = await sendChannelMessage({
+        channel,
         toPhone:   fromPhone,
         fromPhone: toPhone,
         hotelId:   hotel.id,
         guestId:   guest.id,
         text:      sentReplyText,
       });
-      wamid = (result as any)?.messages?.[0]?.id ?? undefined;
+      wamid = extractProviderMessageId(result, channel);
       finalStatus = MessageStatus.SENT;
     } catch (err) {
       log.error({ err, hotelId: hotel.id, guestId: guest.id }, "bot sendTextMessage failed");
@@ -178,6 +207,7 @@ export async function logIncomingMessage(
         hotelId:     hotel.id,
         guestId:     guest.id,
         status:      finalStatus,
+        channel,
         ...(wamid ? { wamid } : {}),
       },
     });
@@ -214,8 +244,9 @@ export async function sendManualReply(input: {
   fromPhone: string; // hotel number
   toPhone:   string; // guest number
   text:      string;
+  channel:   MessageChannel;
 }): Promise<{ message: any; delaySeconds: number | null }> {
-  const { hotelId, guestId, fromPhone, toPhone, text } = input;
+  const { hotelId, guestId, fromPhone, toPhone, text ,channel = MessageChannel.WHATSAPP } = input;
 
   // Mark as handled by staff and reset bot session
   await prisma.guest.updateMany({
@@ -243,6 +274,7 @@ export async function sendManualReply(input: {
         hotelId,
         guestId,
         status:      MessageStatus.PENDING,
+        channel ,
       },
     });
 
@@ -253,22 +285,25 @@ export async function sendManualReply(input: {
     const timer = setTimeout(async () => {
       _pendingTimers.delete(message.id);
 
-      // Guard: message may have been undo-deleted while we were waiting
-      const stillPending = await prisma.message.findFirst({
+      // Atomic claim: transition PENDING → SENT in one statement.
+      // If undoSend already deleted the row, updateMany returns count=0 and
+      // we exit before touching the network — eliminating the send-after-cancel race.
+      const claimed = await prisma.message.updateMany({
         where: { id: message.id, status: MessageStatus.PENDING },
+        data:  { status: MessageStatus.SENT },
       });
-      if (!stillPending) return;
+      if (claimed.count === 0) return;
 
       let wamid: string | undefined;
-      let finalStatus: MessageStatus = MessageStatus.FAILED;
+      let finalStatus: MessageStatus = MessageStatus.SENT;
 
       try {
-        const result = await sendTextMessage({ toPhone, fromPhone, hotelId, guestId, text });
-        wamid = (result as any)?.messages?.[0]?.id ?? undefined;
-        finalStatus = MessageStatus.SENT;
-        console.log("[Delay] Message sent, wamid:", wamid ?? "unknown");
+        const result = await sendChannelMessage({ channel, toPhone, fromPhone, hotelId, guestId, text });
+        wamid = extractProviderMessageId(result, channel);
+        log.info({ messageId: message.id, hotelId }, "[Delay] message sent");
       } catch (err) {
-        console.error("[Delay] sendTextMessage error:", err);
+        log.error({ err, messageId: message.id }, "[Delay] send failed");
+        finalStatus = MessageStatus.FAILED;
       }
 
       await prisma.message.update({
@@ -276,7 +311,6 @@ export async function sendManualReply(input: {
         data:  { status: finalStatus, ...(wamid ? { wamid } : {}) },
       });
 
-      // Push status update to all open dashboard tabs
       emitToHotel(hotelId, "message:status", { messageId: message.id, status: finalStatus });
     }, delaySeconds * 1000);
 
@@ -290,17 +324,18 @@ export async function sendManualReply(input: {
   let finalStatus: MessageStatus = MessageStatus.FAILED;
 
   try {
-    const result = await sendTextMessage({ toPhone, fromPhone, hotelId, guestId, text });
-    wamid = (result as any)?.messages?.[0]?.id ?? undefined;
-    console.log("[Meta] Message sent, wamid:", wamid ?? "unknown");
+    const result = await sendChannelMessage({ channel, toPhone, fromPhone, hotelId, guestId, text });
+    wamid = extractProviderMessageId(result, channel);
+    log.info({ wamid }, "message sent");
     finalStatus = MessageStatus.SENT;
   } catch (err) {
-    console.error("[Meta] sendTextMessage error:", err);
+    log.error({ err }, "send channel message error");
     finalStatus = MessageStatus.FAILED;
   }
 
   const message = await prisma.message.create({
     data: {
+      channel,
       direction:   "OUT",
       fromPhone,
       toPhone,
@@ -316,7 +351,7 @@ export async function sendManualReply(input: {
   emitToHotel(hotelId, "message:new", { message });
 
   if (finalStatus === MessageStatus.FAILED) {
-    throw new Error("WhatsApp delivery failed — message not sent");
+    throw new Error("Message delivery failed — message not sent");
   }
 
   return { message, delaySeconds: null };

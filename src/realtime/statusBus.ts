@@ -6,6 +6,9 @@
  * to Redis; the main server subscribes and forwards them to Socket.IO.
  */
 import { createRedisClient } from "../queue/redis";
+import { logger } from "../utils/logger";
+
+const log = logger.child({ service: "status-bus" });
 
 const CHANNEL = "message:status:update";
 
@@ -26,7 +29,7 @@ export type StatusUpdatePayload = {
 export function publishMessageStatus(payload: StatusUpdatePayload): void {
   getPublisher()
     .publish(CHANNEL, JSON.stringify(payload))
-    .catch((err) => console.error("❌ [StatusBus] Publish error:", err));
+    .catch((err) => log.error({ err }, "status bus publish error"));
 }
 
 /** Called once from the main server process at startup.
@@ -36,13 +39,13 @@ export function subscribeMessageStatus(
 ): () => void {
   const sub = createRedisClient("status-sub");
   sub.subscribe(CHANNEL, (err) => {
-    if (err) console.error("❌ [StatusBus] Subscribe error:", err);
+    if (err) log.error({ err }, "status bus subscribe error");
   });
   sub.on("message", (_channel, raw) => {
     try {
       onUpdate(JSON.parse(raw));
     } catch {
-      console.warn("⚠️  [StatusBus] Invalid payload:", raw);
+      log.warn({ raw }, "status bus received invalid payload");
     }
   });
   return () => { sub.quit().catch(() => {}); };

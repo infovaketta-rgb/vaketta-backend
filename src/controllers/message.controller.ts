@@ -1,7 +1,10 @@
 import { Request, Response } from "express";
 import { sendManualReply, cancelPendingSend } from "../services/message.service";
 import prisma from "../db/connect";
-import { MessageStatus } from "@prisma/client";
+import { MessageStatus, MessageChannel } from "@prisma/client";
+import { logger } from "../utils/logger";
+
+const log = logger.child({ service: "message" });
 import { emitToHotel } from "../realtime/emit";
 import { uploadToR2, deleteFromR2 } from "../services/r2.service";
 import { sendMediaMessage } from "../services/whatsapp.send.service";
@@ -16,6 +19,9 @@ export async function manualReply(req: Request, res: Response) {
     if (!guestId || !text) {
       return res.status(400).json({ error: "guestId and text are required" });
     }
+    if (typeof text !== "string" || text.length > 4096) {
+      return res.status(400).json({ error: "text must be 1–4096 characters" });
+    }
 
     // Scope lookup to this hotel — prevents cross-tenant guest access
     const guest = await prisma.guest.findFirst({
@@ -27,18 +33,28 @@ export async function manualReply(req: Request, res: Response) {
       return res.status(404).json({ error: "Guest not found" });
     }
 
+    // Derive the channel from the guest's most recent message so Instagram
+    // replies go via Instagram, not WhatsApp.
+    const lastMsg = await prisma.message.findFirst({
+      where:   { guestId, hotelId },
+      orderBy: { timestamp: "desc" },
+      select:  { channel: true },
+    });
+    const channel = lastMsg?.channel ?? MessageChannel.WHATSAPP;
+
     const result = await sendManualReply({
       hotelId,
       guestId,
       fromPhone: guest.hotel.phone,
-      toPhone: guest.phone,
+      toPhone:   guest.phone,
       text,
+      channel,
     });
 
     // Return { message, delaySeconds } — frontend uses delaySeconds to show countdown
     res.json(result);
   } catch (err: any) {
-    console.error("❌ manualReply failed:", err);
+    log.error({ err }, "manual reply failed");
     res.status(500).json({ error: err?.message ?? "Send failed" });
   }
 }
@@ -65,7 +81,7 @@ export async function getMessages(req: Request, res: Response) {
 
   return res.json(messages);
 } catch (err) {
-    console.error("❌ Get messages failed:", err);
+    log.error({ err }, "get messages failed");
     return res.status(500).json({
       success: false,
       message: "Internal Server Error",
@@ -101,7 +117,7 @@ export async function markMessagesRead(req: Request, res: Response) {
 
     return res.json({ success: true });
   } catch (err) {
-    console.error("❌ Mark read failed:", err);
+    log.error({ err }, "mark messages read failed");
     return res.status(500).json({ error: "Failed to mark read" });
   }
 }
@@ -128,7 +144,7 @@ export async function setBotEnabled(req: Request, res: Response) {
 
     return res.json({ success: true, botEnabled: enabled });
   } catch (err) {
-    console.error("❌ setBotEnabled failed:", err);
+    log.error({ err }, "set bot enabled failed");
     return res.status(500).json({ error: "Failed to update bot status" });
   }
 }
@@ -164,7 +180,7 @@ export async function deleteMessage(req: Request, res: Response) {
           : null;
       if (key) {
         deleteFromR2(key).catch((err) =>
-          console.error("❌ R2 delete failed for", key, err)
+          log.error({ err, key }, "R2 delete failed")
         );
       }
     }
@@ -192,7 +208,7 @@ export async function deleteMessage(req: Request, res: Response) {
 
     return res.json({ success: true, message: updated });
   } catch (err: any) {
-    console.error("❌ deleteMessage:", err);
+    log.error({ err }, "delete message failed");
     return res.status(500).json({ error: "Failed to delete message" });
   }
 }
@@ -203,26 +219,32 @@ export async function undoSend(req: Request, res: Response) {
     const hotelId   = (req as any).user.hotelId as string;
     const messageId = req.params["messageId"]   as string;
 
+    // Read guestId before deleting (needed for the socket emit below).
     const msg = await prisma.message.findFirst({
-      where: { id: messageId, hotelId },
+      where:  { id: messageId, hotelId },
+      select: { guestId: true, status: true },
     });
     if (!msg) return res.status(404).json({ error: "Message not found" });
-    if (msg.status !== "PENDING") {
-      return res.status(400).json({ error: "Message has already been sent — cannot undo" });
-    }
 
-    // Cancel the in-process setTimeout registered by sendManualReply
+    // Cancel the in-memory timer first (no-op if it already fired).
     cancelPendingSend(messageId);
 
-    // Hard-delete the message row (no tombstone — it was never sent)
-    await prisma.message.delete({ where: { id: messageId } });
+    // Atomic guard: only delete while still PENDING. If the timer already
+    // claimed the row (set status → SENT), deleteMany returns count=0 and
+    // we surface a 409 instead of silently deleting a delivered message.
+    const deleted = await prisma.message.deleteMany({
+      where: { id: messageId, hotelId, status: MessageStatus.PENDING },
+    });
+    if (deleted.count === 0) {
+      return res.status(409).json({ error: "Message has already been sent — cannot undo" });
+    }
 
     // Notify all open dashboard tabs to remove the pending bubble
     emitToHotel(hotelId, "message:undo", { messageId, guestId: msg.guestId });
 
     return res.json({ success: true });
   } catch (err: any) {
-    console.error("❌ undoSend:", err);
+    log.error({ err }, "undo send failed");
     return res.status(500).json({ error: "Failed to undo send" });
   }
 }
@@ -317,7 +339,7 @@ export async function sendMedia(req: Request, res: Response) {
       wamid = (result as any)?.messages?.[0]?.id ?? undefined;
       finalStatus = MessageStatus.SENT;
     } catch (err) {
-      console.error("❌ sendMediaMessage failed:", err);
+      log.error({ err }, "send media message failed");
     }
 
     const updated = await prisma.message.update({
@@ -329,7 +351,7 @@ export async function sendMedia(req: Request, res: Response) {
 
     return res.json(updated);
   } catch (err) {
-    console.error("❌ sendMedia failed:", err);
+    log.error({ err }, "send media failed");
     return res.status(500).json({ error: "Failed to send media" });
   }
 }
@@ -341,6 +363,11 @@ export async function sendMediaFromUrl(req: Request, res: Response) {
     const { guestId, mediaUrl, mimeType, fileName, messageType } = req.body;
 
     if (!guestId || !mediaUrl) return res.status(400).json({ error: "guestId and mediaUrl required" });
+
+    const r2Base = (process.env.R2_PUBLIC_URL ?? "").replace(/\/$/, "");
+    if (!r2Base || !mediaUrl.startsWith(`${r2Base}/`)) {
+      return res.status(400).json({ error: "mediaUrl must be hosted on the Vaketta CDN" });
+    }
 
     const guest = await prisma.guest.findFirst({
       where: { id: guestId, hotelId },
@@ -383,7 +410,7 @@ export async function sendMediaFromUrl(req: Request, res: Response) {
       wamid = (result as any)?.messages?.[0]?.id ?? undefined;
       finalStatus = MessageStatus.SENT;
     } catch (err) {
-      console.error("❌ sendMediaFromUrl WhatsApp send failed:", err);
+      log.error({ err }, "send media from url WhatsApp send failed");
     }
 
     const updated = await prisma.message.update({
@@ -394,7 +421,7 @@ export async function sendMediaFromUrl(req: Request, res: Response) {
     emitToHotel(hotelId, "message:status", { messageId: message.id, status: finalStatus });
     return res.json(updated);
   } catch (err: any) {
-    console.error("❌ sendMediaFromUrl:", err);
+    log.error({ err }, "send media from url failed");
     return res.status(500).json({ error: "Failed to send media" });
   }
 }

@@ -14,7 +14,7 @@ export function signToken(payload: { id: string; role: string; hotelId: string }
   return jwt.sign(
     { ...payload, jti: crypto.randomUUID() },
     process.env.JWT_SECRET!,
-    { expiresIn: "7d" }
+    { expiresIn: "24h" }
   );
 }
 

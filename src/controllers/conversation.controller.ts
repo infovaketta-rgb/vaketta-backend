@@ -1,6 +1,9 @@
 import { Request, Response } from "express";
 import prisma from "../db/connect";
 import { MessageStatus } from "@prisma/client";
+import { logger } from "../utils/logger";
+
+const log = logger.child({ service: "conversation" });
 
 type JwtUser = { id: string; role: string; hotelId: string };
 
@@ -58,7 +61,7 @@ export async function getConversations(req: Request, res: Response) {
 
     return res.json(result);
   } catch (err) {
-    console.error("❌ Get conversations failed:", err);
+    log.error({ err }, "get conversations failed");
     return res.status(500).json({ error: "Internal Server Error" });
   }
 }
@@ -85,7 +88,7 @@ export async function updateGuestName(req: Request, res: Response) {
 
     return res.json({ success: true, name: name.trim() });
   } catch (err) {
-    console.error("❌ Update guest name failed:", err);
+    log.error({ err }, "update guest name failed");
     return res.status(500).json({ error: "Internal Server Error" });
   }
 }

@@ -5,6 +5,10 @@ import prisma from "../db/connect";
 import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
 import { extractMediaFromWebhookMessage, downloadMetaMedia } from "../services/media.service";
+import crypto from "crypto";
+import { logger } from "../utils/logger";
+
+const log = logger.child({ service: "whatsapp" });
 
 const META_STATUS_MAP: Record<string, MessageStatus> = {
   sent:      MessageStatus.SENT,
@@ -27,14 +31,18 @@ export function verifyWhatsAppWebhook(req: Request, res: Response) {
   const token     = req.query["hub.verify_token"] as string | undefined;
   const challenge = req.query["hub.challenge"] as string | undefined;
 
-  const expectedToken = process.env.WHATSAPP_VERIFY_TOKEN ;
+  const expectedToken = process.env.WHATSAPP_VERIFY_TOKEN ?? "";
 
-  if (mode === "subscribe" && token === expectedToken) {
-    console.log("✅ WhatsApp webhook verified");
+  const ha = crypto.createHash("sha256").update(token ?? "").digest();
+  const hb = crypto.createHash("sha256").update(expectedToken).digest();
+  const tokenMatch = crypto.timingSafeEqual(ha, hb);
+
+  if (mode === "subscribe" && tokenMatch) {
+    log.info("WhatsApp webhook verified");
     return res.status(200).send(challenge);
   }
 
-  console.warn("❌ WhatsApp webhook verification failed", { mode, token });
+  log.warn({ mode }, "WhatsApp webhook verification failed");
   return res.sendStatus(403);
 }
 
@@ -83,7 +91,7 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
     const rawTo   = value?.metadata?.display_phone_number as string | undefined;
 
     if (!rawFrom || !rawTo) {
-      console.warn("⚠️ Missing phone numbers in webhook payload", { rawFrom, rawTo });
+      log.warn({ rawFrom, rawTo }, "missing phone numbers in webhook payload");
       return res.sendStatus(200);
     }
 
@@ -98,7 +106,7 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
     const SUPPORTED_TYPES = new Set(["text", "image", "video", "audio", "document", "sticker"]);
 
     if (!SUPPORTED_TYPES.has(messageType)) {
-      console.log(`[Webhook] Skipping unsupported message type: ${messageType}`);
+      log.info({ messageType }, "skipping unsupported message type");
       return res.sendStatus(200);
     }
 
@@ -116,7 +124,7 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
 
       // Upload to R2 in the background — never blocks the webhook ACK
       downloadAndStoreMedia(mediaInfo, toPhone).catch((err) =>
-        console.error("[Media] Background upload failed:", err)
+        log.error({ err }, "media background upload failed")
       );
 
       return res.sendStatus(200);
@@ -127,7 +135,7 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
 
     return res.sendStatus(200);
   } catch (err) {
-    console.error("❌ WhatsApp webhook error:", err);
+    log.error({ err }, "WhatsApp webhook error");
     return res.sendStatus(200); // always ACK to prevent Meta retries
   }
 }

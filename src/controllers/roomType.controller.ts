@@ -5,7 +5,11 @@ import {
   updateRoomType,
   deleteRoomType,
 } from "../services/roomType.service";
+import { invalidatePromptCache } from "../services/ai.service";
+import { logger } from "../utils/logger";
 import multer from "multer";
+
+const log = logger.child({ service: "room-type" });
 import { uploadRoomPhoto, deleteRoomPhoto, setMainPhoto, reorderRoomPhotos, getRoomTypeById } from "../services/roomType.service";
 
 
@@ -31,9 +35,10 @@ export async function createRoomTypeController(req: Request, res: Response) {
       ...(totalRooms  ? { totalRooms:  Number(totalRooms)  } : {}),
     });
 
+    invalidatePromptCache(hotelId);
     res.json(roomType);
   } catch (err) {
-    console.error(err);
+    log.error({ err });
     res.status(500).json({ error: "Create room type failed" });
   }
 }
@@ -46,7 +51,7 @@ export async function getRoomTypesController(req: Request, res: Response) {
     const roomTypes = await getRoomTypes(hotelId);
     res.json(roomTypes);
   } catch (err) {
-    console.error(err);
+    log.error({ err });
     res.status(500).json({ error: "Get room types failed" });
   }
 }
@@ -75,9 +80,10 @@ if (!id) return res.status(400).json({ error: "Room type ID is required" });
       ...(totalRooms  ? { totalRooms:  Number(totalRooms)  } : {}),
     });
 
+    invalidatePromptCache(hotelId);
     res.json(roomType);
   } catch (err) {
-    console.error(err);
+    log.error({ err });
     res.status(500).json({ error: "Update room type failed" });
   }
 }
@@ -90,9 +96,10 @@ export async function deleteRoomTypeController(req: Request, res: Response) {
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: "Room type ID is required" });
     await deleteRoomType({ id, hotelId });
+    invalidatePromptCache(hotelId);
     res.json({ success: true });
   } catch (err) {
-    console.error(err);
+    log.error({ err });
     res.status(500).json({ error: "Delete room type failed" });
   }
 }

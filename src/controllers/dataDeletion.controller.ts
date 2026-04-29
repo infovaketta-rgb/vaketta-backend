@@ -1,12 +1,13 @@
 import { Request, Response } from "express";
 import { getDataDeletion, updateDataDeletion } from "../services/dataDeletion.service";
+import { serverError } from "../utils/serverError";
 
 export async function getDataDeletionHandler(_req: Request, res: Response) {
   try {
     const doc = await getDataDeletion();
     res.json(doc);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch (err) {
+    serverError(res, err);
   }
 }
 
@@ -18,7 +19,7 @@ export async function updateDataDeletionHandler(req: Request, res: Response) {
       ...(content       != null && { content:       String(content) }),
     });
     res.json(doc);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch (err) {
+    serverError(res, err);
   }
 }

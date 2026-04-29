@@ -1,4 +1,7 @@
 import prisma from "../db/connect";
+import { logger } from "../utils/logger";
+
+const log = logger.child({ service: "whatsapp-send" });
 
 // ── Credentials ───────────────────────────────────────────────────────────────
 
@@ -16,9 +19,9 @@ async function resolveCredentials(hotelId: string): Promise<{
   const forceMock = process.env.MOCK_WHATSAPP_SEND === "true";
 
   if (forceMock) {
-    console.warn("[WhatsApp] MOCK_WHATSAPP_SEND=true — not sending to Meta");
+    log.warn({ hotelId }, "MOCK_WHATSAPP_SEND=true — not sending to Meta");
   } else if (!phoneNumberId || !accessToken) {
-    console.warn(`[WhatsApp] Hotel ${hotelId} has no Meta credentials configured — message will not be sent`);
+    log.warn({ hotelId }, "hotel has no Meta credentials configured — message will not be sent");
   }
 
   const mockMode = forceMock || !phoneNumberId || !accessToken;
@@ -53,7 +56,7 @@ async function withRetry<T>(
       if (!isRetryable || attempt === retries) throw err;
 
       const delay = baseMs * 2 ** attempt + Math.random() * 200;
-      console.warn(`[Meta] Attempt ${attempt + 1} failed — retrying in ${Math.round(delay)}ms`);
+      log.warn({ attempt: attempt + 1, delayMs: Math.round(delay) }, "Meta API attempt failed — retrying");
       await new Promise((r) => setTimeout(r, delay));
     }
   }
@@ -95,7 +98,7 @@ export async function sendTextMessage(input: {
   const { phoneNumberId, accessToken, mockMode } = await resolveCredentials(hotelId);
 
   if (mockMode) {
-    console.log("📤 MOCK TEXT →", toPhone, ":", text.slice(0, 80));
+    log.info({ toPhone, preview: text.slice(0, 80) }, "MOCK TEXT send");
     return null;
   }
 
@@ -124,7 +127,7 @@ export async function sendMediaMessage(input: {
   const { phoneNumberId, accessToken, mockMode } = await resolveCredentials(hotelId);
 
   if (mockMode) {
-    console.log("📤 MOCK MEDIA →", toPhone, ":", messageType, mediaUrl);
+    log.info({ toPhone, messageType, mediaUrl }, "MOCK MEDIA send");
     return null;
   }
 
@@ -147,7 +150,7 @@ export async function sendMediaMessage(input: {
     mediaObject.filename = fileName;
   }
 
-  console.log(`[WhatsApp] Sending ${messageType} to ${toPhone} — URL: ${mediaUrl} — MIME: ${mimeType}`);
+  log.info({ toPhone, messageType, mediaUrl, mimeType }, "sending media message");
 
   return withRetry(() =>
     metaPost(`${phoneNumberId}/messages`, {

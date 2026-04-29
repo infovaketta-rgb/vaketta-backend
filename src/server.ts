@@ -19,6 +19,7 @@ import { subscribeMessageStatus } from "./realtime/statusBus";
 import { emitToHotel } from "./realtime/emit";
 import prisma from "./db/connect";
 import { logger } from "./utils/logger";
+import { MessageStatus } from "@prisma/client";
 
 // ── Startup environment validation ────────────────────────────────────────────
 
@@ -55,6 +56,37 @@ function validateEnv() {
 
 validateEnv();
 
+// ── Startup sweep: resolve PENDING messages orphaned by a prior crash/restart ─
+// The delayed-send timer (setTimeout in message.service.ts) lives in process
+// memory. If the process dies while a timer is active, the message stays PENDING
+// forever. Max configured delay is 60 s, so anything older than 2 min is stale.
+async function sweepStalePendingMessages() {
+  const cutoff = new Date(Date.now() - 2 * 60 * 1000);
+  const result = await prisma.message.updateMany({
+    where: {
+      direction: "OUT",
+      status:    MessageStatus.PENDING,
+      createdAt: { lt: cutoff },
+    },
+    data: { status: MessageStatus.FAILED },
+  });
+  if (result.count > 0) {
+    logger.warn({ count: result.count }, "swept stale PENDING→FAILED messages on startup");
+  }
+}
+
+sweepStalePendingMessages().catch((err) =>
+  logger.error({ err }, "startup PENDING sweep failed")
+);
+
+// Recurring sweep — catches any messages that slip through after startup
+const pendingSweepInterval = setInterval(
+  () => sweepStalePendingMessages().catch((err) =>
+    logger.error({ err }, "periodic PENDING sweep failed")
+  ),
+  5 * 60 * 1000 // every 5 minutes
+).unref();
+
 // ── Server setup ──────────────────────────────────────────────────────────────
 
 const server = http.createServer(app);
@@ -81,6 +113,7 @@ async function shutdown(signal: string) {
 
   logger.info({ signal }, "shutdown signal received — closing gracefully");
 
+  clearInterval(pendingSweepInterval);
   unsubscribeStatus();
 
   server.close(async () => {

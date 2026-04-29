@@ -139,23 +139,30 @@ const nights = Math.ceil(
     });
   }
 
-  const referenceNumber = await generateReferenceNumber();
+  const lockKey = `${hotelId}:${new Date().getFullYear()}`;
 
-  const booking = await prisma.booking.create({
-    data: {
-      hotelId,
-      guestId,
-      roomTypeId,
-      guestName,
-      referenceNumber,
-      checkIn: new Date(checkIn),
-      checkOut: new Date(checkOut),
-      pricePerNight: finalPrice,
-      totalPrice,
-      advancePaid: advancePaid ?? 0,
-      status: BookingStatus.PENDING,
-    },
-    include: { guest: true, roomType: true },
+  const booking = await prisma.$transaction(async (tx) => {
+    // Per-hotel-per-year advisory lock — serializes concurrent ref generation.
+    // Transaction-scoped: auto-released on commit or rollback.
+    // hashtext() → int4, auto-promoted to bigint by Postgres.
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+    const referenceNumber = await generateReferenceNumber(tx);
+    return tx.booking.create({
+      data: {
+        hotelId,
+        guestId,
+        roomTypeId,
+        guestName,
+        referenceNumber,
+        checkIn:       checkInDate,
+        checkOut:      checkOutDate,
+        pricePerNight: finalPrice,
+        totalPrice,
+        advancePaid:   advancePaid ?? 0,
+        status:        BookingStatus.PENDING,
+      },
+      include: { guest: true, roomType: true },
+    });
   });
 
   emitToHotel(hotelId, "booking:new", { booking });

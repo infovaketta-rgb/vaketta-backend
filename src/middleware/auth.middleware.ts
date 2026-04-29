@@ -17,13 +17,20 @@ export async function auth(req: Request, res: Response, next: NextFunction) {
     const blocked = await isTokenBlocked(decoded.jti, decoded.id, decoded.iat);
     if (blocked) return res.status(401).json({ error: "Token has been revoked" });
 
-    // Check user is still active — suspended staff must not use old tokens
+    // Check user is still active and hotel subscription has not expired
     const user = await prisma.user.findUnique({
       where:  { id: decoded.id },
-      select: { isActive: true, hotelId: true },
+      select: {
+        isActive: true,
+        hotelId:  true,
+        hotel:    { select: { subscriptionStatus: true } },
+      },
     });
     if (!user || !user.isActive) {
       return res.status(401).json({ error: "Account is inactive" });
+    }
+    if (user.hotel.subscriptionStatus === "expired") {
+      return res.status(402).json({ error: "Subscription has expired" });
     }
 
     (req as any).user = decoded;

@@ -13,6 +13,7 @@ import {
   updateWhatsAppConfig,
   testWhatsAppConnection,
 } from "../services/settings.service";
+import { invalidatePromptCache } from "../services/ai.service";
 
 function hotelId(req: Request): string {
   return (req as any).user.hotelId;
@@ -56,6 +57,7 @@ export async function patchSettings(req: Request, res: Response) {
       ...(aiInstructions       !== undefined && { aiInstructions: aiInstructions || null }),
     });
 
+    invalidatePromptCache(hotelId(req));
     res.json(config);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -80,6 +82,7 @@ export async function addMenuItemHandler(req: Request, res: Response) {
       key, label, replyText: replyText ?? "", order: Number(order ?? 0), type: type ?? "INFO",
       flowId: flowId ?? null,
     });
+    invalidatePromptCache(hotelId(req));
     res.status(201).json(item);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -91,6 +94,7 @@ export async function updateMenuItemHandler(req: Request, res: Response) {
     const itemId = req.params["itemId"];
     if (!itemId) return res.status(400).json({ error: "itemId required" });
     const item = await updateMenuItem(itemId, hotelId(req), req.body);
+    invalidatePromptCache(hotelId(req));
     res.json(item);
   } catch (err: any) {
     res.status(404).json({ error: err.message });
@@ -102,6 +106,7 @@ export async function deleteMenuItemHandler(req: Request, res: Response) {
     const itemId = req.params["itemId"];
     if (!itemId) return res.status(400).json({ error: "itemId required" });
     await deleteMenuItem(itemId, hotelId(req));
+    invalidatePromptCache(hotelId(req));
     res.json({ success: true });
   } catch (err: any) {
     res.status(404).json({ error: err.message });
@@ -112,7 +117,9 @@ export async function updateMenuTitleHandler(req: Request, res: Response) {
   try {
     const { title } = req.body;
     if (!title) return res.status(400).json({ error: "title is required" });
-    res.json(await updateMenuTitle(hotelId(req), title));
+    const updated = await updateMenuTitle(hotelId(req), title);
+    invalidatePromptCache(hotelId(req));
+    res.json(updated);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -173,6 +180,7 @@ export async function patchHotelProfile(req: Request, res: Response) {
       ...(checkOutTime !== undefined && { checkOutTime }),
       ...(website      !== undefined && { website }),
     });
+    invalidatePromptCache(hotelId(req));
     res.json(hotel);
   } catch (err: any) {
     res.status(400).json({ error: err.message });

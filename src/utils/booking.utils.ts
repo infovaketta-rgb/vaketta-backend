@@ -1,9 +1,12 @@
-import prisma from "../db/connect";
+import { Prisma } from "@prisma/client";
 
-export async function generateReferenceNumber(): Promise<string> {
+// tx is required — must be called inside a transaction that holds the advisory lock
+export async function generateReferenceNumber(
+  tx: Prisma.TransactionClient
+): Promise<string> {
   const year = new Date().getFullYear();
   const prefix = `VKT-${year}-`;
-  const last = await prisma.booking.findFirst({
+  const last = await tx.booking.findFirst({
     where:   { referenceNumber: { startsWith: prefix } },
     orderBy: { referenceNumber: "desc" },
     select:  { referenceNumber: true },

@@ -317,6 +317,10 @@ enum MessageStatus {
   READ
 }
 
+enum MessageChannel {
+  WHATSAPP
+  INSTAGRAM
+}
 
 model Message {
   id          String   @id @default(uuid())
@@ -331,6 +335,8 @@ model Message {
   wamid       String?  // Meta's message ID — used to map status webhooks
   jobId       String?  // BullMQ job ID — set when message is queued with a delay (undo-send)
   timestamp   DateTime @default(now())
+
+  channel MessageChannel @default(WHATSAPP)
 
   deleted     Boolean   @default(false)
   deletedBy   String?   // name of the staff member who deleted it
@@ -349,6 +355,7 @@ model Message {
   @@index([wamid])               // status webhook lookup by Meta message ID
   @@index([guestId, timestamp])  // conversation history queries (most common read)
   @@index([hotelId, direction])  // filter IN/OUT per hotel
+  @@index([hotelId, channel])
   @@index([fromPhone])
   @@index([toPhone])
   @@index([hotelId])
@@ -486,7 +493,7 @@ model PushSubscription {
 model WebhookEvent {
   id            String   @id @default(uuid())
   provider      String   // instagram
-  externalEventId String @unique // mid
+  externalEventId String // mid
   hotelId       String?
   payloadHash   String
   processed     Boolean  @default(false)
@@ -494,6 +501,7 @@ model WebhookEvent {
   receivedAt    DateTime @default(now())
   processedAt   DateTime?
 
+  @@unique([provider, externalEventId])
   @@index([provider, externalEventId])
 }
 

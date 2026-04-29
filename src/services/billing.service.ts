@@ -142,17 +142,29 @@ export async function getAdminBillingAnalytics() {
     0
   );
 
-  // MRR trend: use subscriptions grouped by month (start of billing period)
-  // Gives a picture of when hotels were activated
+  // MRR trend: paid subscriptions only, deduped per hotel per month so that
+  // plan reassignments within the same month are not double-counted.
   const subHistory = await prisma.subscription.findMany({
+    where:   { price: { gt: 0 } },
     orderBy: { startDate: "asc" },
-    select:  { price: true, startDate: true },
+    select:  { hotelId: true, price: true, startDate: true },
   });
 
-  // Build monthly MRR from subscription activations (cumulative running total)
-  const monthMap = new Map<string, number>();
+  // Keep only the latest subscription per (hotelId, billingMonth) pair
+  type SubEntry = { price: number; startDate: Date };
+  const latestByHotelMonth = new Map<string, SubEntry>();
   for (const sub of subHistory) {
-    const m = `${sub.startDate.getFullYear()}-${String(sub.startDate.getMonth() + 1).padStart(2, "0")}`;
+    const m   = `${sub.startDate.getFullYear()}-${String(sub.startDate.getMonth() + 1).padStart(2, "0")}`;
+    const key = `${sub.hotelId}:${m}`;
+    const cur = latestByHotelMonth.get(key);
+    if (!cur || sub.startDate > cur.startDate) {
+      latestByHotelMonth.set(key, { price: sub.price, startDate: sub.startDate });
+    }
+  }
+
+  const monthMap = new Map<string, number>();
+  for (const [key, sub] of latestByHotelMonth) {
+    const m = key.split(":")[1]!;
     monthMap.set(m, (monthMap.get(m) ?? 0) + sub.price);
   }
 

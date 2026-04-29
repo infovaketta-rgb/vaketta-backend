@@ -1,5 +1,10 @@
 import { Server, Socket } from "socket.io";
 import prisma from "./db/connect";
+import { logger } from "./utils/logger";
+
+const log = logger.child({ service: "socket" });
+
+const isProd = process.env.NODE_ENV === "production";
 
 type AuthedSocket = Socket & {
   data: {
@@ -18,7 +23,7 @@ export function initSocket(server: any) {
         const allowed = (process.env.FRONTEND_ORIGIN || "https://www.vaketta.com")
           .split(",")
           .map((o) => o.trim());
-        const isNgrok = origin.includes("ngrok");
+        const isNgrok = !isProd && origin.includes("ngrok");
         if (allowed.includes(origin) || isNgrok) callback(null, true);
         else callback(new Error(`Socket origin ${origin} not allowed`));
       },
@@ -57,10 +62,7 @@ export function initSocket(server: any) {
   });
 
   io.on("connection", (socket: AuthedSocket) => {
-    console.log(
-      "🔌 Hotel connected:",
-      socket.data.hotel.name
-    );
+    log.info({ hotelName: socket.data.hotel.name }, "hotel socket connected");
   });
 
   return io;

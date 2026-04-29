@@ -9,6 +9,9 @@
 
 import prisma from "../db/connect";
 import { uploadToR2 } from "./r2.service";
+import { logger } from "../utils/logger";
+
+const log = logger.child({ service: "media" });
 
 const META_API_VERSION = "v25.0";
 
@@ -37,7 +40,7 @@ export async function downloadMetaMedia(
   const accessToken = hotel?.config?.metaAccessToken ?? "";
 
   if (!accessToken) {
-    console.warn(`⚠️  No metaAccessToken configured for hotel ${toPhone} — skipping media download`);
+    log.warn({ toPhone }, "no metaAccessToken configured — skipping media download");
     return null;
   }
 
@@ -72,7 +75,7 @@ export async function downloadMetaMedia(
       fileName: uploaded.fileName,
     };
   } catch (err) {
-    console.error("❌ Failed to download/store media:", err);
+    log.error({ err }, "failed to download/store media");
     return null;
   }
 }

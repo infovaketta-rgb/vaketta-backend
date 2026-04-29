@@ -1,5 +1,8 @@
 import { Router } from "express";
 import multer from "multer";
+import { logger } from "../utils/logger";
+
+const log = logger.child({ service: "message-routes" });
 import { manualReply, getMessages, markMessagesRead, setBotEnabled, sendMedia, deleteMessage, undoSend, sendMediaFromUrl } from "../controllers/message.controller";
 import { requireRole } from "../middleware/role.middleware";
 import { UserRole } from "@prisma/client";
@@ -74,7 +77,7 @@ router.get("/media", async (req, res) => {
 
     res.json({ data: messages, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
-    console.error("❌ GET /messages/media failed:", err);
+    log.error({ err }, "GET /messages/media failed");
     res.status(500).json({ error: "Failed to fetch media" });
   }
 });

@@ -1,5 +1,9 @@
 import { Request, Response } from "express";
 import prisma from "../db/connect";
+import { logger } from "../utils/logger";
+import { serverError } from "../utils/serverError";
+
+const log = logger.child({ service: "lead" });
 
 // ── Public: POST /public/leads ────────────────────────────────────────────────
 export async function submitLead(req: Request, res: Response) {
@@ -28,9 +32,9 @@ export async function submitLead(req: Request, res: Response) {
     });
 
     return res.status(201).json({ success: true, id: lead.id });
-  } catch (err: any) {
-    console.error("❌ submitLead:", err);
-    return res.status(500).json({ error: "Failed to submit lead" });
+  } catch (err) {
+    log.error({ err }, "submit lead failed");
+    return serverError(res, err, "Failed to submit lead");
   }
 }
 
@@ -64,9 +68,9 @@ export async function listLeads(req: Request, res: Response) {
     ]);
 
     return res.json({ data: leads, total, page, pages: Math.ceil(total / limit), limit });
-  } catch (err: any) {
-    console.error("❌ listLeads:", err);
-    return res.status(500).json({ error: "Failed to fetch leads" });
+  } catch (err) {
+    log.error({ err }, "list leads failed");
+    return serverError(res, err, "Failed to fetch leads");
   }
 }
 
@@ -92,7 +96,7 @@ export async function updateLead(req: Request, res: Response) {
     return res.json(lead);
   } catch (err: any) {
     if (err.code === "P2025") return res.status(404).json({ error: "Lead not found" });
-    console.error("❌ updateLead:", err);
+    log.error({ err }, "update lead failed");
     return res.status(500).json({ error: "Failed to update lead" });
   }
 }
@@ -115,8 +119,8 @@ export async function listPublicPlans(_req: Request, res: Response) {
       },
     });
     return res.json(plans);
-  } catch (err: any) {
-    console.error("❌ listPublicPlans:", err);
-    return res.status(500).json({ error: "Failed to fetch plans" });
+  } catch (err) {
+    log.error({ err }, "list public plans failed");
+    return serverError(res, err, "Failed to fetch plans");
   }
 }

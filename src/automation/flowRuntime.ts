@@ -17,6 +17,9 @@
  */
 
 import prisma from "../db/connect";
+import { logger } from "../utils/logger";
+
+const log = logger.child({ service: "flow-runtime" });
 import { updateSession, resetSession, SessionData } from "../services/session.service";
 import { buildMenuMessage } from "./buildMenuResponse";
 import { checkRoomAvailability, getCalendarData } from "../services/availability.service";
@@ -108,6 +111,35 @@ function todayUTC(): Date {
 /** Replace {{varName}} placeholders in text with values from flowVars. */
 function interpolate(text: string, flowVars: Record<string, string>): string {
   return text.replace(/\{\{(\w+)\}\}/g, (_, key) => flowVars[key] ?? `{{${key}}}`);
+}
+
+// Variable names that are injected by the runtime or set by action nodes from
+// DB-verified data. A flow admin naming a *question* node with one of these
+// keys would allow a guest to overwrite them with arbitrary text input.
+const RESERVED_FLOW_VARS = new Set([
+  // Runtime-injected read-only variables
+  "hotelName", "guestName", "guestPhone",
+  "currentDate", "currentTime", "currentDay", "__sysInjected__",
+  // Internal room list cache used between show_rooms phases
+  "__roomList__",
+  // Set by show_rooms / room_selection from DB — never from raw guest text
+  "bookingRoomTypeId", "bookingRoomTypeName", "bookingPricePerNight",
+  // Set by check_availability node
+  "availabilityResult", "availabilityCount",
+  // Set by create_booking action result
+  "bookingRef", "bookingId", "bookingStatus",
+  // Set by notify_staff action
+  "staffNotified",
+]);
+
+/** Write a guest-collected answer into flowVars, rejecting reserved key names. */
+function safeSetVar(
+  flowVars: Record<string, string>,
+  key: string,
+  value: string,
+): Record<string, string> {
+  if (!key || RESERVED_FLOW_VARS.has(key)) return flowVars;
+  return { ...flowVars, [key]: value };
 }
 
 async function safeMenu(hotelId: string): Promise<string | null> {
@@ -244,7 +276,7 @@ export async function executeFlowStep(
 
   async function advance(currentNodeId: string): Promise<string | null> {
     if (++hops > MAX_HOPS) {
-      console.error(`[FlowRuntime] MAX_HOPS(${MAX_HOPS}) exceeded — likely infinite loop. flowId=${flowId} guestId=${guestId} lastNode=${currentNodeId}`);
+      log.error({ flowId, guestId, lastNode: currentNodeId }, `MAX_HOPS(${MAX_HOPS}) exceeded — likely infinite loop`);
       await resetSession(guestId, hotelId);
       return safeMenu(hotelId);
     }
@@ -328,8 +360,8 @@ export async function executeFlowStep(
             return listText;
           }
 
-          const rawList: { id: string; name: string; price: number }[] =
-            JSON.parse(flowData.flowVars["__roomList__"] ?? "[]");
+          let rawList: { id: string; name: string; price: number }[] = [];
+          try { rawList = JSON.parse(flowData.flowVars["__roomList__"] ?? "[]"); } catch { /* corrupted — treat as empty */ }
           if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
 
           const num = parseInt(input, 10);
@@ -386,7 +418,7 @@ export async function executeFlowStep(
           }
 
           const dateStr = toDateStr(parsed);
-          flowData.flowVars = { ...flowData.flowVars, [d.variableName]: dateStr };
+          flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, dateStr);
           // Set canonical booking aliases if var name suggests check-in / check-out
           const vl = d.variableName.toLowerCase();
           if (vl.includes("checkin") || vl.includes("check_in") || vl === "checkin")
@@ -423,7 +455,7 @@ export async function executeFlowStep(
             return d.validationError || `The maximum value is *${d.numberMax}*.`;
           }
 
-          flowData.flowVars = { ...flowData.flowVars, [d.variableName]: String(num) };
+          flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, String(num));
           delete flowData.waitingFor;
           const next = nextNodeId(currentNodeId, adjacency);
           if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
@@ -451,7 +483,7 @@ export async function executeFlowStep(
             return d.validationError || `Please reply *1* for *${yesLabel}* or *2* for *${noLabel}*.`;
           }
 
-          flowData.flowVars = { ...flowData.flowVars, [d.variableName]: isYes ? "yes" : "no" };
+          flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, isYes ? "yes" : "no");
           delete flowData.waitingFor;
           const next = nextNodeId(currentNodeId, adjacency);
           if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
@@ -477,11 +509,11 @@ export async function executeFlowStep(
           }
 
           const isPositive = d.ratingPositiveThreshold !== undefined && score >= d.ratingPositiveThreshold;
-          flowData.flowVars = {
-            ...flowData.flowVars,
-            [d.variableName]:               String(score),
-            [`${d.variableName}_isPositive`]: isPositive ? "yes" : "no",
-          };
+          flowData.flowVars = safeSetVar(
+            safeSetVar(flowData.flowVars, d.variableName, String(score)),
+            `${d.variableName}_isPositive`,
+            isPositive ? "yes" : "no",
+          );
           delete flowData.waitingFor;
 
           const next = nextNodeId(currentNodeId, adjacency);
@@ -525,7 +557,7 @@ export async function executeFlowStep(
           return d.validationError || "Please provide a valid date.";
         }
 
-        flowData.flowVars = { ...flowData.flowVars, [d.variableName]: input };
+        flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, input);
         // Canonical aliases
         if (d.variableName) {
           const key = d.variableName.toLowerCase();
@@ -566,7 +598,7 @@ export async function executeFlowStep(
             available      = result.available;
             availableCount = result.availableCount;
           } else if (!checkInParsed || !checkOutParsed) {
-            console.warn(`[FlowRuntime] check_availability: invalid date strings checkIn="${checkIn}" checkOut="${checkOut}" for flow ${flowId}`);
+            log.warn({ flowId, checkIn, checkOut }, "check_availability: invalid date strings");
           }
         }
 
@@ -663,8 +695,8 @@ export async function executeFlowStep(
         }
 
         // Phase 2: validate selection
-        const rawList: { id: string; name: string; price: number; maxAdults: number | null; maxChildren: number | null }[] =
-          JSON.parse(flowData.flowVars["__roomList__"] ?? "[]");
+        let rawList: { id: string; name: string; price: number; maxAdults: number | null; maxChildren: number | null }[] = [];
+        try { rawList = JSON.parse(flowData.flowVars["__roomList__"] ?? "[]"); } catch { /* corrupted — treat as empty */ }
 
         if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
 
@@ -714,7 +746,7 @@ export async function executeFlowStep(
           nextNodeId(currentNodeId, adjacency);
 
         if (!next) {
-          console.error(`[FlowRuntime] Branch node has no outgoing edge. flowId=${flowId} nodeId=${currentNodeId} handle=${handle}`);
+          log.error({ flowId, nodeId: currentNodeId, handle }, "branch node has no outgoing edge");
           await resetSession(guestId, hotelId);
           return safeMenu(hotelId);
         }
@@ -784,15 +816,19 @@ export async function executeFlowStep(
           const nights        = Math.max(1, Math.ceil((checkOutDate.getTime() - checkInDate.getTime()) / 86_400_000));
           const totalPrice    = pricePerNight * nights;
           const advancePaid   = advancePaidRaw ? Math.round(parseFloat(advancePaidRaw)) : 0;
-          const referenceNumber = await generateReferenceNumber();
+          const lockKey = `${hotelId}:${new Date().getFullYear()}`;
 
-          const booking = await prisma.booking.create({
-            data: {
-              hotelId, guestId, roomTypeId, guestName,
-              checkIn: checkInDate, checkOut: checkOutDate,
-              status: BookingStatus.PENDING, pricePerNight, totalPrice, advancePaid,
-              referenceNumber,
-            },
+          const booking = await prisma.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+            const referenceNumber = await generateReferenceNumber(tx);
+            return tx.booking.create({
+              data: {
+                hotelId, guestId, roomTypeId, guestName,
+                checkIn: checkInDate, checkOut: checkOutDate,
+                status: BookingStatus.PENDING, pricePerNight, totalPrice, advancePaid,
+                referenceNumber,
+              },
+            });
           });
 
           flowData.flowVars = {
@@ -896,7 +932,7 @@ export async function executeFlowStep(
           guestName: guest?.name || flowData.flowVars["guestName"] || guest?.phone || "A guest",
           timestamp: new Date().toISOString(),
         });
-        console.log(`[notify_staff] emitted to hotel:${hotelId}`);
+        log.info({ hotelId }, "notify_staff emitted");
         flowData.flowVars = { ...flowData.flowVars, staffNotified: "yes" };
         const next = nextNodeId(currentNodeId, adjacency);
         if (!next) {
@@ -917,7 +953,7 @@ export async function executeFlowStep(
         // ── start_booking_flow (removed — booking state machine is gone) ──────────
         // Use the "create_booking" action node with a show_rooms + question nodes instead.
         if (d.actionType === "start_booking_flow") {
-          console.error(`[FlowRuntime] Deprecated action "start_booking_flow" used in flow ${flowId}. Replace with create_booking action.`);
+          log.error({ flowId }, 'deprecated action "start_booking_flow" — replace with create_booking');
           await resetSession(guestId, hotelId);
           return (d.message ? `${d.message}\n\n` : "") + (await safeMenu(hotelId) ?? "");
         }
@@ -1038,7 +1074,7 @@ export async function executeFlowStep(
       case "jump": {
         const d = node.data as JumpNodeData;
         if (!d.targetNodeId || !nodeMap.has(d.targetNodeId)) {
-          console.error(`[FlowRuntime] jump node references missing targetNodeId="${d.targetNodeId}" in flow ${flowId}`);
+          log.error({ flowId, targetNodeId: d.targetNodeId }, "jump node references missing targetNodeId");
           await resetSession(guestId, hotelId);
           return safeMenu(hotelId);
         }

@@ -5,8 +5,8 @@ import helmet from "helmet";
 import { rateLimit } from "express-rate-limit";
 import cookieParser from "cookie-parser";
 import hotelRoutes from "./routes/hotel.routes";
-import { verifyWebhookSignature } from "./middleware/verifyWebhookSignature";
-import { verifyWhatsAppWebhook, handleWhatsAppWebhook } from "./controllers/whatsapp.controller";
+import instagramRoutes from "./routes/instagram.routes";
+import whatsappRoutes from "./routes/whatsapp.routes";
 import messageRoutes from "./routes/message.routes";
 import conversationRoutes from "./routes/conversation.routes";
 import { auth } from "./middleware/auth.middleware";
@@ -138,26 +138,10 @@ app.use("/conversations", auth, conversationRoutes);
 
 // ── WhatsApp webhook ──────────────────────────────────────────────────────────
 // GET: Meta webhook verification challenge — no body, no signature needed
-app.get("/webhook/whatsapp", webhookLimiter, verifyWhatsAppWebhook);
 
-// POST: capture raw buffer → verify HMAC → parse → dispatch
-app.post(
-  "/webhook/whatsapp",
-  webhookLimiter,
-  express.raw({ type: "application/json", limit: "1mb" }),
-  (req: any, _res: any, next: any) => {
-    req.rawBody = req.body; // Buffer preserved for HMAC check
-    try {
-      req.body = JSON.parse(req.body.toString());
-    } catch {
-      logger.warn("WhatsApp webhook: invalid JSON body — ignoring");
-      return _res.sendStatus(200); // always ACK Meta to prevent retries
-    }
-    next();
-  },
-  verifyWebhookSignature,
-  handleWhatsAppWebhook,
-);
+app.use("/",webhookLimiter,whatsappRoutes);
+app.use("/",webhookLimiter,instagramRoutes);
+
 
 // ── Static file serving ───────────────────────────────────────────────────────
 app.use(
@@ -200,7 +184,6 @@ app.get("/health", async (_req, res) => {
     uptime:  process.uptime(),
     service: "vaketta-backend",
     time:    new Date().toISOString(),
-    env:     process.env.NODE_ENV ?? "development",
   });
 });
 
