@@ -198,6 +198,7 @@ model Guest {
   id        String   @id @default(uuid())
   name      String?
   phone     String
+  notes     String?
   createdAt DateTime @default(now())
 
   lastHandledByStaff Boolean @default(false)
