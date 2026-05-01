@@ -12,7 +12,6 @@ router.get("/", async (req: Request, res: Response) => {
     const search  = String(req.query.search ?? "").trim();
     const channel = String(req.query.channel ?? "").toUpperCase();
 
-    // Build the WHERE clause for the Guest table
     const where: any = { hotelId };
     if (search) {
       where.OR = [
@@ -20,9 +19,6 @@ router.get("/", async (req: Request, res: Response) => {
         { phone: { contains: search, mode: "insensitive" } },
       ];
     }
-
-    // Channel filter is applied via message sub-query after fetch when needed
-    // (Prisma doesn't support filtering by aggregated related field in WHERE directly)
 
     const [guests, total] = await Promise.all([
       prisma.guest.findMany({
@@ -34,6 +30,8 @@ router.get("/", async (req: Request, res: Response) => {
           id:                 true,
           name:               true,
           phone:              true,
+          isVip:              true,
+          tags:               true,
           createdAt:          true,
           lastHandledByStaff: true,
           _count: {
@@ -49,11 +47,12 @@ router.get("/", async (req: Request, res: Response) => {
       prisma.guest.count({ where }),
     ]);
 
-    // Shape the response
     let rows = guests.map((g) => ({
       id:                 g.id,
       name:               g.name,
       phone:              g.phone,
+      isVip:              g.isVip,
+      tags:               g.tags,
       createdAt:          g.createdAt,
       lastHandledByStaff: g.lastHandledByStaff,
       totalMessages:      g._count.messages,
@@ -62,7 +61,6 @@ router.get("/", async (req: Request, res: Response) => {
       lastActivity:       g.messages[0]?.timestamp ?? g.createdAt,
     }));
 
-    // Apply channel filter after aggregation
     if (channel === "WHATSAPP" || channel === "INSTAGRAM") {
       rows = rows.filter((r) => r.channel === channel);
     }
@@ -96,7 +94,7 @@ router.get("/:id", async (req: Request, res: Response) => {
         },
         messages: {
           orderBy: { timestamp: "desc" },
-          take: 10,
+          take: 50,
         },
       },
     });
@@ -110,6 +108,29 @@ router.get("/:id", async (req: Request, res: Response) => {
       select:  { id: true, mediaUrl: true, mimeType: true, fileName: true, timestamp: true, direction: true },
     });
 
+    const totalSpend = guest.bookings
+      .filter((b) => b.status === "CONFIRMED")
+      .reduce((sum, b) => sum + b.totalPrice, 0);
+
+    // Synthesise activity log from bookings + latest message
+    const activityLog: Array<{ type: string; timestamp: string; label: string }> = [];
+    for (const b of guest.bookings) {
+      activityLog.push({
+        type:      "booking",
+        timestamp: b.createdAt.toISOString(),
+        label:     `Booking ${b.referenceNumber ?? b.id.slice(0, 8)} — ${b.status}`,
+      });
+    }
+    if (guest.messages.length > 0) {
+      const last = guest.messages[0];
+      activityLog.push({
+        type:      "message",
+        timestamp: last.timestamp.toISOString(),
+        label:     last.direction === "IN" ? "Sent a message" : "Received a reply",
+      });
+    }
+    activityLog.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
     const lastActivity = guest.messages[0]?.timestamp ?? guest.createdAt;
 
     res.json({
@@ -117,12 +138,15 @@ router.get("/:id", async (req: Request, res: Response) => {
       name:               guest.name,
       phone:              guest.phone,
       notes:              guest.notes,
+      isVip:              guest.isVip,
+      tags:               guest.tags,
       createdAt:          guest.createdAt,
       lastHandledByStaff: guest.lastHandledByStaff,
       totalMessages:      guest._count.messages,
+      totalSpend,
       lastActivity,
       channel:            guest.messages[0]?.channel ?? "WHATSAPP",
-      bookings:           guest.bookings.map((b) => ({
+      bookings: guest.bookings.map((b) => ({
         id:              b.id,
         referenceNumber: b.referenceNumber,
         checkIn:         b.checkIn,
@@ -132,15 +156,20 @@ router.get("/:id", async (req: Request, res: Response) => {
         createdAt:       b.createdAt,
         roomType:        b.roomType ? { name: b.roomType.name } : null,
       })),
-      recentMessages:     guest.messages.map((m) => ({
+      recentMessages: guest.messages.map((m) => ({
         id:          m.id,
         body:        m.body,
         direction:   m.direction,
         channel:     m.channel,
         messageType: m.messageType,
         timestamp:   m.timestamp,
+        mediaUrl:    m.mediaUrl,
+        mimeType:    m.mimeType,
+        fileName:    m.fileName,
+        status:      m.status,
       })),
       mediaMessages,
+      activityLog,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -154,7 +183,13 @@ router.patch("/:id", async (req: Request, res: Response) => {
     const hotelId = (req as any).user.hotelId as string;
     const id      = req.params["id"];
     if (!id) return res.status(400).json({ error: "id required" });
-    const { name, notes } = req.body as { name?: string | null; notes?: string | null };
+
+    const { name, notes, isVip, tags } = req.body as {
+      name?:  string | null;
+      notes?: string | null;
+      isVip?: boolean;
+      tags?:  string[];
+    };
 
     const existing = await prisma.guest.findFirst({ where: { id, hotelId } });
     if (!existing) return res.status(404).json({ error: "Guest not found" });
@@ -162,11 +197,13 @@ router.patch("/:id", async (req: Request, res: Response) => {
     const patch: Record<string, unknown> = {};
     if (name  !== undefined) patch.name  = name  ?? null;
     if (notes !== undefined) patch.notes = notes ?? null;
+    if (isVip !== undefined) patch.isVip = isVip;
+    if (tags  !== undefined) patch.tags  = tags;
 
     const updated = await prisma.guest.update({
-      where: { id: id as string },
-      data:  patch,
-      select: { id: true, name: true, notes: true },
+      where:  { id: id as string },
+      data:   patch,
+      select: { id: true, name: true, notes: true, isVip: true, tags: true },
     });
 
     res.json(updated);

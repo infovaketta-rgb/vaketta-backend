@@ -199,6 +199,8 @@ model Guest {
   name      String?
   phone     String
   notes     String?
+  isVip     Boolean  @default(false)
+  tags      Json     @default("[]")
   createdAt DateTime @default(now())
 
   lastHandledByStaff Boolean @default(false)
