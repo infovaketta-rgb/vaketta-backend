@@ -83,42 +83,20 @@ router.get("/", async (req: Request, res: Response) => {
 router.get("/:id", async (req: Request, res: Response) => {
   try {
     const hotelId = (req as any).user.hotelId as string;
-    const { id }  = req.params;
+    const id      = req.params["id"];
+    if (!id) return res.status(400).json({ error: "id required" });
 
     const guest = await prisma.guest.findFirst({
       where: { id, hotelId },
-      select: {
-        id:                 true,
-        name:               true,
-        phone:              true,
-        notes:              true,
-        createdAt:          true,
-        lastHandledByStaff: true,
+      include: {
         _count: { select: { messages: true } },
         bookings: {
           orderBy: { createdAt: "desc" },
-          select: {
-            id:              true,
-            referenceNumber: true,
-            checkIn:         true,
-            checkOut:        true,
-            status:          true,
-            totalPrice:      true,
-            createdAt:       true,
-            roomType: { select: { name: true } },
-          },
+          include: { roomType: { select: { name: true } } },
         },
         messages: {
           orderBy: { timestamp: "desc" },
           take: 10,
-          select: {
-            id:          true,
-            body:        true,
-            direction:   true,
-            channel:     true,
-            messageType: true,
-            timestamp:   true,
-          },
         },
       },
     });
@@ -143,9 +121,25 @@ router.get("/:id", async (req: Request, res: Response) => {
       lastHandledByStaff: guest.lastHandledByStaff,
       totalMessages:      guest._count.messages,
       lastActivity,
-      channel:            (guest.messages[0] as any)?.channel ?? "WHATSAPP",
-      bookings:           guest.bookings,
-      recentMessages:     guest.messages,
+      channel:            guest.messages[0]?.channel ?? "WHATSAPP",
+      bookings:           guest.bookings.map((b) => ({
+        id:              b.id,
+        referenceNumber: b.referenceNumber,
+        checkIn:         b.checkIn,
+        checkOut:        b.checkOut,
+        status:          b.status,
+        totalPrice:      b.totalPrice,
+        createdAt:       b.createdAt,
+        roomType:        b.roomType ? { name: b.roomType.name } : null,
+      })),
+      recentMessages:     guest.messages.map((m) => ({
+        id:          m.id,
+        body:        m.body,
+        direction:   m.direction,
+        channel:     m.channel,
+        messageType: m.messageType,
+        timestamp:   m.timestamp,
+      })),
       mediaMessages,
     });
   } catch (err: any) {
@@ -158,7 +152,8 @@ router.get("/:id", async (req: Request, res: Response) => {
 router.patch("/:id", async (req: Request, res: Response) => {
   try {
     const hotelId = (req as any).user.hotelId as string;
-    const { id }  = req.params;
+    const id      = req.params["id"];
+    if (!id) return res.status(400).json({ error: "id required" });
     const { name, notes } = req.body as { name?: string | null; notes?: string | null };
 
     const existing = await prisma.guest.findFirst({ where: { id, hotelId } });
@@ -169,7 +164,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
     if (notes !== undefined) patch.notes = notes ?? null;
 
     const updated = await prisma.guest.update({
-      where: { id },
+      where: { id: id as string },
       data:  patch,
       select: { id: true, name: true, notes: true },
     });
