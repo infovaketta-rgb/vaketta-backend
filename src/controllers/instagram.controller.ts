@@ -9,18 +9,13 @@ export function verifyInstagramWebhook(
  req:Request,
  res:Response
 ){
+ const mode      = req.query["hub.mode"];
+ const token     = req.query["hub.verify_token"];
+ const challenge = req.query["hub.challenge"];
 
-  console.log("[Instagram] RAW HIT", JSON.stringify(req.body).slice(0, 300));
-  res.sendStatus(200);
-
- const mode=
- req.query["hub.mode"];
-
- const token=
- req.query["hub.verify_token"];
-
- const challenge=
- req.query["hub.challenge"];
+ if (!mode || !token || !challenge) {
+   return res.sendStatus(403);
+ }
 
  const expectedToken = process.env.INSTAGRAM_VERIFY_TOKEN ?? "";
  const ha = crypto.createHash("sha256").update(typeof token === "string" ? token : "").digest();

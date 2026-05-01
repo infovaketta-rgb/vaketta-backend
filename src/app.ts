@@ -15,6 +15,7 @@ import roomTypeRoutes from "./routes/roomType.routes";
 import authRoutes from "./routes/auth.routes";
 import dashboardRoutes from "./routes/dashboard.routes";
 import settingsRoutes from "./routes/settings.routes";
+import guestRoutes    from "./routes/guests.routes";
 import { publicRouter, adminLeadRouter } from "./routes/lead.routes";
 import pushRoutes from "./routes/push.routes";
 import { logger } from "./utils/logger";
@@ -159,6 +160,7 @@ app.use("/bookings",       auth, bookingRoutes);
 app.use("/room-types",     auth, roomTypeRoutes);
 app.use("/dashboard",      auth, dashboardRoutes);
 app.use("/hotel-settings", auth, settingsRoutes);
+app.use("/guests",         auth, guestRoutes);
 
 // ── Push notification endpoints ───────────────────────────────────────────────
 app.use("/push", pushRoutes);
