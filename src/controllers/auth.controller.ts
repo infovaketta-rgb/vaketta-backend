@@ -82,6 +82,48 @@ export async function logout(req: Request, res: Response) {
   }
 }
 
+export async function updateUser(req: Request, res: Response) {
+  try {
+    const hotelId  = (req as any).user.hotelId as string;
+    const targetId = req.params["id"];
+    if (!targetId) return res.status(400).json({ error: "id required" });
+
+    const existing = await prisma.user.findFirst({ where: { id: targetId, hotelId } });
+    if (!existing) return res.status(404).json({ error: "User not found" });
+
+    // OWNER role cannot be changed or deactivated
+    if (existing.role === "OWNER") {
+      return res.status(403).json({ error: "Cannot modify the OWNER account" });
+    }
+
+    const { name, role, isActive } = req.body as {
+      name?:     string;
+      role?:     string;
+      isActive?: boolean;
+    };
+
+    const patch: Record<string, unknown> = {};
+    if (name     !== undefined) patch.name     = name;
+    if (isActive !== undefined) patch.isActive = isActive;
+    if (role     !== undefined) {
+      if (!CREATABLE_ROLES.includes(role as UserRole)) {
+        return res.status(400).json({ error: `Role must be one of: ${CREATABLE_ROLES.join(", ")}` });
+      }
+      patch.role = role;
+    }
+
+    const updated = await prisma.user.update({
+      where:  { id: targetId },
+      data:   patch,
+      select: { id: true, name: true, email: true, role: true, isActive: true, createdAt: true },
+    });
+
+    res.json(updated);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
 export async function changePassword(req: Request, res: Response) {
   try {
     const userId = (req as any).user.id;
