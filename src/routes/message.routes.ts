@@ -55,7 +55,7 @@ router.get("/media", async (req, res) => {
       ],
     };
 
-    const [messages, total] = await Promise.all([
+    const [messages, total, roomPhotos] = await Promise.all([
       prisma.message.findMany({
         where,
         orderBy: { timestamp: "desc" },
@@ -73,9 +73,37 @@ router.get("/media", async (req, res) => {
         },
       }),
       prisma.message.count({ where }),
+      prisma.roomPhoto.findMany({
+        where:   { roomType: { hotelId } },
+        orderBy: { order: "asc" },
+        select: {
+          id:       true,
+          url:      true,
+          isMain:   true,
+          order:    true,
+          roomType: { select: { name: true } },
+        },
+      }),
     ]);
 
-    res.json({ data: messages, total, page, pages: Math.ceil(total / limit) });
+    const roomPhotoItems = roomPhotos.map((p) => ({
+      id:          `rp_${p.id}`,
+      mediaUrl:    p.url,
+      mimeType:    "image/jpeg",
+      fileName:    p.url.split("/").pop() ?? "room-photo.jpg",
+      messageType: "image",
+      timestamp:   null,
+      direction:   "room_photo",
+      guest:       { phone: "", name: `${p.roomType.name}${p.isMain ? " ★" : ""}` },
+    }));
+
+    res.json({
+      data:       [...roomPhotoItems, ...messages],
+      total:      total + roomPhotos.length,
+      page,
+      pages:      Math.ceil((total + roomPhotos.length) / limit),
+      roomPhotos: roomPhotoItems.length,
+    });
   } catch (err) {
     log.error({ err }, "GET /messages/media failed");
     res.status(500).json({ error: "Failed to fetch media" });
