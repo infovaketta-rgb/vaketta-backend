@@ -122,7 +122,7 @@ router.get("/:id", async (req: Request, res: Response) => {
       });
     }
     if (guest.messages.length > 0) {
-      const last = guest.messages[0];
+      const last = guest.messages[0]!;
       activityLog.push({
         type:      "message",
         timestamp: last.timestamp.toISOString(),
@@ -138,8 +138,8 @@ router.get("/:id", async (req: Request, res: Response) => {
       name:               guest.name,
       phone:              guest.phone,
       notes:              guest.notes,
-      isVip:              guest.isVip,
-      tags:               guest.tags,
+      isVip:              (guest as any).isVip  ?? false,
+      tags:               (guest as any).tags   ?? [],
       createdAt:          guest.createdAt,
       lastHandledByStaff: guest.lastHandledByStaff,
       totalMessages:      guest._count.messages,
@@ -200,7 +200,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
     if (isVip !== undefined) patch.isVip = isVip;
     if (tags  !== undefined) patch.tags  = tags;
 
-    const updated = await prisma.guest.update({
+    const updated = await (prisma.guest.update as any)({
       where:  { id: id as string },
       data:   patch,
       select: { id: true, name: true, notes: true, isVip: true, tags: true },
