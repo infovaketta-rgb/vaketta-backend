@@ -19,7 +19,6 @@ import {
   testWhatsAppHandler,
   getInstagramHandler,
   patchInstagramHandler,
-  instagramOAuthExchangeHandler,
   getIgSubscriptionStatusHandler,
   subscribeIgWebhookHandler,
   unsubscribeIgWebhookHandler,
@@ -52,7 +51,6 @@ router.post("/whatsapp/test",       testWhatsAppHandler);
 
 router.get("/instagram",                       getInstagramHandler);
 router.patch("/instagram",                     patchInstagramHandler);
-router.post("/instagram/oauth-exchange",       instagramOAuthExchangeHandler);
 router.get("/instagram/subscribe/status",      getIgSubscriptionStatusHandler);
 router.post("/instagram/subscribe",            subscribeIgWebhookHandler);
 router.delete("/instagram/subscribe",          unsubscribeIgWebhookHandler);

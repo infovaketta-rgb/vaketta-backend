@@ -250,56 +250,6 @@ export async function updateInstagramConfig(
   return getInstagramConfig(hotelId);
 }
 
-export async function exchangeInstagramCode(hotelId: string, code: string) {
-  const appId     = process.env.INSTAGRAM_APP_ID ?? "";
-  const appSecret = process.env.INSTAGRAM_APP_SECRET ?? "";
-  const redirectUri = process.env.INSTAGRAM_REDIRECT_URL ?? "https://vaketta.com/dashboard/configuration";
-
-  if (!appId || !appSecret) throw new Error("Instagram app credentials not configured");
-
-  // Log so it's visible in Render logs — must match Meta App Dashboard exactly
-  console.log(`[Instagram OAuth] exchange redirect_uri="${redirectUri}"`);
-
-  // Short-lived token exchange
-  const tokenRes = await fetch("https://api.instagram.com/oauth/access_token", {
-    method:  "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body:    new URLSearchParams({ client_id: appId, client_secret: appSecret,
-                                   grant_type: "authorization_code", redirect_uri: redirectUri, code }),
-  });
-  const tokenData = await tokenRes.json() as any;
-  if (!tokenRes.ok || !tokenData.access_token) {
-    throw new Error(tokenData.error_message ?? tokenData.error?.message ?? "Failed to exchange Instagram code");
-  }
-
-  const shortToken = String(tokenData.access_token);
-  const igUserId   = String(tokenData.user_id ?? "");
-
-  // Upgrade to long-lived token
-  const llRes = await fetch(
-    `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${appSecret}&access_token=${shortToken}`
-  );
-  const llData = await llRes.json() as any;
-  const finalToken = (llRes.ok && llData.access_token) ? String(llData.access_token) : shortToken;
-
-  await prisma.hotelConfig.upsert({
-    where:  { hotelId },
-    update: {
-      instagramAccessTokenEncrypted: encryptInstagramToken(finalToken),
-      instagramBusinessAccountId:   igUserId || null,
-      instagramTokenUpdatedAt:       new Date(),
-    },
-    create: {
-      hotelId,
-      instagramAccessTokenEncrypted: encryptInstagramToken(finalToken),
-      instagramBusinessAccountId:   igUserId || null,
-      instagramTokenUpdatedAt:       new Date(),
-    },
-  });
-
-  return { igAccountId: igUserId, redirectUri };
-}
-
 // ── Instagram webhook subscription ──────────────────────────────────────────
 
 const META_VERSION = "v25.0";

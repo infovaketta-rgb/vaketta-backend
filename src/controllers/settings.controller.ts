@@ -14,7 +14,6 @@ import {
   testWhatsAppConnection,
   getInstagramConfig,
   updateInstagramConfig,
-  exchangeInstagramCode,
   getIgSubscriptionStatus,
   subscribeIgWebhook,
   unsubscribeIgWebhook,
@@ -214,17 +213,6 @@ export async function patchInstagramHandler(req: Request, res: Response) {
     }));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
-  }
-}
-
-export async function instagramOAuthExchangeHandler(req: Request, res: Response) {
-  try {
-    const { code } = req.body;
-    if (!code) return res.status(400).json({ error: "code is required" });
-    const result = await exchangeInstagramCode(hotelId(req), code);
-    res.json(result);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
   }
 }
 

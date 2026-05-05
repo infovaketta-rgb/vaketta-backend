@@ -134,6 +134,8 @@ model HotelConfig {
   instagramAccessTokenEncrypted  String?
   instagramTokenUpdatedAt        DateTime?
   instagramTokenExpiresAt        DateTime?
+  facebookPageId                 String?
+  instagramConnectedAt           DateTime?
 
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
