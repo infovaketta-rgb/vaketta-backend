@@ -1,0 +1,3 @@
+-- Add WhatsApp Embedded Signup URL to platform-level settings
+ALTER TABLE "PlatformSettings"
+    ADD COLUMN IF NOT EXISTS "whatsappEmbedSignupUrl" TEXT NOT NULL DEFAULT '';

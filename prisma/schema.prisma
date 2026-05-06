@@ -433,9 +433,10 @@ model DataDeletion {
 
 // Platform-wide settings singleton (embed URLs, OAuth config, etc.)
 model PlatformSettings {
-  id                String   @id @default("global")
-  instagramEmbedUrl String   @default("")
-  updatedAt         DateTime @updatedAt
+  id                     String   @id @default("global")
+  instagramEmbedUrl      String   @default("")
+  whatsappEmbedSignupUrl String   @default("")
+  updatedAt              DateTime @updatedAt
 }
 
 // Platform-wide trial defaults (singleton — only one row ever exists)

@@ -125,7 +125,10 @@ export async function updateMenuTitle(hotelId: string, title: string) {
 // ── WhatsApp / Meta credentials ────────────────────────────────────────────
 
 export async function getWhatsAppConfig(hotelId: string) {
-  const config = await prisma.hotelConfig.findUnique({ where: { hotelId } });
+  const [config, platform] = await Promise.all([
+    prisma.hotelConfig.findUnique({ where: { hotelId } }),
+    prisma.platformSettings.findUnique({ where: { id: "global" } }),
+  ]);
 
   let maskedToken: string | null = null;
   if (config?.metaAccessTokenEncrypted) {
@@ -142,6 +145,7 @@ export async function getWhatsAppConfig(hotelId: string) {
     metaAccessToken:   maskedToken,
     metaWabaId:        config?.metaWabaId        ?? null,
     connected: !!(config?.metaPhoneNumberId && config?.metaAccessTokenEncrypted),
+    embedUrl: platform?.whatsappEmbedSignupUrl ?? "",
   };
 }
 
@@ -202,19 +206,25 @@ export async function connectWhatsAppEmbeddedSignup(
   hotelId: string,
   code: string,
   wabaId: string,
-  phoneNumberId: string
+  phoneNumberId: string,
+  redirectUri: string
 ): Promise<{ phoneNumberId: string; wabaId: string }> {
   const appId     = process.env.FACEBOOK_APP_ID     ?? "";
   const appSecret = process.env.FACEBOOK_APP_SECRET ?? "";
   if (!appId || !appSecret) throw new Error("Facebook app credentials not configured");
 
   // 1. Exchange authorisation code for access token
-  const tokenUrl = new URL("https://graph.facebook.com/v21.0/oauth/access_token");
-  tokenUrl.searchParams.set("client_id",     appId);
-  tokenUrl.searchParams.set("client_secret", appSecret);
-  tokenUrl.searchParams.set("code",          code);
-
-  const tokenRes  = await fetch(tokenUrl.toString());
+  const tokenRes = await fetch("https://graph.facebook.com/v25.0/oauth/access_token", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({
+      client_id:     appId,
+      client_secret: appSecret,
+      grant_type:    "authorization_code",
+      redirect_uri:  redirectUri,
+      code,
+    }),
+  });
   const tokenData = await tokenRes.json() as any;
   if (!tokenRes.ok || !tokenData.access_token) {
     throw new Error(tokenData?.error?.message ?? "Failed to exchange code for access token");
@@ -223,7 +233,7 @@ export async function connectWhatsAppEmbeddedSignup(
 
   // 2. Subscribe the WABA to the app so webhook events are delivered
   const subRes = await fetch(
-    `https://graph.facebook.com/v21.0/${wabaId}/subscribed_apps`,
+    `https://graph.facebook.com/v25.0/${wabaId}/subscribed_apps`,
     { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } }
   );
   const subData = await subRes.json() as any;
@@ -386,7 +396,7 @@ export async function getPlatformSettings() {
   });
 }
 
-export async function updatePlatformSettings(data: { instagramEmbedUrl?: string }) {
+export async function updatePlatformSettings(data: { instagramEmbedUrl?: string; whatsappEmbedSignupUrl?: string }) {
   return prisma.platformSettings.upsert({
     where:  { id: "global" },
     update: data,
