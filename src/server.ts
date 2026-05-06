@@ -27,7 +27,7 @@ import "./workers/instagram.worker";
 const REQUIRED_ENV: string[] = [
   "JWT_SECRET",
   "DATABASE_URL",
-  "WHATSAPP_APP_SECRET", // HMAC verification of Meta webhook payloads
+  "FACEBOOK_APP_SECRET", // HMAC verification of Meta webhook payloads
 ];
 
 function validateEnv() {

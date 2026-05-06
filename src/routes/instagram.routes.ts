@@ -21,14 +21,14 @@ router.get(
 
 /**
  * Incoming Instagram webhook events — always registered.
- * Signature verification is enforced when INSTAGRAM_APP_SECRET is set;
+ * Signature verification is enforced when FACEBOOK_APP_SECRET is set;
  * if missing, the request is accepted but a warning is logged.
  */
-const instagramAppSecret = process.env.INSTAGRAM_APP_SECRET;
+const instagramAppSecret = process.env.FACEBOOK_APP_SECRET;
 
 if (!instagramAppSecret) {
   logger.warn(
-    "INSTAGRAM_APP_SECRET not set — Instagram webhook signature verification is DISABLED. " +
+    "FACEBOOK_APP_SECRET not set — Instagram webhook signature verification is DISABLED. " +
     "Set the env var in production to secure the endpoint."
   );
 }

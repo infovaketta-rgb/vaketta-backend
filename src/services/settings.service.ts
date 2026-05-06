@@ -147,13 +147,12 @@ export async function getWhatsAppConfig(hotelId: string) {
 
 export async function testWhatsAppConnection(hotelId: string): Promise<{ ok: boolean; detail?: string }> {
   const config = await prisma.hotelConfig.findUnique({ where: { hotelId } });
-  const phoneNumberId = config?.metaPhoneNumberId || process.env.META_PHONE_NUMBER_ID || "";
+  const phoneNumberId = config?.metaPhoneNumberId ?? "";
 
   let accessToken = "";
   if (config?.metaAccessTokenEncrypted) {
     try { accessToken = decryptWhatsAppToken(config.metaAccessTokenEncrypted); } catch {}
   }
-  if (!accessToken) accessToken = process.env.META_ACCESS_TOKEN || "";
 
   if (!phoneNumberId || !accessToken) {
     return { ok: false, detail: "Credentials not configured" };

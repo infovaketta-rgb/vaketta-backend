@@ -50,7 +50,7 @@ router.post(
   },
 
   verifyWebhookSignature(
-    process.env.WHATSAPP_APP_SECRET!
+    process.env.FACEBOOK_APP_SECRET!
   ),
 
   handleWhatsAppWebhook
