@@ -124,9 +124,10 @@ model HotelConfig {
   messageDelaySeconds   Int     @default(10)    // 1–60
 
   // WhatsApp / Meta credentials (per-hotel)
-  metaPhoneNumberId String?   // Meta Phone Number ID from developer console
-  metaAccessToken   String?   // Permanent system user access token
-  metaWabaId        String?   // WhatsApp Business Account ID
+  metaPhoneNumberId        String?
+  metaAccessTokenEncrypted String?   // AES-256-GCM encrypted WhatsApp access token
+  metaWabaId               String?
+  metaTokenUpdatedAt       DateTime?
 
   instagramBusinessAccountId     String? @unique
   instagramWebhookActive         Boolean @default(false)

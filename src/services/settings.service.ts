@@ -1,5 +1,10 @@
 import prisma from "../db/connect";
-import { encryptInstagramToken, decryptInstagramToken } from "./instagram.service";
+import {
+  encryptInstagramToken,
+  decryptInstagramToken,
+  encryptWhatsAppToken,
+  decryptWhatsAppToken,
+} from "../utils/encryption.utils";
 
 export async function getHotelSettings(hotelId: string) {
   const hotel = await prisma.hotel.findUnique({
@@ -121,21 +126,34 @@ export async function updateMenuTitle(hotelId: string, title: string) {
 
 export async function getWhatsAppConfig(hotelId: string) {
   const config = await prisma.hotelConfig.findUnique({ where: { hotelId } });
+
+  let maskedToken: string | null = null;
+  if (config?.metaAccessTokenEncrypted) {
+    try {
+      const plain = decryptWhatsAppToken(config.metaAccessTokenEncrypted);
+      maskedToken = "••••••••••••••••" + plain.slice(-6);
+    } catch {
+      maskedToken = "••••••••••••••••";
+    }
+  }
+
   return {
     metaPhoneNumberId: config?.metaPhoneNumberId ?? null,
-    // Mask token — only show last 6 chars so user can see it's set
-    metaAccessToken:   config?.metaAccessToken
-      ? "••••••••••••••••" + config.metaAccessToken.slice(-6)
-      : null,
-    metaWabaId:        config?.metaWabaId ?? null,
-    connected: !!(config?.metaPhoneNumberId && config?.metaAccessToken),
+    metaAccessToken:   maskedToken,
+    metaWabaId:        config?.metaWabaId        ?? null,
+    connected: !!(config?.metaPhoneNumberId && config?.metaAccessTokenEncrypted),
   };
 }
 
 export async function testWhatsAppConnection(hotelId: string): Promise<{ ok: boolean; detail?: string }> {
   const config = await prisma.hotelConfig.findUnique({ where: { hotelId } });
   const phoneNumberId = config?.metaPhoneNumberId || process.env.META_PHONE_NUMBER_ID || "";
-  const accessToken   = config?.metaAccessToken   || process.env.META_ACCESS_TOKEN   || "";
+
+  let accessToken = "";
+  if (config?.metaAccessTokenEncrypted) {
+    try { accessToken = decryptWhatsAppToken(config.metaAccessTokenEncrypted); } catch {}
+  }
+  if (!accessToken) accessToken = process.env.META_ACCESS_TOKEN || "";
 
   if (!phoneNumberId || !accessToken) {
     return { ok: false, detail: "Credentials not configured" };
@@ -159,23 +177,80 @@ export async function updateWhatsAppConfig(
   hotelId: string,
   data: {
     metaPhoneNumberId?: string;
-    metaAccessToken?:   string;
+    metaAccessToken?:   string;   // plain text from frontend
     metaWabaId?:        string;
+    metaVerifyToken?:   string;   // accepted for forward compat, not persisted (no schema field)
   }
 ) {
-  // Strip masked placeholder — if token starts with bullets, it hasn't changed
-  const patch: Record<string, string> = {};
+  const patch: Record<string, unknown> = {};
   if (data.metaPhoneNumberId !== undefined) patch.metaPhoneNumberId = data.metaPhoneNumberId;
   if (data.metaWabaId        !== undefined) patch.metaWabaId        = data.metaWabaId;
   if (data.metaAccessToken !== undefined && !data.metaAccessToken.startsWith("••")) {
-    patch.metaAccessToken = data.metaAccessToken;
+    patch.metaAccessTokenEncrypted = encryptWhatsAppToken(data.metaAccessToken);
+    patch.metaTokenUpdatedAt       = new Date();
   }
 
-  return prisma.hotelConfig.upsert({
+  await prisma.hotelConfig.upsert({
     where:  { hotelId },
     update: patch,
     create: { hotelId, ...patch },
   });
+
+  return getWhatsAppConfig(hotelId);
+}
+
+export async function connectWhatsAppEmbeddedSignup(
+  hotelId: string,
+  code: string,
+  wabaId: string,
+  phoneNumberId: string
+): Promise<{ phoneNumberId: string; wabaId: string }> {
+  const appId     = process.env.FACEBOOK_APP_ID     ?? "";
+  const appSecret = process.env.FACEBOOK_APP_SECRET ?? "";
+  if (!appId || !appSecret) throw new Error("Facebook app credentials not configured");
+
+  // 1. Exchange authorisation code for access token
+  const tokenUrl = new URL("https://graph.facebook.com/v21.0/oauth/access_token");
+  tokenUrl.searchParams.set("client_id",     appId);
+  tokenUrl.searchParams.set("client_secret", appSecret);
+  tokenUrl.searchParams.set("code",          code);
+
+  const tokenRes  = await fetch(tokenUrl.toString());
+  const tokenData = await tokenRes.json() as any;
+  if (!tokenRes.ok || !tokenData.access_token) {
+    throw new Error(tokenData?.error?.message ?? "Failed to exchange code for access token");
+  }
+  const accessToken = String(tokenData.access_token);
+
+  // 2. Subscribe the WABA to the app so webhook events are delivered
+  const subRes = await fetch(
+    `https://graph.facebook.com/v21.0/${wabaId}/subscribed_apps`,
+    { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  const subData = await subRes.json() as any;
+  if (!subRes.ok) {
+    throw new Error(subData?.error?.message ?? "Failed to subscribe WABA to app");
+  }
+
+  // 3. Persist encrypted token (hotelId always from JWT, never from request body)
+  await prisma.hotelConfig.upsert({
+    where:  { hotelId },
+    update: {
+      metaAccessTokenEncrypted: encryptWhatsAppToken(accessToken),
+      metaWabaId:               wabaId,
+      metaPhoneNumberId:        phoneNumberId,
+      metaTokenUpdatedAt:       new Date(),
+    },
+    create: {
+      hotelId,
+      metaAccessTokenEncrypted: encryptWhatsAppToken(accessToken),
+      metaWabaId:               wabaId,
+      metaPhoneNumberId:        phoneNumberId,
+      metaTokenUpdatedAt:       new Date(),
+    },
+  });
+
+  return { phoneNumberId, wabaId };
 }
 
 export async function updateHotelProfile(

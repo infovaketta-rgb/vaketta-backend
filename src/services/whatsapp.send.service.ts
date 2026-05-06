@@ -1,5 +1,6 @@
 import prisma from "../db/connect";
 import { logger } from "../utils/logger";
+import { decryptWhatsAppToken } from "../utils/encryption.utils";
 
 const log = logger.child({ service: "whatsapp-send" });
 
@@ -14,7 +15,8 @@ async function resolveCredentials(hotelId: string): Promise<{
   const config = await prisma.hotelConfig.findUnique({ where: { hotelId } });
 
   const phoneNumberId = config?.metaPhoneNumberId ?? "";
-  const accessToken   = config?.metaAccessToken   ?? "";
+  const encrypted     = config?.metaAccessTokenEncrypted ?? "";
+  const accessToken   = encrypted ? decryptWhatsAppToken(encrypted) : "";
 
   const forceMock = process.env.MOCK_WHATSAPP_SEND === "true";
 

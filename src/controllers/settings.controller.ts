@@ -12,6 +12,7 @@ import {
   getWhatsAppConfig,
   updateWhatsAppConfig,
   testWhatsAppConnection,
+  connectWhatsAppEmbeddedSignup,
   getInstagramConfig,
   updateInstagramConfig,
   getIgSubscriptionStatus,
@@ -191,6 +192,19 @@ export async function patchHotelProfile(req: Request, res: Response) {
     res.json(hotel);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
+  }
+}
+
+export async function embeddedSignupHandler(req: Request, res: Response) {
+  try {
+    const { code, wabaId, phoneNumberId } = req.body;
+    if (!code || !wabaId || !phoneNumberId) {
+      return res.status(400).json({ error: "code, wabaId, and phoneNumberId are required" });
+    }
+    const result = await connectWhatsAppEmbeddedSignup(hotelId(req), code, wabaId, phoneNumberId);
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(502).json({ error: err.message });
   }
 }
 

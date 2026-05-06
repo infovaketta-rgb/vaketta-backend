@@ -10,6 +10,7 @@
 import prisma from "../db/connect";
 import { uploadToR2 } from "./r2.service";
 import { logger } from "../utils/logger";
+import { decryptWhatsAppToken } from "../utils/encryption.utils";
 
 const log = logger.child({ service: "media" });
 
@@ -35,12 +36,13 @@ export async function downloadMetaMedia(
   // Resolve per-hotel Meta access token from DB
   const hotel = await prisma.hotel.findUnique({
     where:  { phone: toPhone },
-    select: { config: { select: { metaAccessToken: true } } },
+    select: { config: { select: { metaAccessTokenEncrypted: true } } },
   });
-  const accessToken = hotel?.config?.metaAccessToken ?? "";
+  const encrypted   = hotel?.config?.metaAccessTokenEncrypted ?? "";
+  const accessToken = encrypted ? decryptWhatsAppToken(encrypted) : "";
 
   if (!accessToken) {
-    log.warn({ toPhone }, "no metaAccessToken configured — skipping media download");
+    log.warn({ toPhone }, "no metaAccessTokenEncrypted configured — skipping media download");
     return null;
   }
 

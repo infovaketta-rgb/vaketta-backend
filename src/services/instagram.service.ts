@@ -1,50 +1,6 @@
-import crypto from "crypto";
 import { MessageChannel } from "@prisma/client";
 import { logIncomingMessage } from "./message.service";
-
-function getEncryptionKey() {
-  const keyHex = process.env.INSTAGRAM_TOKEN_ENCRYPTION_KEY;
-  if (!keyHex) throw new Error("Missing encryption key");
-  return Buffer.from(keyHex,"hex");
-}
-
-export function encryptInstagramToken(token: string): string {
-  const iv = crypto.randomBytes(12);
-
-  const cipher = crypto.createCipheriv(
-    "aes-256-gcm",
-    getEncryptionKey(),
-    iv
-  );
-
-  let encrypted =
-    cipher.update(token,"utf8","hex") +
-    cipher.final("hex");
-
-  const tag = cipher.getAuthTag().toString("hex");
-
-  return `${iv.toString("hex")}:${encrypted}:${tag}`;
-}
-
-export function decryptInstagramToken(payload: string): string {
-  const [ivHex, encrypted, tagHex] = payload.split(":");
-  if(!ivHex||!encrypted||!tagHex){
-    throw new Error("Invalid encrypted token")
-  }
-
-  const decipher = crypto.createDecipheriv(
-    "aes-256-gcm",
-    getEncryptionKey(),
-    Buffer.from(ivHex,"hex")
-  );
-
-  decipher.setAuthTag(Buffer.from(tagHex,"hex"));
-
-  return (
-    decipher.update(encrypted,"hex","utf8") +
-    decipher.final("utf8")
-  );
-}
+export { encryptInstagramToken, decryptInstagramToken } from "../utils/encryption.utils";
 
 export async function processInstagramInboundEvent(event: any): Promise<void> {
   console.log("[Instagram] recipient:", event.recipient?.id, "sender:", event.sender?.id, "mid:", event.message?.mid);
