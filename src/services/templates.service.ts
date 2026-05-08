@@ -1,6 +1,7 @@
 import prisma from "../db/connect";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
-import { TemplateCategory, TemplateStatus } from "@prisma/client";
+import { TemplateCategory, TemplateStatus, MessageStatus, MessageChannel } from "@prisma/client";
+import { emitToHotel } from "../realtime/emit";
 import { logger } from "../utils/logger";
 
 const log = logger.child({ service: "templates" });
@@ -286,25 +287,35 @@ export async function sendTemplateMessage(
   }
   if (!guest) throw Object.assign(new Error("Guest not found"), { status: 404 });
 
-  const { phoneNumberId, accessToken } = await getWaCredentials(hotelId);
+  const [{ phoneNumberId, accessToken }, hotel] = await Promise.all([
+    getWaCredentials(hotelId),
+    prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } }),
+  ]);
+
   const components = template.components as any;
   const sendComponents: any[] = [];
 
+  // Header text variable (key: "header_1")
   if (components.header?.format === "TEXT" && components.header.text?.includes("{{")) {
     sendComponents.push({ type: "header", parameters: [{ type: "text", text: values["header_1"] ?? "" }] });
   }
-  if (components.body?.text?.includes("{{")) {
-    const params = (components.body.examples ?? []).map((_: any, i: number) => ({
-      type: "text", text: values[`body_${i + 1}`] ?? "",
+
+  // Body variables — TemplatePicker sends keys "1", "2", … matching {{1}}, {{2}}
+  const bodyVarCount = (components.body?.text ?? "").match(/\{\{(\d+)\}\}/g)?.length ?? 0;
+  if (bodyVarCount > 0) {
+    const params = Array.from({ length: bodyVarCount }, (_, i) => ({
+      type: "text",
+      text: values[String(i + 1)] ?? "",
     }));
-    if (params.length) sendComponents.push({ type: "body", parameters: params });
+    sendComponents.push({ type: "body", parameters: params });
   }
+
   (components.buttons ?? []).forEach((btn: any, i: number) => {
     if (btn.type === "URL" && btn.isDynamic) {
       sendComponents.push({ type: "button", sub_type: "url", index: i, parameters: [{ type: "text", text: values[`btn_${i}`] ?? "" }] });
     }
     if (btn.type === "COPY_CODE") {
-      sendComponents.push({ type: "button", sub_type: "COPY_CODE", index: i, parameters: [{ type: "coupon_code", coupon_code: values[`btn_${i}`] ?? "" }] });
+      sendComponents.push({ type: "button", sub_type: "copy_code", index: i, parameters: [{ type: "coupon_code", coupon_code: values[`btn_${i}`] ?? "" }] });
     }
   });
 
@@ -335,7 +346,34 @@ export async function sendTemplateMessage(
     );
   }
 
-  return { success: true, messageId: metaData?.messages?.[0]?.id ?? null };
+  const wamid      = metaData?.messages?.[0]?.id ?? null;
+  const fromPhone  = hotel?.phone ?? "";
+
+  // Render the body text so the bubble shows the actual message content
+  const renderedBody = (components.body?.text ?? template.name).replace(
+    /\{\{(\d+)\}\}/g,
+    (_: string, n: string) => values[n] ?? `{{${n}}}`
+  );
+
+  // Persist so the chat thread shows the outbound bubble immediately
+  const savedMessage = await prisma.message.create({
+    data: {
+      direction:   "OUT",
+      fromPhone,
+      toPhone:     guest.phone,
+      body:        renderedBody,
+      messageType: "text",
+      hotelId,
+      guestId,
+      channel:     MessageChannel.WHATSAPP,
+      status:      MessageStatus.SENT,
+      ...(wamid ? { wamid } : {}),
+    },
+  });
+
+  emitToHotel(hotelId, "message:new", { message: savedMessage });
+
+  return { success: true, messageId: wamid };
 }
 
 // ── Background sync (called from cron) ───────────────────────────────────────
