@@ -6,6 +6,7 @@ import { MessageStatus } from "@prisma/client";
 import { publishMessageStatus } from "../realtime/statusBus";
 import "./billing.worker";   // Start billing expiry cron alongside this worker
 import "./instagram.worker"; // Start Instagram inbound processor alongside this worker
+import { syncPendingTemplates } from "../services/templates.service";
 import { logger } from "../utils/logger";
 
 const log = logger.child({ service: "worker" });
@@ -101,3 +102,13 @@ worker.on("failed", async (job, err) => {
 worker.on("error", (err) => {
   log.error({ err }, "worker error");
 });
+
+// Daily cron: sync PENDING templates older than 30 min (runs every 24 h)
+const TEMPLATE_SYNC_INTERVAL = 24 * 60 * 60 * 1000;
+setInterval(() => {
+  syncPendingTemplates().catch((err) => log.error({ err }, "template cron sync failed"));
+}, TEMPLATE_SYNC_INTERVAL);
+// Also run once at startup (after a brief delay)
+setTimeout(() => {
+  syncPendingTemplates().catch((err) => log.error({ err }, "template startup sync failed"));
+}, 5 * 60 * 1000);

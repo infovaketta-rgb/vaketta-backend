@@ -52,6 +52,18 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
     const change = entry?.changes?.[0];
     const value  = change?.value;
 
+    // Handle template status updates (APPROVED / REJECTED / PAUSED / DISABLED)
+    if (change?.field === "message_template_status_update") {
+      const { message_template_id, event, reason } = value ?? {};
+      if (message_template_id && event) {
+        await prisma.whatsAppTemplate.updateMany({
+          where: { metaTemplateId: String(message_template_id) },
+          data:  { status: event, rejectionReason: reason ?? null },
+        });
+      }
+      return res.sendStatus(200);
+    }
+
     // Handle Meta status updates (sent / delivered / read / failed)
     const statusUpdate = value?.statuses?.[0];
     if (statusUpdate) {

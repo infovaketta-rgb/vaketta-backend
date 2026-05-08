@@ -97,6 +97,7 @@ model Hotel {
   plan   Plan?       @relation(fields: [planId], references: [id])
   config HotelConfig?
   menu   HotelMenu?
+  whatsappTemplates WhatsAppTemplate[]
 }
 
 model HotelConfig {
@@ -526,4 +527,45 @@ model DeadLetterEvent {
   error       String
   failedAt    DateTime @default(now())
   retries     Int @default(0)
+}
+
+// ── WhatsApp Message Templates ────────────────────────────────────────────────
+
+enum TemplateCategory {
+  MARKETING
+  UTILITY
+  AUTHENTICATION
+}
+
+enum TemplateStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PAUSED
+  DISABLED
+}
+
+model WhatsAppTemplate {
+  id              String           @id @default(cuid())
+  hotelId         String
+  hotel           Hotel            @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+
+  name            String
+  language        String
+  category        TemplateCategory
+  status          TemplateStatus   @default(PENDING)
+  qualityScore    String?
+  metaTemplateId  String?
+  rejectionReason String?
+  components      Json
+  allowCategoryChange Boolean      @default(true)
+  ttlSeconds      Int?
+  editCount       Int              @default(0)
+  lastEditedAt    DateTime?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([hotelId, name, language])
+  @@index([hotelId])
 }

@@ -4,6 +4,7 @@ import { logger } from "../utils/logger";
 
 const log = logger.child({ service: "message-routes" });
 import { manualReply, getMessages, markMessagesRead, setBotEnabled, sendMedia, deleteMessage, undoSend, sendMediaFromUrl } from "../controllers/message.controller";
+import { sendTemplateMessage } from "../services/templates.service";
 import { requireRole } from "../middleware/role.middleware";
 import { UserRole } from "@prisma/client";
 import prisma from "../db/connect";
@@ -110,6 +111,17 @@ router.get("/media", async (req, res) => {
   }
 });
 
+router.post("/send-template", requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), async (req, res) => {
+  try {
+    const hotelId = (req as any).user.hotelId;
+    const { guestId, templateId, values } = req.body;
+    if (!guestId || !templateId) return res.status(400).json({ error: "guestId and templateId are required" });
+    const result = await sendTemplateMessage(hotelId, guestId, templateId, values ?? {});
+    res.json(result);
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message });
+  }
+});
 router.post("/send-media-url", requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), sendMediaFromUrl);
 router.post("/reply",     requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), manualReply);
 router.post("/send-media", upload.single("file"), requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), sendMedia);
