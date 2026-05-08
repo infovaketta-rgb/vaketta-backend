@@ -197,11 +197,14 @@ export async function patchHotelProfile(req: Request, res: Response) {
 
 export async function embeddedSignupHandler(req: Request, res: Response) {
   try {
-    const { code, wabaId, phoneNumberId, redirectUri } = req.body;
+    const { code, wabaId, phoneNumberId, redirectUri, coexistence } = req.body;
     if (!code || !wabaId || !phoneNumberId) {
       return res.status(400).json({ error: "code, wabaId, and phoneNumberId are required" });
     }
-    const result = await connectWhatsAppEmbeddedSignup(hotelId(req), code, wabaId, phoneNumberId, redirectUri ?? "");
+    const result = await connectWhatsAppEmbeddedSignup(
+      hotelId(req), code, wabaId, phoneNumberId, redirectUri ?? "",
+      coexistence === true,
+    );
     res.json({ success: true, ...result });
   } catch (err: any) {
     res.status(502).json({ error: err.message });
