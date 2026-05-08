@@ -5,7 +5,10 @@ import {
   updateTemplate,
   deleteTemplate,
   syncTemplate,
+  parseMetaComponents,
 } from "../services/templates.service";
+import prisma from "../db/connect";
+import { decryptWhatsAppToken } from "../utils/encryption.utils";
 
 const router = Router();
 
@@ -69,6 +72,98 @@ router.post("/", async (req: Request, res: Response) => {
     res.status(201).json(template);
   } catch (err: any) {
     res.status(err.status ?? 500).json({ error: err.message, details: err.details });
+  }
+});
+
+// POST /hotel-templates/sync-from-meta  — import all templates from Meta WABA
+router.post("/sync-from-meta", async (req: Request, res: Response) => {
+  try {
+    const hid = hotelId(req);
+
+    const config = await prisma.hotelConfig.findUnique({ where: { hotelId: hid } });
+    if (!config?.metaWabaId || !config?.metaAccessTokenEncrypted) {
+      return res.status(400).json({ error: "WhatsApp is not configured for this hotel" });
+    }
+    const accessToken = decryptWhatsAppToken(config.metaAccessTokenEncrypted);
+    const wabaId      = config.metaWabaId;
+
+    // Meta status → internal status
+    const STATUS_MAP: Record<string, string> = {
+      APPROVED:  "APPROVED",
+      ACTIVE:    "APPROVED",
+      PENDING:   "PENDING",
+      IN_APPEAL: "PENDING",
+      REJECTED:  "REJECTED",
+      PAUSED:    "PAUSED",
+      DISABLED:  "DISABLED",
+      DELETED:   "DISABLED",
+    };
+
+    // Recognised categories
+    const VALID_CATEGORIES = new Set(["MARKETING", "UTILITY", "AUTHENTICATION"]);
+
+    // Fetch all pages from Meta
+    const allTemplates: any[] = [];
+    let url: string | null =
+      `https://graph.facebook.com/v23.0/${wabaId}/message_templates` +
+      `?limit=100&fields=id,name,language,category,status,quality_score,components,rejected_reason`;
+
+    while (url) {
+      const metaRes = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+      const data    = await metaRes.json() as any;
+      if (!metaRes.ok) {
+        return res.status(400).json({ error: data?.error?.message ?? "Meta API error", details: data?.error });
+      }
+      allTemplates.push(...(data.data ?? []));
+      url = data.paging?.next ?? null;
+    }
+
+    let created = 0, updated = 0, skipped = 0;
+
+    for (const t of allTemplates) {
+      const category = t.category as string;
+      if (!VALID_CATEGORIES.has(category)) { skipped++; continue; }
+
+      const status      = STATUS_MAP[t.status as string] ?? "PENDING";
+      const score       = t.quality_score?.score;
+      const qualityScore = (score === "GREEN" || score === "YELLOW" || score === "RED")
+        ? score
+        : score ? "UNKNOWN" : null;
+
+      const components = parseMetaComponents(t.components ?? []);
+
+      const existing = await prisma.whatsAppTemplate.findUnique({
+        where: { hotelId_name_language: { hotelId: hid, name: t.name, language: t.language } },
+      });
+
+      await prisma.whatsAppTemplate.upsert({
+        where: { hotelId_name_language: { hotelId: hid, name: t.name, language: t.language } },
+        create: {
+          hotelId:          hid,
+          name:             t.name,
+          language:         t.language,
+          category:         category as any,
+          status:           status   as any,
+          metaTemplateId:   String(t.id),
+          qualityScore,
+          rejectionReason:  t.rejected_reason ?? null,
+          components,
+        },
+        update: {
+          status:          status as any,
+          metaTemplateId:  String(t.id),
+          qualityScore,
+          rejectionReason: t.rejected_reason ?? null,
+          components,
+        },
+      });
+
+      existing ? updated++ : created++;
+    }
+
+    res.json({ success: true, summary: { total: allTemplates.length, created, updated, skipped } });
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message });
   }
 });
 

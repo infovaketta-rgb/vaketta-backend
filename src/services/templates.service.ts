@@ -16,6 +16,53 @@ async function getWaCredentials(hotelId: string) {
   return { wabaId: config.metaWabaId, accessToken, phoneNumberId: config.metaPhoneNumberId };
 }
 
+// ── Meta → internal component parser ─────────────────────────────────────────
+
+export function parseMetaComponents(metaComponents: any[]): any {
+  const result: any = { body: { text: "" } };
+
+  for (const comp of metaComponents) {
+    switch (comp.type) {
+      case "HEADER":
+        result.header = {
+          format:    comp.format,
+          text:      comp.text      ?? undefined,
+          example:   comp.example?.header_text?.[0] ?? undefined,
+          sampleUrl: comp.example?.header_handle?.[0] ?? undefined,
+        };
+        break;
+
+      case "BODY":
+        result.body = {
+          text:     comp.text ?? "",
+          examples: comp.example?.body_text?.[0] ?? [],
+        };
+        break;
+
+      case "FOOTER":
+        result.footer = { text: comp.text ?? "" };
+        break;
+
+      case "BUTTONS":
+        result.buttons = (comp.buttons ?? []).map((btn: any) => {
+          if (btn.type === "QUICK_REPLY")  return { type: "QUICK_REPLY",  text: btn.text };
+          if (btn.type === "PHONE_NUMBER") return { type: "PHONE_NUMBER", text: btn.text, phoneNumber: btn.phone_number };
+          if (btn.type === "COPY_CODE")    return { type: "COPY_CODE",    text: btn.text, couponCode: btn.example?.[0] ?? "" };
+          if (btn.type === "URL") {
+            const b: any = { type: "URL", text: btn.text, url: btn.url };
+            if (btn.example?.length) { b.isDynamic = true; b.urlExample = btn.example[0]; }
+            return b;
+          }
+          if (btn.type === "OTP") return { type: "COPY_CODE", text: btn.text, couponCode: "" };
+          return { type: btn.type, text: btn.text };
+        });
+        break;
+    }
+  }
+
+  return result;
+}
+
 // ── Meta payload builder ──────────────────────────────────────────────────────
 
 function buildMetaComponents(components: any): any[] {
