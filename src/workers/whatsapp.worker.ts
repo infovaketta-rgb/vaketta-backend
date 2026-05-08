@@ -78,8 +78,12 @@ const worker = new Worker(
     }
   },
   {
-    connection:  redis,
-    concurrency: 5,
+    connection:     redis,
+    concurrency:    2,
+    drainDelay:     5_000,   // 5 s idle wait — prevents hammering Upstash when queue is empty
+    lockDuration:   120_000, // 2-min lock → renewal every ~1 min
+    stalledInterval:300_000, // check stalled jobs every 5 min
+    maxStalledCount:1,
   }
 );
 

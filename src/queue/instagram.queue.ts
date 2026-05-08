@@ -6,13 +6,13 @@ export const instagramQueue = new Queue(
   {
     connection: redis,
     defaultJobOptions:{
-      attempts:5,
+      attempts: 3,           // 3 total attempts — reduces retry-loop Redis commands
       backoff:{
-        type:"exponential",
-        delay:2000
+        type: "exponential",
+        delay: 10_000,       // 10 s → 20 s → 40 s — space retries out more
       },
-      removeOnComplete:{count:500},
-      removeOnFail:{count:200}
+      removeOnComplete:{ count: 100 },
+      removeOnFail:    { count: 50  },
     }
   }
 );
