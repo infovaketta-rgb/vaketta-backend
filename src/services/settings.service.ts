@@ -241,6 +241,13 @@ export async function connectWhatsAppEmbeddedSignup(
     throw new Error(subData?.error?.message ?? "Failed to subscribe WABA to app");
   }
 
+  // 2b. Also subscribe to Coexistence history fields (best-effort — never throw)
+  fetch(
+    `https://graph.facebook.com/v25.0/${wabaId}/subscribed_apps` +
+    `?subscribed_fields=history,smb_message_echoes`,
+    { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } }
+  ).catch(() => { /* best-effort — coexistence fields may not be available on all WABAs */ });
+
   // 3. Persist encrypted token (hotelId always from JWT, never from request body)
   await prisma.hotelConfig.upsert({
     where:  { hotelId },

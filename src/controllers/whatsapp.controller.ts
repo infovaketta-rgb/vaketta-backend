@@ -5,6 +5,7 @@ import prisma from "../db/connect";
 import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
 import { extractMediaFromWebhookMessage, downloadMetaMedia } from "../services/media.service";
+import { processHistoryWebhook, processSmbMessageEcho } from "../services/history.service";
 import crypto from "crypto";
 import { logger } from "../utils/logger";
 
@@ -51,6 +52,22 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
     const entry  = req.body?.entry?.[0];
     const change = entry?.changes?.[0];
     const value  = change?.value;
+
+    // Handle Coexistence history sync chunks
+    if (change?.field === "history") {
+      processHistoryWebhook(change.value).catch((err) =>
+        log.error({ err }, "history webhook processing failed")
+      );
+      return res.sendStatus(200);
+    }
+
+    // Handle echoes of messages the hotel sends from WhatsApp Business App
+    if (change?.field === "smb_message_echoes") {
+      processSmbMessageEcho(change.value).catch((err) =>
+        log.error({ err }, "smb_message_echoes processing failed")
+      );
+      return res.sendStatus(200);
+    }
 
     // Handle template status updates (APPROVED / REJECTED / PAUSED / DISABLED)
     if (change?.field === "message_template_status_update") {

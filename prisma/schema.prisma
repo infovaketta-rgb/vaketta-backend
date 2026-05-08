@@ -80,6 +80,13 @@ model Hotel {
   subscriptionStatus  String    @default("trial")  // "active" | "trial" | "expired"
   billingStartDate    DateTime?
   billingEndDate      DateTime?
+
+  // WhatsApp Coexistence — chat history sync state
+  historySyncStatus    String?   // "pending" | "in_progress" | "complete" | "failed"
+  historySyncProgress  Int?      // 0-100
+  historySyncStarted   DateTime?
+  historySyncCompleted DateTime?
+
   createdAt    DateTime @default(now())
 
   guests               Guest[]
