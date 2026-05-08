@@ -208,7 +208,6 @@ export async function connectWhatsAppEmbeddedSignup(
   wabaId: string,
   phoneNumberId: string,
   redirectUri: string,
-  coexistence = false,
 ): Promise<{ phoneNumberId: string; wabaId: string }> {
   const appId     = process.env.FACEBOOK_APP_ID     ?? "";
   const appSecret = process.env.FACEBOOK_APP_SECRET ?? "";
@@ -267,24 +266,18 @@ export async function connectWhatsAppEmbeddedSignup(
     },
   });
 
-  // If this is a Coexistence flow, request history sync from Meta and mark the hotel
-  if (coexistence) {
-    // Trigger history sync — best-effort, never throws
-    fetch(
-      `https://graph.facebook.com/v25.0/${phoneNumberId}/smb_app_data`,
-      {
-        method:  "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
-        body:    JSON.stringify({ messaging_product: "whatsapp", sync_type: "history" }),
-      }
-    ).catch(() => { /* best-effort */ });
-
-    // Mark sync as pending so the frontend banner shows once webhooks start arriving
-    await prisma.hotel.update({
-      where: { id: hotelId },
-      data:  { historySyncStatus: "pending" },
-    });
-  }
+  // Request history sync from Meta — best-effort, never throws.
+  // If the WABA supports Coexistence, Meta will start delivering history webhook
+  // chunks.  If it doesn't support it, Meta returns an error which we silently
+  // ignore so normal (non-Coexistence) signups are unaffected.
+  fetch(
+    `https://graph.facebook.com/v25.0/${phoneNumberId}/smb_app_data`,
+    {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+      body:    JSON.stringify({ messaging_product: "whatsapp", sync_type: "history" }),
+    }
+  ).catch(() => { /* best-effort — not all WABAs support Coexistence */ });
 
   return { phoneNumberId, wabaId };
 }
