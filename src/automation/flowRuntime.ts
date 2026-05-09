@@ -622,12 +622,19 @@ export async function executeFlowStep(
         }
 
         flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, input);
-        // Canonical aliases
+        // Canonical aliases — safeSetVar blocks reserved keys like "guestName" to prevent
+        // arbitrary guest injection, but the aliases below are intentional runtime cross-refs.
         if (d.variableName) {
           const key = d.variableName.toLowerCase();
-          if (key.includes("name"))     flowData.flowVars["bookingGuestName"]  ??= input;
-          if (key.includes("checkin"))  flowData.flowVars["bookingCheckIn"]    ??= input;
-          if (key.includes("checkout")) flowData.flowVars["bookingCheckOut"]   ??= input;
+          if (key.includes("name")) {
+            flowData.flowVars["bookingGuestName"] ??= input;
+            // Populate guestName when blank so {{guestName}} works in downstream messages.
+            // guest?.name from the DB is commonly empty for WhatsApp contacts, making the
+            // flow-collected answer the only reliable source for the guest's display name.
+            if (!flowData.flowVars["guestName"]) flowData.flowVars["guestName"] = input;
+          }
+          if (key.includes("checkin"))  flowData.flowVars["bookingCheckIn"]  ??= input;
+          if (key.includes("checkout")) flowData.flowVars["bookingCheckOut"] ??= input;
         }
         delete flowData.waitingFor;
 
