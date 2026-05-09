@@ -1,4 +1,5 @@
 import { Router, Request, Response } from "express";
+import multer from "multer";
 import {
   getTemplates,
   createTemplate,
@@ -7,8 +8,14 @@ import {
   syncTemplate,
   parseMetaComponents,
 } from "../services/templates.service";
+import { uploadToR2 } from "../services/r2.service";
 import prisma from "../db/connect";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
+
+const mediaUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 16 * 1024 * 1024 },
+});
 
 const router = Router();
 
@@ -162,6 +169,17 @@ router.post("/sync-from-meta", async (req: Request, res: Response) => {
     }
 
     res.json({ success: true, summary: { total: allTemplates.length, created, updated, skipped } });
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message });
+  }
+});
+
+// POST /hotel-templates/upload-media — upload image/video for a template header
+router.post("/upload-media", mediaUpload.single("file"), async (req: Request, res: Response) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const result = await uploadToR2(req.file.buffer, req.file.mimetype, { hotelId: hotelId(req) });
+    res.json({ url: result.url, key: result.key });
   } catch (err: any) {
     res.status(err.status ?? 500).json({ error: err.message });
   }

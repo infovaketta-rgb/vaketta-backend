@@ -71,12 +71,16 @@ function buildMetaComponents(components: any): any[] {
   const { header, body, footer, buttons } = components;
 
   if (header) {
-    const h: any = { type: "HEADER", format: header.format };
-    if (header.format === "TEXT") {
+    // parseMetaComponents stores "format"; the creation form stores "type" — accept both
+    const format = header.format ?? header.type;
+    const h: any = { type: "HEADER", format };
+    if (format === "TEXT") {
       h.text = header.text ?? "";
       if (header.example) h.example = { header_text: [header.example] };
-    } else if (["IMAGE", "VIDEO", "DOCUMENT"].includes(header.format)) {
-      if (header.sampleUrl) h.example = { header_handle: [header.sampleUrl] };
+    } else if (["IMAGE", "VIDEO", "DOCUMENT"].includes(format)) {
+      // sampleUrl comes from Meta-synced data; mediaUrl from the upload form
+      const sampleUrl = header.sampleUrl ?? header.mediaUrl;
+      if (sampleUrl) h.example = { header_handle: [sampleUrl] };
     }
     result.push(h);
   }
