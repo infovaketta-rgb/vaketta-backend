@@ -10,6 +10,7 @@ function createRedis(label: string): Redis {
     maxRetriesPerRequest: null,           // required by BullMQ
     enableReadyCheck:     false,          // don't block until Redis is ready
     lazyConnect:          false,
+    keepAlive:            30_000,         // TCP keepalive every 30s — reduces Upstash PING overhead
     retryStrategy(times) {
       const delay = times > 20
         ? 30_000  // after 20 fast attempts, keep retrying every 30s indefinitely

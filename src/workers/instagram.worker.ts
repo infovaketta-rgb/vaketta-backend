@@ -78,9 +78,9 @@ const worker = new Worker(
    connection:     redis,
    concurrency:    2,
    // Upstash free tier (500 k commands/day) — reduce idle Redis pressure:
-   drainDelay:     5_000,   // wait 5 s before re-polling an empty queue (default: 5 ms)
+   drainDelay:     30_000,  // 30 s idle wait — reduces Upstash commands when queue is empty
    lockDuration:   120_000, // 2-min lock → renewal every ~1 min instead of every 15 s
-   stalledInterval:300_000, // check for stalled jobs every 5 min (default: 30 s)
+   stalledInterval:600_000, // check for stalled jobs every 10 min (default: 30 s)
    maxStalledCount:1,       // stalled job counts as one failure, then falls to retry policy
  }
 );
