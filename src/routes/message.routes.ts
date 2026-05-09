@@ -127,6 +127,53 @@ router.post("/reply",     requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.M
 router.post("/send-media", upload.single("file"), requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER, UserRole.STAFF), sendMedia);
 router.delete("/:messageId/undo-send", requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER), undoSend);
 router.delete("/:messageId",           requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER), deleteMessage);
+// GET /messages/:guestId/context  — guest name + latest booking for template auto-fill
+router.get("/:guestId/context", async (req, res) => {
+  try {
+    const hotelId = (req as any).user.hotelId;
+    const { guestId } = req.params;
+
+    const [guest, latestBooking] = await Promise.all([
+      prisma.guest.findFirst({
+        where:  { id: guestId, hotelId },
+        select: { name: true, phone: true },
+      }),
+      prisma.booking.findFirst({
+        where:   { guestId, hotelId, status: { in: ["CONFIRMED", "PENDING", "HOLD"] } },
+        orderBy: { createdAt: "desc" },
+        select: {
+          checkIn:         true,
+          checkOut:        true,
+          referenceNumber: true,
+          status:          true,
+          roomType:        { select: { name: true } },
+        },
+      }),
+    ]);
+
+    if (!guest) return res.status(404).json({ error: "Guest not found" });
+
+    function fmtDate(d: Date): string {
+      return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
+    }
+
+    res.json({
+      guest: { name: guest.name ?? "", phone: guest.phone },
+      latestBooking: latestBooking
+        ? {
+            checkIn:         fmtDate(latestBooking.checkIn),
+            checkOut:        fmtDate(latestBooking.checkOut),
+            roomTypeName:    latestBooking.roomType?.name ?? "",
+            referenceNumber: latestBooking.referenceNumber ?? "",
+            status:          latestBooking.status,
+          }
+        : null,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get("/:guestId",       getMessages);
 router.post("/:guestId/read", markMessagesRead);
 router.patch("/:guestId/bot", requireRole(UserRole.OWNER, UserRole.ADMIN, UserRole.MANAGER), setBotEnabled);

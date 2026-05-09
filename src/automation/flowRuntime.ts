@@ -201,6 +201,70 @@ function buildRoomListText(
   return text;
 }
 
+// ── Booking confirmation template ──────────────────────────────────────────────
+
+async function sendBookingConfirmationTemplate(
+  hotelId:   string,
+  guestId:   string,
+  booking:   { id: string; checkIn: Date; checkOut: Date; referenceNumber: string | null },
+  flowVars:  Record<string, string>
+): Promise<void> {
+  const { sendTemplateMessage } = await import("../services/templates.service");
+
+  const template = await prisma.whatsAppTemplate.findFirst({
+    where: {
+      hotelId,
+      status: "APPROVED",
+      OR: [
+        { name: { contains: "booking_confirmation" } },
+        { name: { contains: "booking_confirmed"   } },
+        { name: { contains: "confirmation"        } },
+      ],
+    },
+    orderBy: { updatedAt: "desc" },
+  });
+
+  if (!template) return;
+
+  const vm         = ((template as any).variableMapping ?? {}) as Record<string, string>;
+  const components = template.components as { body?: { text?: string } };
+  const bodyText   = components?.body?.text ?? "";
+  const varCount   = (bodyText.match(/\{\{\d+\}\}/g) ?? []).length;
+  if (varCount === 0) return;
+
+  function fmtDate(d: Date): string {
+    return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
+  }
+
+  const ctx: Record<string, string> = {
+    "guest.name":              flowVars["guestName"] ?? flowVars["bookingGuestName"] ?? "",
+    "guest.phone":             flowVars["guestPhone"] ?? "",
+    "booking.checkIn":         fmtDate(booking.checkIn),
+    "booking.checkOut":        fmtDate(booking.checkOut),
+    "booking.roomTypeName":    flowVars["bookingRoomTypeName"] ?? "",
+    "booking.referenceNumber": booking.referenceNumber ?? booking.id.slice(0, 8).toUpperCase(),
+    "booking.status":          "PENDING",
+    "hotel.name":              flowVars["hotelName"] ?? "",
+  };
+
+  // Position-based defaults when no explicit mapping is set
+  const DEFAULTS: Record<number, string> = {
+    1: "guest.name",
+    2: "booking.checkIn",
+    3: "booking.checkOut",
+    4: "booking.roomTypeName",
+    5: "booking.referenceNumber",
+  };
+
+  const values: Record<string, string> = {};
+  for (let i = 1; i <= varCount; i++) {
+    const key = vm[String(i)] ?? DEFAULTS[i] ?? "";
+    values[String(i)] = ctx[key] ?? "";
+  }
+
+  await sendTemplateMessage(hotelId, guestId, template.id, values);
+}
+
 // ── Main entry point ───────────────────────────────────────────────────────────
 
 export async function executeFlowStep(
@@ -838,6 +902,11 @@ export async function executeFlowStep(
             bookingId:     booking.id,
           };
 
+          // Fire-and-forget: send booking confirmation template if the hotel has one
+          sendBookingConfirmationTemplate(hotelId, guestId, booking, flowData.flowVars).catch((err: unknown) =>
+            log.warn({ err, bookingId: booking.id }, "confirmation template send skipped")
+          );
+
           const next = nextNodeId(currentNodeId, adjacency);
           if (!next) {
             await resetSession(guestId, hotelId);
@@ -1080,6 +1149,61 @@ export async function executeFlowStep(
         }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${d.targetNodeId}`, { ...sessionData, flow: { ...flowData } });
         return advance(d.targetNodeId);
+      }
+
+      // ── send_template ────────────────────────────────────────────────────────
+      // Sends an approved WhatsApp template to the guest.
+      // Each {{n}} variable resolved from flowVars via variableMapping.
+      // Routes: "success" handle → next node; "failure" handle → fallback.
+      case "send_template": {
+        const { sendTemplateMessage } = await import("../services/templates.service");
+        const d = node.data as any;
+
+        const template = d.templateId
+          ? await prisma.whatsAppTemplate.findFirst({
+              where: { id: d.templateId, hotelId, status: "APPROVED" },
+            })
+          : null;
+
+        if (!template) {
+          log.warn({ flowId, nodeId: currentNodeId, templateId: d.templateId }, "send_template: template not found or not approved");
+          const failNext = nextNodeId(currentNodeId, adjacency, "failure") ?? nextNodeId(currentNodeId, adjacency);
+          if (!failNext) { await resetSession(guestId, hotelId); return (d.failureMessage as string | undefined) || null; }
+          await updateSession(guestId, hotelId, `FLOW:${flowId}:${failNext}`, { ...sessionData, flow: { ...flowData } });
+          return advance(failNext);
+        }
+
+        const components = template.components as { body?: { text?: string } };
+        const bodyText   = components?.body?.text ?? "";
+        const varCount   = (bodyText.match(/\{\{\d+\}\}/g) ?? []).length;
+        const vm         = ((d.variableMapping ?? {}) as Record<string, string>);
+
+        const values: Record<string, string> = {};
+        for (let i = 1; i <= varCount; i++) {
+          const flowVarName = vm[String(i)] ?? "";
+          values[String(i)] = flowVarName
+            ? (flowData.flowVars[flowVarName] ?? interpolate(flowVarName, flowData.flowVars))
+            : "";
+        }
+
+        let sendOk = false;
+        try {
+          await sendTemplateMessage(hotelId, guestId, d.templateId, values);
+          sendOk = true;
+        } catch (err: unknown) {
+          log.warn({ err, templateId: d.templateId, flowId }, "send_template node: failed to send template");
+        }
+
+        const handle  = sendOk ? "success" : "failure";
+        const next    = nextNodeId(currentNodeId, adjacency, handle) ?? nextNodeId(currentNodeId, adjacency);
+
+        if (!next) {
+          await resetSession(guestId, hotelId);
+          return sendOk ? null : ((d.failureMessage as string | undefined) || null);
+        }
+
+        await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+        return advance(next);
       }
 
       // ── show_menu ─────────────────────────────────────────────────────────────

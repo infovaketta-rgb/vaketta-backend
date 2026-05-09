@@ -43,15 +43,43 @@ function validate(body: any): string | null {
     if (hasQR && hasCTA) return "Cannot mix Quick Reply and Call to Action buttons";
   }
 
-  // Variable count must match examples
+  // Variable count must match examples and all examples must be non-empty
   const varCount = (body.components.body.text.match(/\{\{\d+\}\}/g) ?? []).length;
   const exCount  = body.components.body.examples?.length ?? 0;
   if (varCount > 0 && exCount !== varCount) {
     return `body has ${varCount} variable(s) but ${exCount} example value(s) — counts must match`;
   }
+  if (varCount > 0 && (body.components.body.examples as any[]).some((e: any) => !e?.trim())) {
+    return "All body variable example values must be non-empty";
+  }
+
+  // Button text must be non-empty, max 25 chars; Quick Reply labels must be unique
+  for (const btn of (body.components.buttons ?? []) as any[]) {
+    if (!btn.text?.trim()) return "Button label cannot be empty";
+    if (btn.text.length > 25) return "Button label must be 25 characters or fewer";
+    if (btn.type === "COPY_CODE" && !btn.example?.trim() && !btn.couponCode?.trim()) {
+      return "Copy Code button must include an example coupon code";
+    }
+  }
+  const qrLabels = ((body.components.buttons ?? []) as any[])
+    .filter((b: any) => b.type === "QUICK_REPLY")
+    .map((b: any) => b.text as string);
+  if (new Set(qrLabels).size !== qrLabels.length) {
+    return "Quick Reply button labels must be unique";
+  }
 
   return null;
 }
+
+// GET /hotel-templates/approved  — convenience alias used by chat & bot flows
+router.get("/approved", async (req: Request, res: Response) => {
+  try {
+    const templates = await getTemplates(hotelId(req), { status: "APPROVED" });
+    res.json(templates);
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message });
+  }
+});
 
 // GET /hotel-templates
 router.get("/", async (req: Request, res: Response) => {
@@ -212,6 +240,27 @@ router.post("/:id/sync", async (req: Request, res: Response) => {
   try {
     const template = await syncTemplate(hotelId(req), req.params["id"]!);
     res.json(template);
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message });
+  }
+});
+
+// PATCH /hotel-templates/:id/variable-mapping  — set which context field each {{n}} maps to
+router.patch("/:id/variable-mapping", async (req: Request, res: Response) => {
+  try {
+    const { variableMapping } = req.body;
+    if (!variableMapping || typeof variableMapping !== "object" || Array.isArray(variableMapping)) {
+      return res.status(400).json({ error: "variableMapping must be a plain object e.g. {\"1\":\"guest.name\"}" });
+    }
+    const existing = await prisma.whatsAppTemplate.findFirst({
+      where: { id: req.params["id"]!, hotelId: hotelId(req) },
+    });
+    if (!existing) return res.status(404).json({ error: "Template not found" });
+    const updated = await prisma.whatsAppTemplate.update({
+      where: { id: req.params["id"]! },
+      data:  { variableMapping },
+    });
+    res.json(updated);
   } catch (err: any) {
     res.status(err.status ?? 500).json({ error: err.message });
   }

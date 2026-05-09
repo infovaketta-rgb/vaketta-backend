@@ -564,7 +564,8 @@ model WhatsAppTemplate {
   qualityScore    String?
   metaTemplateId  String?
   rejectionReason String?
-  components      Json
+  components       Json
+  variableMapping  Json?           // e.g. {"1":"guest.name","2":"booking.checkIn"}
   allowCategoryChange Boolean      @default(true)
   ttlSeconds      Int?
   editCount       Int              @default(0)

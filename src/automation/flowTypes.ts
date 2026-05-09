@@ -11,7 +11,8 @@ export type NodeType =
   | "show_rooms"          // displays a room list (all or available-only) and collects selection
   | "time_condition"      // branches by time-of-day using the hotel's business hours config
   | "jump"                // jumps to another node in the same flow (enables loops / sub-menus)
-  | "show_menu";          // emits the hotel's formatted WhatsApp menu text inline
+  | "show_menu"           // emits the hotel's formatted WhatsApp menu text inline
+  | "send_template";      // sends an approved WhatsApp template; routes success / failure
 
 // ── Per-node data shapes ───────────────────────────────────────────────────────
 
@@ -192,6 +193,19 @@ export interface ShowMenuNodeData {
   label?: string;  // optional canvas label
 }
 
+/**
+ * send_template node
+ * Sends an approved WhatsApp template message to the guest.
+ * Each {{n}} variable is resolved from the current flow variables via variableMapping.
+ * Routes to "success" handle on successful send, "failure" handle if sending fails.
+ */
+export interface SendTemplateNodeData {
+  templateId:      string;                   // WhatsApp template ID (UUID)
+  templateName?:   string;                   // display-only label (resolved at save time)
+  variableMapping: Record<string, string>;   // {"1":"guestName","2":"bookingCheckIn"} — flow var names
+  failureMessage?: string;                   // optional message sent (via plain text) on failure
+}
+
 export type FlowNodeData =
   | StartNodeData
   | MessageNodeData
@@ -203,7 +217,8 @@ export type FlowNodeData =
   | EndNodeData
   | TimeConditionNodeData
   | JumpNodeData
-  | ShowMenuNodeData;
+  | ShowMenuNodeData
+  | SendTemplateNodeData;
 
 // ── Serialised graph (stored as JSON in FlowDefinition.nodes / .edges) ─────────
 

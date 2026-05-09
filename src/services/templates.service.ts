@@ -78,9 +78,13 @@ function buildMetaComponents(components: any): any[] {
       h.text = header.text ?? "";
       if (header.example) h.example = { header_text: [header.example] };
     } else if (["IMAGE", "VIDEO", "DOCUMENT"].includes(format)) {
-      // sampleUrl comes from Meta-synced data; mediaUrl from the upload form
+      // sampleUrl comes from Meta-synced data; mediaUrl from the upload form.
+      // header_handle must be a Meta upload handle (opaque ID), NOT a CDN/https URL.
+      // If we only have a CDN URL, omit the example — Meta will request samples during review.
       const sampleUrl = header.sampleUrl ?? header.mediaUrl;
-      if (sampleUrl) h.example = { header_handle: [sampleUrl] };
+      if (sampleUrl && !sampleUrl.startsWith("http")) {
+        h.example = { header_handle: [sampleUrl] };
+      }
     }
     result.push(h);
   }
@@ -101,7 +105,8 @@ function buildMetaComponents(components: any): any[] {
       buttons: buttons.map((btn: any) => {
         if (btn.type === "QUICK_REPLY")   return { type: "QUICK_REPLY", text: btn.text };
         if (btn.type === "PHONE_NUMBER")  return { type: "PHONE_NUMBER", text: btn.text, phone_number: btn.phoneNumber };
-        if (btn.type === "COPY_CODE")     return { type: "COPY_CODE", example: [btn.couponCode ?? ""] };
+        // couponCode: stored by parseMetaComponents (sync from Meta); example: stored by the creation form
+        if (btn.type === "COPY_CODE")     return { type: "COPY_CODE", example: [btn.couponCode ?? btn.example ?? ""] };
         if (btn.type === "URL") {
           const b: any = { type: "URL", text: btn.text, url: btn.url };
           if (btn.isDynamic && btn.urlExample) b.example = [btn.urlExample];
@@ -146,18 +151,24 @@ export async function getTemplates(
 export async function createTemplate(hotelId: string, data: any) {
   const { wabaId, accessToken } = await getWaCredentials(hotelId);
 
+  const metaPayload = buildMetaPayload(data);
+  log.info({ metaPayload }, "submitting template to Meta API");
+  console.log("[templates] Meta submission payload:", JSON.stringify(metaPayload, null, 2));
+
   const metaRes = await fetch(
     `https://graph.facebook.com/v23.0/${wabaId}/message_templates`,
     {
       method:  "POST",
       headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-      body:    JSON.stringify(buildMetaPayload(data)),
+      body:    JSON.stringify(metaPayload),
     }
   );
   const metaData = await metaRes.json() as any;
   if (!metaRes.ok) {
+    log.warn({ metaError: metaData?.error }, "Meta template creation failed");
+    console.error("[templates] Meta API error response:", JSON.stringify(metaData, null, 2));
     const err = Object.assign(
-      new Error(metaData?.error?.message ?? "Meta API error"),
+      new Error(metaData?.error?.error_user_msg ?? metaData?.error?.message ?? "Meta API error"),
       { status: 400, details: metaData?.error }
     );
     throw err;
