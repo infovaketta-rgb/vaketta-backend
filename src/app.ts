@@ -88,7 +88,7 @@ app.use(
 // Skip /webhook/* paths — they need the raw buffer for HMAC verification
 app.use((req, res, next) => {
   if (req.path.startsWith("/webhook/")) return next();
-  if (["POST", "PUT", "PATCH"].includes(req.method)) {
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) {
     express.json({ strict: false, limit: "1mb" })(req, res, next);
   } else {
     next();
