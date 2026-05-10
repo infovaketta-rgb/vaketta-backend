@@ -322,38 +322,62 @@ export async function sendTemplateMessage(
   const components = template.components as any;
   const sendComponents: any[] = [];
 
-  // Header text variable (key: "header_1")
-  if (components.header?.format === "TEXT" && components.header.text?.includes("{{")) {
-    sendComponents.push({ type: "header", parameters: [{ type: "text", text: values["header_1"] ?? "" }] });
+  function extractVarIds(text: string): string[] {
+    const re = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
+    const seen = new Set<string>();
+    const ids: string[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const id = m[1]!;
+      if (!seen.has(id)) { seen.add(id); ids.push(id); }
+    }
+    return ids;
+  }
+
+  function buildTextParams(ids: string[], lookup: (id: string) => string) {
+    return ids.map((id) => {
+      const isNamed = !/^\d+$/.test(id);
+      return isNamed
+        ? { type: "text", parameter_name: id, text: lookup(id) }
+        : { type: "text", text: lookup(id) };
+    });
+  }
+
+  // Header text variables — supports both positional and named.
+  // Frontend currently doesn't ask for header values, so we resolve from `values[id]`
+  // (named) or `values["header_1"]` (legacy positional fallback).
+  if (components.header?.format === "TEXT" && components.header.text) {
+    const headerIds = extractVarIds(components.header.text);
+    if (headerIds.length > 0) {
+      sendComponents.push({
+        type: "header",
+        parameters: buildTextParams(headerIds, (id) =>
+          values[id] ?? values[`header_${id}`] ?? values["header_1"] ?? ""
+        ),
+      });
+    }
   }
 
   // Body variables — supports both positional ({{1}}) and named ({{guestname}}) formats.
-  // TemplatePicker sends keys matching the variable identifiers in the body text.
-  const bodyText = components.body?.text ?? "";
-  const bodyVarRe = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
-  const bodyVarIds: string[] = [];
-  const seenBodyVars = new Set<string>();
-  let bv: RegExpExecArray | null;
-  while ((bv = bodyVarRe.exec(bodyText)) !== null) {
-    const id = bv[1]!;
-    if (!seenBodyVars.has(id)) { seenBodyVars.add(id); bodyVarIds.push(id); }
-  }
+  const bodyText   = components.body?.text ?? "";
+  const bodyVarIds = extractVarIds(bodyText);
   if (bodyVarIds.length > 0) {
-    const params = bodyVarIds.map((id) => {
-      const isNamed = !/^\d+$/.test(id);
-      return isNamed
-        ? { type: "text", parameter_name: id, text: values[id] ?? "" }
-        : { type: "text", text: values[id] ?? "" };
+    sendComponents.push({
+      type: "body",
+      parameters: buildTextParams(bodyVarIds, (id) => values[id] ?? ""),
     });
-    sendComponents.push({ type: "body", parameters: params });
   }
 
   (components.buttons ?? []).forEach((btn: any, i: number) => {
     if (btn.type === "URL" && btn.isDynamic) {
-      sendComponents.push({ type: "button", sub_type: "url", index: i, parameters: [{ type: "text", text: values[`btn_${i}`] ?? "" }] });
+      const v = values[`btn_${i}`] ?? "";
+      if (v) sendComponents.push({ type: "button", sub_type: "url", index: i, parameters: [{ type: "text", text: v }] });
     }
     if (btn.type === "COPY_CODE") {
-      sendComponents.push({ type: "button", sub_type: "copy_code", index: i, parameters: [{ type: "coupon_code", coupon_code: values[`btn_${i}`] ?? "" }] });
+      // Only include the button component if a coupon value is provided at send-time.
+      // If the template has a static couponCode baked in, omit the parameter entirely.
+      const v = values[`btn_${i}`];
+      if (v) sendComponents.push({ type: "button", sub_type: "copy_code", index: i, parameters: [{ type: "coupon_code", coupon_code: v }] });
     }
   });
 
@@ -368,6 +392,8 @@ export async function sendTemplateMessage(
     },
   };
 
+  log.info({ templateName: template.name, payload }, "[templates] sending template message to Meta");
+
   const metaRes = await fetch(
     `https://graph.facebook.com/v23.0/${phoneNumberId}/messages`,
     {
@@ -378,6 +404,7 @@ export async function sendTemplateMessage(
   );
   const metaData = await metaRes.json() as any;
   if (!metaRes.ok) {
+    log.warn({ templateName: template.name, payload, metaError: metaData?.error }, "[templates] Meta rejected template send");
     throw Object.assign(
       new Error(metaData?.error?.message ?? "Failed to send template message"),
       { status: 502 }
