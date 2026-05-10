@@ -12,7 +12,8 @@ export type NodeType =
   | "time_condition"      // branches by time-of-day using the hotel's business hours config
   | "jump"                // jumps to another node in the same flow (enables loops / sub-menus)
   | "show_menu"           // emits the hotel's formatted WhatsApp menu text inline
-  | "send_template";      // sends an approved WhatsApp template; routes success / failure
+  | "send_template"       // sends an approved WhatsApp template; routes success / failure
+  | "send_saved_reply";   // sends an internal saved reply with {{var}} resolution
 
 // ── Per-node data shapes ───────────────────────────────────────────────────────
 

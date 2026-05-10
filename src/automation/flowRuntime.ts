@@ -1213,6 +1213,44 @@ export async function executeFlowStep(
         return advance(next);
       }
 
+      // ── send_saved_reply ─────────────────────────────────────────────────────
+      // Fetches an internal SavedReply by id, resolves {{var}} placeholders from
+      // flowVars + per-node variableOverrides, then sends the resolved text.
+      case "send_saved_reply": {
+        const d = node.data as any;
+        const savedReply = d.savedReplyId
+          ? await prisma.savedReply.findFirst({ where: { id: d.savedReplyId, hotelId } })
+          : null;
+
+        if (!savedReply) {
+          log.warn({ flowId, nodeId: currentNodeId, savedReplyId: d.savedReplyId }, "send_saved_reply: reply not found");
+          const next = nextNodeId(currentNodeId, adjacency);
+          if (!next) { await resetSession(guestId, hotelId); return null; }
+          await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+          return advance(next);
+        }
+
+        // Merge flowVars with per-node overrides (overrides take priority)
+        const overrides = (d.variableOverrides ?? {}) as Record<string, string>;
+        const mergedVars: Record<string, string> = { ...flowData.flowVars };
+        for (const [k, v] of Object.entries(overrides)) {
+          if (v) mergedVars[k] = interpolate(v, flowData.flowVars);
+        }
+
+        const text = interpolate(savedReply.body, mergedVars);
+        const next = nextNodeId(currentNodeId, adjacency);
+
+        if (!next) {
+          await resetSession(guestId, hotelId);
+          return text;
+        }
+
+        await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+        const rest = await advance(next);
+        if (!rest) return text;
+        return `${text}\n\n${rest}`;
+      }
+
       // ── show_menu ─────────────────────────────────────────────────────────────
       // Emits the hotel's formatted WhatsApp menu text (same as buildMenuMessage).
       // Continues to the next node after emitting — use an end node to terminate.

@@ -105,6 +105,7 @@ model Hotel {
   config HotelConfig?
   menu   HotelMenu?
   whatsappTemplates WhatsAppTemplate[]
+  savedReplies      SavedReply[]
 }
 
 model HotelConfig {
@@ -575,5 +576,19 @@ model WhatsAppTemplate {
   updatedAt       DateTime @updatedAt
 
   @@unique([hotelId, name, language])
+  @@index([hotelId])
+}
+
+model SavedReply {
+  id        String   @id @default(uuid())
+  hotelId   String
+  name      String
+  category  String?
+  body      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  hotel     Hotel    @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+
   @@index([hotelId])
 }
