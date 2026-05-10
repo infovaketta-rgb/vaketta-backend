@@ -268,18 +268,24 @@ export async function syncTemplate(hotelId: string, templateId: string) {
   const { accessToken } = await getWaCredentials(hotelId);
 
   const metaRes = await fetch(
-    `https://graph.facebook.com/v23.0/${existing.metaTemplateId}?fields=status,quality_score,rejected_reason`,
+    `https://graph.facebook.com/v23.0/${existing.metaTemplateId}?fields=status,quality_score,rejected_reason,components`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   const data = await metaRes.json() as any;
 
+  const updateData: any = {
+    status:          (data.status ?? existing.status) as TemplateStatus,
+    qualityScore:    data.quality_score?.score ?? existing.qualityScore ?? null,
+    rejectionReason: data.rejected_reason ?? null,
+  };
+
+  if (Array.isArray(data.components) && data.components.length > 0) {
+    updateData.components = parseMetaComponents(data.components);
+  }
+
   return prisma.whatsAppTemplate.update({
     where: { id: templateId },
-    data: {
-      status:         (data.status          ?? existing.status)       as TemplateStatus,
-      qualityScore:   data.quality_score?.score ?? existing.qualityScore ?? null,
-      rejectionReason: data.rejected_reason  ?? null,
-    },
+    data:  updateData,
   });
 }
 
