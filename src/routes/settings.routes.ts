@@ -23,6 +23,7 @@ import {
   getIgSubscriptionStatusHandler,
   subscribeIgWebhookHandler,
   unsubscribeIgWebhookHandler,
+  deleteAllChatsHandler,
 } from "../controllers/settings.controller";
 import {
   getHotelFlowsHandler,
@@ -74,6 +75,9 @@ router.patch("/availability/cell",   patchCellHandler);
 router.patch("/availability/bulk",   bulkPatchHandler);
 router.get("/availability/toggle",   getToggleHandler);
 router.patch("/availability/toggle", patchToggleHandler);
+
+// Danger Zone
+router.delete("/chats",            deleteAllChatsHandler);
 
 // Flow definitions (hotel-private + read access to global templates)
 router.get("/flows",           getHotelFlowsHandler);

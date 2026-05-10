@@ -22,6 +22,7 @@ import {
   updatePlatformSettings,
 } from "../services/settings.service";
 import { invalidatePromptCache } from "../services/ai.service";
+import prisma from "../db/connect";
 
 function hotelId(req: Request): string {
   return (req as any).user.hotelId;
@@ -258,6 +259,19 @@ export async function unsubscribeIgWebhookHandler(req: Request, res: Response) {
   } catch (err: any) {
     const status = err.message === "Instagram not connected" ? 400 : 502;
     res.status(status).json({ error: err.message });
+  }
+}
+
+// ── Danger Zone ───────────────────────────────────────────────────────────────
+
+export async function deleteAllChatsHandler(req: Request, res: Response) {
+  try {
+    const result = await prisma.message.deleteMany({
+      where: { hotelId: hotelId(req) },
+    });
+    res.json({ success: true, deletedMessages: result.count });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
 }
 
