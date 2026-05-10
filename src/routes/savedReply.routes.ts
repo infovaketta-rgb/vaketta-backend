@@ -63,7 +63,7 @@ router.post("/", async (req: Request, res: Response) => {
 // PUT /saved-replies/:id — update
 router.put("/:id", async (req: Request, res: Response) => {
   const hotelId = (req as any).user.hotelId as string;
-  const { id } = req.params;
+  const id      = req.params["id"] as string;
   const { name, category, body } = req.body;
 
   const existing = await prisma.savedReply.findFirst({ where: { id, hotelId } });
@@ -75,8 +75,8 @@ router.put("/:id", async (req: Request, res: Response) => {
   const reply = await prisma.savedReply.update({
     where: { id },
     data: {
-      ...(name  !== undefined ? { name:     name.trim()            } : {}),
-      ...(body  !== undefined ? { body:     body.trim()            } : {}),
+      ...(name     !== undefined ? { name:     name.trim()             } : {}),
+      ...(body     !== undefined ? { body:     body.trim()             } : {}),
       ...(category !== undefined ? { category: category?.trim() || null } : {}),
     },
   });
@@ -86,7 +86,7 @@ router.put("/:id", async (req: Request, res: Response) => {
 // DELETE /saved-replies/:id
 router.delete("/:id", async (req: Request, res: Response) => {
   const hotelId = (req as any).user.hotelId as string;
-  const { id } = req.params;
+  const id      = req.params["id"] as string;
 
   const existing = await prisma.savedReply.findFirst({ where: { id, hotelId } });
   if (!existing) return res.status(404).json({ error: "Saved reply not found" });
