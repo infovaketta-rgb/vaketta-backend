@@ -214,6 +214,7 @@ export async function connectWhatsAppEmbeddedSignup(
   if (!appId || !appSecret) throw new Error("Facebook app credentials not configured");
 
   // 1. Exchange authorisation code for access token
+  console.log("[embedded-signup] Exchanging code for token...");
   const tokenRes = await fetch("https://graph.facebook.com/v25.0/oauth/access_token", {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
@@ -230,23 +231,32 @@ export async function connectWhatsAppEmbeddedSignup(
     throw new Error(tokenData?.error?.message ?? "Failed to exchange code for access token");
   }
   const accessToken = String(tokenData.access_token);
+  console.log("[embedded-signup] Token exchanged successfully");
 
   // 2. Subscribe the WABA to the app so webhook events are delivered
+  console.log("[webhook-sub] Subscribing WABA to webhook fields...");
   const subRes = await fetch(
     `https://graph.facebook.com/v25.0/${wabaId}/subscribed_apps`,
     { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } }
   );
   const subData = await subRes.json() as any;
+  console.log("[webhook-sub] Response:", subRes.status, JSON.stringify(subData));
   if (!subRes.ok) {
     throw new Error(subData?.error?.message ?? "Failed to subscribe WABA to app");
   }
 
-  // 2b. Also subscribe to Coexistence history fields (best-effort — never throw)
-  fetch(
-    `https://graph.facebook.com/v25.0/${wabaId}/subscribed_apps` +
-    `?subscribed_fields=history,smb_message_echoes`,
-    { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } }
-  ).catch(() => { /* best-effort — coexistence fields may not be available on all WABAs */ });
+  // 2b. Subscribe to Coexistence history fields — best-effort, never throws
+  try {
+    const coexRes = await fetch(
+      `https://graph.facebook.com/v25.0/${wabaId}/subscribed_apps` +
+      `?subscribed_fields=messages,message_status_updates,history,smb_message_echoes,smb_app_state_sync`,
+      { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    const coexData = await coexRes.json() as any;
+    console.log("[webhook-sub] Coexistence fields subscription:", coexRes.status, JSON.stringify(coexData));
+  } catch (err) {
+    console.error("[webhook-sub] Coexistence fields subscription threw:", err);
+  }
 
   // 3. Persist encrypted token (hotelId always from JWT, never from request body)
   await prisma.hotelConfig.upsert({
@@ -265,20 +275,41 @@ export async function connectWhatsAppEmbeddedSignup(
       metaTokenUpdatedAt:       new Date(),
     },
   });
+  console.log("[embedded-signup] Credentials saved for hotel:", hotelId);
 
-  // Request history sync from Meta — best-effort, never throws.
-  // If the WABA supports Coexistence, Meta will start delivering history webhook
-  // chunks.  If it doesn't support it, Meta returns an error which we silently
-  // ignore so normal (non-Coexistence) signups are unaffected.
-  fetch(
-    `https://graph.facebook.com/v25.0/${phoneNumberId}/smb_app_data`,
-    {
-      method:  "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
-      body:    JSON.stringify({ messaging_product: "whatsapp", sync_type: "history" }),
+  // 4. Trigger history sync — wrapped in its own try/catch that ALWAYS logs
+  try {
+    console.log("[history] Calling smb_app_data for phoneNumberId:", phoneNumberId);
+    const smbRes = await fetch(
+      `https://graph.facebook.com/v25.0/${phoneNumberId}/smb_app_data`,
+      {
+        method:  "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+        body:    JSON.stringify({ messaging_product: "whatsapp", sync_type: "history" }),
+      }
+    );
+    const smbBody = await smbRes.json() as any;
+    console.log("[history] smb_app_data response:", smbRes.status, JSON.stringify(smbBody));
+
+    if (smbRes.ok) {
+      await prisma.hotel.update({
+        where: { id: hotelId },
+        data: {
+          historySyncStatus:  "pending",
+          historySyncStarted: new Date(),
+        },
+      });
+      console.log("[history] Sync triggered successfully for hotel:", hotelId);
+    } else {
+      console.log("[history] Not coexistence eligible:", smbBody?.error?.message);
     }
-  ).catch(() => { /* best-effort — not all WABAs support Coexistence */ });
+  } catch (err) {
+    // Never let this block the main response — but always log
+    console.error("[history] smb_app_data call threw an error:", err);
+  }
 
+  // 5. Return success response to frontend
+  console.log("[embedded-signup] Onboarding complete for hotel:", hotelId);
   return { phoneNumberId, wabaId };
 }
 
