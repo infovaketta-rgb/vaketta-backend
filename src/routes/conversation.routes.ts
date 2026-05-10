@@ -1,4 +1,4 @@
-import { Router, Request, Response } from "express";
+import { Router, Request, Response, json as expressJson } from "express";
 import { getConversations, updateGuestName } from "../controllers/conversation.controller";
 import { normalizePhone } from "../utils/phone";
 import prisma from "../db/connect";
@@ -11,8 +11,14 @@ router.patch("/:guestId", updateGuestName);
 // ── DELETE /conversations/bulk ────────────────────────────────────────────────
 // Must be declared BEFORE /:guestId so Express doesn't treat "bulk" as a guestId.
 // body: { guestIds: string[], action: "delete" | "clear" }
-router.delete("/bulk", async (req: Request, res: Response) => {
+router.delete("/bulk", expressJson({ strict: false, limit: "1mb" }), async (req: Request, res: Response) => {
   const hotelId = (req as any).user.hotelId as string;
+
+  // Guard against unparsed body (body parser may not run for DELETE on some setups)
+  if (!req.body || typeof req.body !== "object") {
+    return res.status(400).json({ error: "Request body is missing or not JSON" });
+  }
+
   const { guestIds, action } = req.body as { guestIds?: string[]; action?: string };
 
   if (!Array.isArray(guestIds) || guestIds.length === 0) {
