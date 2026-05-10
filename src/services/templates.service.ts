@@ -343,17 +343,43 @@ export async function sendTemplateMessage(
     });
   }
 
-  // Header text variables — supports both positional and named.
-  // Frontend currently doesn't ask for header values, so we resolve from `values[id]`
-  // (named) or `values["header_1"]` (legacy positional fallback).
-  if (components.header?.format === "TEXT" && components.header.text) {
-    const headerIds = extractVarIds(components.header.text);
-    if (headerIds.length > 0) {
+  // Header — supports TEXT (with text variables) and IMAGE/VIDEO/DOCUMENT (with media link).
+  const header = components.header;
+  if (header) {
+    const format = header.format ?? header.type;
+
+    if (format === "TEXT" && header.text) {
+      const headerIds = extractVarIds(header.text);
+      if (headerIds.length > 0) {
+        sendComponents.push({
+          type: "header",
+          parameters: buildTextParams(headerIds, (id) =>
+            values[id] ?? values[`header_${id}`] ?? values["header_1"] ?? ""
+          ),
+        });
+      }
+    } else if (format === "IMAGE" || format === "VIDEO" || format === "DOCUMENT") {
+      // Resolve a sendable media URL: explicit user-provided override → Vaketta-stored
+      // mediaUrl → Meta's sample URL captured at sync time. Meta's sample CDN URLs are
+      // typically valid HTTPS links; opaque upload handles (no http prefix) cannot be
+      // used in send calls and are skipped.
+      const provided   = values["header_image"] ?? values["header_video"] ?? values["header_document"] ?? values["header_media"];
+      const stored     = header.mediaUrl ?? header.sampleUrl;
+      const link       = (provided && provided.startsWith("http")) ? provided
+                        : (stored   && stored.startsWith("http"))   ? stored
+                        : null;
+
+      if (!link) {
+        throw Object.assign(
+          new Error(`Template "${template.name}" requires a ${format.toLowerCase()} header but no media URL is available. Please re-sync the template from Meta or upload header media.`),
+          { status: 400 }
+        );
+      }
+
+      const mediaKey = format.toLowerCase(); // "image" | "video" | "document"
       sendComponents.push({
         type: "header",
-        parameters: buildTextParams(headerIds, (id) =>
-          values[id] ?? values[`header_${id}`] ?? values["header_1"] ?? ""
-        ),
+        parameters: [{ type: mediaKey, [mediaKey]: { link } }],
       });
     }
   }
