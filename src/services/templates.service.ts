@@ -33,12 +33,18 @@ export function parseMetaComponents(metaComponents: any[]): any {
         };
         break;
 
-      case "BODY":
+      case "BODY": {
+        const namedExamples: Record<string, string> = {};
+        for (const e of comp.example?.body_text_named_params ?? []) {
+          if (e?.param_name) namedExamples[e.param_name] = e.example ?? "";
+        }
         result.body = {
           text:     comp.text ?? "",
           examples: comp.example?.body_text?.[0] ?? [],
+          ...(Object.keys(namedExamples).length > 0 && { namedExamples }),
         };
         break;
+      }
 
       case "FOOTER":
         result.footer = { text: comp.text ?? "" };
@@ -321,13 +327,24 @@ export async function sendTemplateMessage(
     sendComponents.push({ type: "header", parameters: [{ type: "text", text: values["header_1"] ?? "" }] });
   }
 
-  // Body variables — TemplatePicker sends keys "1", "2", … matching {{1}}, {{2}}
-  const bodyVarCount = (components.body?.text ?? "").match(/\{\{(\d+)\}\}/g)?.length ?? 0;
-  if (bodyVarCount > 0) {
-    const params = Array.from({ length: bodyVarCount }, (_, i) => ({
-      type: "text",
-      text: values[String(i + 1)] ?? "",
-    }));
+  // Body variables — supports both positional ({{1}}) and named ({{guestname}}) formats.
+  // TemplatePicker sends keys matching the variable identifiers in the body text.
+  const bodyText = components.body?.text ?? "";
+  const bodyVarRe = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
+  const bodyVarIds: string[] = [];
+  const seenBodyVars = new Set<string>();
+  let bv: RegExpExecArray | null;
+  while ((bv = bodyVarRe.exec(bodyText)) !== null) {
+    const id = bv[1]!;
+    if (!seenBodyVars.has(id)) { seenBodyVars.add(id); bodyVarIds.push(id); }
+  }
+  if (bodyVarIds.length > 0) {
+    const params = bodyVarIds.map((id) => {
+      const isNamed = !/^\d+$/.test(id);
+      return isNamed
+        ? { type: "text", parameter_name: id, text: values[id] ?? "" }
+        : { type: "text", text: values[id] ?? "" };
+    });
     sendComponents.push({ type: "body", parameters: params });
   }
 
@@ -372,8 +389,8 @@ export async function sendTemplateMessage(
 
   // Render the body text so the bubble shows the actual message content
   const renderedBody = (components.body?.text ?? template.name).replace(
-    /\{\{(\d+)\}\}/g,
-    (_: string, n: string) => values[n] ?? `{{${n}}}`
+    /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g,
+    (_: string, id: string) => values[id] ?? `{{${id}}}`
   );
 
   // Persist so the chat thread shows the outbound bubble immediately

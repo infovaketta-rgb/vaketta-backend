@@ -229,8 +229,16 @@ async function sendBookingConfirmationTemplate(
   const vm         = ((template as any).variableMapping ?? {}) as Record<string, string>;
   const components = template.components as { body?: { text?: string } };
   const bodyText   = components?.body?.text ?? "";
-  const varCount   = (bodyText.match(/\{\{\d+\}\}/g) ?? []).length;
-  if (varCount === 0) return;
+
+  const varRe = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
+  const varIds: string[] = [];
+  const seen = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = varRe.exec(bodyText)) !== null) {
+    const id = m[1]!;
+    if (!seen.has(id)) { seen.add(id); varIds.push(id); }
+  }
+  if (varIds.length === 0) return;
 
   function fmtDate(d: Date): string {
     return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
@@ -248,7 +256,7 @@ async function sendBookingConfirmationTemplate(
   };
 
   // Position-based defaults when no explicit mapping is set
-  const DEFAULTS: Record<number, string> = {
+  const POS_DEFAULTS: Record<number, string> = {
     1: "guest.name",
     2: "booking.checkIn",
     3: "booking.checkOut",
@@ -256,10 +264,27 @@ async function sendBookingConfirmationTemplate(
     5: "booking.referenceNumber",
   };
 
+  // Named-variable name → context-field heuristic
+  const NAME_DEFAULTS: Record<string, string> = {
+    guestname: "guest.name", guest_name: "guest.name", name: "guest.name",
+    phone: "guest.phone", guestphone: "guest.phone", guest_phone: "guest.phone",
+    checkin: "booking.checkIn", check_in: "booking.checkIn",
+    checkout: "booking.checkOut", check_out: "booking.checkOut",
+    roomtype: "booking.roomTypeName", room_type: "booking.roomTypeName", room: "booking.roomTypeName",
+    reference: "booking.referenceNumber", referencenumber: "booking.referenceNumber",
+    bookingref: "booking.referenceNumber", bookingid: "booking.referenceNumber",
+    status: "booking.status", bookingstatus: "booking.status",
+    hotel: "hotel.name", hotelname: "hotel.name", hotel_name: "hotel.name",
+  };
+
   const values: Record<string, string> = {};
-  for (let i = 1; i <= varCount; i++) {
-    const key = vm[String(i)] ?? DEFAULTS[i] ?? "";
-    values[String(i)] = ctx[key] ?? "";
+  for (const id of varIds) {
+    let key = vm[id];
+    if (!key) {
+      if (/^\d+$/.test(id)) key = POS_DEFAULTS[parseInt(id, 10)] ?? "";
+      else                  key = NAME_DEFAULTS[id.toLowerCase()] ?? "";
+    }
+    values[id] = ctx[key] ?? "";
   }
 
   await sendTemplateMessage(hotelId, guestId, template.id, values);
@@ -1182,13 +1207,20 @@ export async function executeFlowStep(
 
         const components = template.components as { body?: { text?: string } };
         const bodyText   = components?.body?.text ?? "";
-        const varCount   = (bodyText.match(/\{\{\d+\}\}/g) ?? []).length;
-        const vm         = ((d.variableMapping ?? {}) as Record<string, string>);
+        const tplVarRe   = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
+        const tplVarIds: string[] = [];
+        const tplSeen = new Set<string>();
+        let tm: RegExpExecArray | null;
+        while ((tm = tplVarRe.exec(bodyText)) !== null) {
+          const id = tm[1]!;
+          if (!tplSeen.has(id)) { tplSeen.add(id); tplVarIds.push(id); }
+        }
+        const vm = ((d.variableMapping ?? {}) as Record<string, string>);
 
         const values: Record<string, string> = {};
-        for (let i = 1; i <= varCount; i++) {
-          const flowVarName = vm[String(i)] ?? "";
-          values[String(i)] = flowVarName
+        for (const id of tplVarIds) {
+          const flowVarName = vm[id] ?? "";
+          values[id] = flowVarName
             ? (flowData.flowVars[flowVarName] ?? interpolate(flowVarName, flowData.flowVars))
             : "";
         }
