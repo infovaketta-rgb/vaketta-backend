@@ -357,7 +357,9 @@ export async function uploadHeaderMediaToMeta(
   const form = new FormData();
   form.append("messaging_product", "whatsapp");
   form.append("type", mimeType);
-  form.append("file", new Blob([fileBuffer], { type: mimeType }), "header-media");
+  // Wrap in Uint8Array so the Blob constructor accepts it under recent @types/node
+  // (Buffer's underlying ArrayBufferLike isn't assignable to BlobPart directly).
+  form.append("file", new Blob([new Uint8Array(fileBuffer)], { type: mimeType }), "header-media");
 
   const metaRes = await fetch(
     `https://graph.facebook.com/v23.0/${phoneNumberId}/media`,
