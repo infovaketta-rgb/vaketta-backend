@@ -567,6 +567,14 @@ model WhatsAppTemplate {
   rejectionReason String?
   components       Json
   variableMapping  Json?           // e.g. {"1":"guest.name","2":"booking.checkIn"}
+
+  // Header media kept as top-level columns so the send path can include the
+  // header component without round-tripping through the JSON blob. headerHandle
+  // is the persistent value Meta returns in components[HEADER].example.header_handle[0]
+  // after approval; reusable as image/video/document.id at send time.
+  headerFormat     String?         // "IMAGE" | "VIDEO" | "DOCUMENT" | "TEXT" | null
+  headerHandle     String?
+
   allowCategoryChange Boolean      @default(true)
   ttlSeconds      Int?
   editCount       Int              @default(0)

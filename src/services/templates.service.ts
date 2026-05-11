@@ -17,6 +17,19 @@ async function getWaCredentials(hotelId: string) {
   return { wabaId: config.metaWabaId, accessToken, phoneNumberId: config.metaPhoneNumberId };
 }
 
+// Pull the header format + persistent media handle out of Meta's raw components
+// response. Stored as top-level columns so the send path can include the header
+// without parsing the JSON components blob.
+function extractHeaderMeta(metaComponents: any[]): { headerFormat: string | null; headerHandle: string | null } {
+  if (!Array.isArray(metaComponents)) return { headerFormat: null, headerHandle: null };
+  const headerComp = metaComponents.find((c: any) => c?.type === "HEADER");
+  if (!headerComp) return { headerFormat: null, headerHandle: null };
+  return {
+    headerFormat: headerComp.format ?? null,
+    headerHandle: headerComp.example?.header_handle?.[0] ?? null,
+  };
+}
+
 // ── Meta → internal component parser ─────────────────────────────────────────
 
 export function parseMetaComponents(metaComponents: any[]): any {
@@ -180,6 +193,11 @@ export async function createTemplate(hotelId: string, data: any) {
     throw err;
   }
 
+  // Persist the header format up-front so the send path knows the shape. The
+  // persistent header_handle isn't known until Meta returns it on a subsequent
+  // GET (after approval), so headerHandle is filled in by syncTemplate.
+  const headerFormat = data.components?.header?.format ?? data.components?.header?.type ?? null;
+
   return prisma.whatsAppTemplate.create({
     data: {
       hotelId,
@@ -189,6 +207,7 @@ export async function createTemplate(hotelId: string, data: any) {
       status:             "PENDING",
       metaTemplateId:     String(metaData.id),
       components:         data.components,
+      headerFormat,
       allowCategoryChange: data.allowCategoryChange ?? true,
       ttlSeconds:         data.ttlSeconds ?? null,
     },
@@ -287,6 +306,9 @@ export async function syncTemplate(hotelId: string, templateId: string) {
 
   if (Array.isArray(data.components) && data.components.length > 0) {
     updateData.components = parseMetaComponents(data.components);
+    const { headerFormat, headerHandle } = extractHeaderMeta(data.components);
+    updateData.headerFormat = headerFormat;
+    updateData.headerHandle = headerHandle;
   }
 
   return prisma.whatsAppTemplate.update({
@@ -343,48 +365,43 @@ export async function sendTemplateMessage(
     });
   }
 
-  // Header — supports TEXT (with text variables) and IMAGE/VIDEO/DOCUMENT (with media link).
-  const header = components.header;
-  if (header) {
-    const format = header.format ?? header.type;
+  // Header — supports TEXT (with text variables) and IMAGE/VIDEO/DOCUMENT.
+  // Format comes from the top-level column (populated on sync); fall back to the
+  // components JSON for templates that pre-date the migration.
+  const header = components.header ?? {};
+  const headerFormat = template.headerFormat ?? header.format ?? header.type;
 
-    if (format === "TEXT" && header.text) {
-      const headerIds = extractVarIds(header.text);
-      if (headerIds.length > 0) {
-        sendComponents.push({
-          type: "header",
-          parameters: buildTextParams(headerIds, (id) =>
-            values[id] ?? values[`header_${id}`] ?? values["header_1"] ?? ""
-          ),
-        });
-      }
-    } else if (format === "IMAGE" || format === "VIDEO" || format === "DOCUMENT") {
-      // Resolve a sendable media URL. Priority:
-      //   1. Send-time override from values[]
-      //   2. Vaketta-stored mediaUrl (uploaded via our gallery, publicly fetchable)
-      //
-      // We deliberately do NOT fall back to header.sampleUrl. That field is populated
-      // from Meta's example.header_handle during sync — it is either an opaque upload
-      // handle (only valid during template creation) or a scontent.whatsapp.net CDN URL
-      // that expires. Passing either as a send-time `link` causes Meta to reject the send.
-      //
-      // When no usable link is available, we omit the header component entirely. For
-      // approved templates with a static header, Meta renders the approved sample image
-      // automatically. To send a dynamic header image, upload the media via
-      // POST /{phoneNumberId}/media first and pass the returned id (not implemented here).
-      const provided = values["header_image"] ?? values["header_video"] ?? values["header_document"] ?? values["header_media"];
-      const link =
-        provided && provided.startsWith("http")           ? provided :
-        header.mediaUrl && header.mediaUrl.startsWith("http") ? header.mediaUrl :
-        null;
+  if (headerFormat === "TEXT" && header.text) {
+    const headerIds = extractVarIds(header.text);
+    if (headerIds.length > 0) {
+      sendComponents.push({
+        type: "header",
+        parameters: buildTextParams(headerIds, (id) =>
+          values[id] ?? values[`header_${id}`] ?? values["header_1"] ?? ""
+        ),
+      });
+    }
+  } else if (headerFormat === "IMAGE" || headerFormat === "VIDEO" || headerFormat === "DOCUMENT") {
+    // Resolve the media reference. Priority:
+    //   1. Send-time override URL from values[] → `link`
+    //   2. template.headerHandle (persistent handle from Meta sync) → `id`
+    //   3. Vaketta-stored mediaUrl (publicly hosted) → `link`
+    // Otherwise omit the header — Meta renders the approved sample image automatically
+    // for static templates.
+    const mediaKey = headerFormat.toLowerCase(); // "image" | "video" | "document"
+    const provided = values["header_image"] ?? values["header_video"] ?? values["header_document"] ?? values["header_media"];
 
-      if (link) {
-        const mediaKey = format.toLowerCase(); // "image" | "video" | "document"
-        sendComponents.push({
-          type: "header",
-          parameters: [{ type: mediaKey, [mediaKey]: { link } }],
-        });
-      }
+    let mediaParam: any = null;
+    if (provided && provided.startsWith("http")) {
+      mediaParam = { type: mediaKey, [mediaKey]: { link: provided } };
+    } else if (template.headerHandle) {
+      mediaParam = { type: mediaKey, [mediaKey]: { id: template.headerHandle } };
+    } else if (header.mediaUrl && header.mediaUrl.startsWith("http")) {
+      mediaParam = { type: mediaKey, [mediaKey]: { link: header.mediaUrl } };
+    }
+
+    if (mediaParam) {
+      sendComponents.push({ type: "header", parameters: [mediaParam] });
     }
   }
 
@@ -485,15 +502,23 @@ export async function syncPendingTemplates() {
       if (!t.metaTemplateId || !t.hotel.config?.metaAccessTokenEncrypted) continue;
       const accessToken = decryptWhatsAppToken(t.hotel.config.metaAccessTokenEncrypted);
       const res = await fetch(
-        `https://graph.facebook.com/v23.0/${t.metaTemplateId}?fields=status,quality_score,rejected_reason`,
+        `https://graph.facebook.com/v23.0/${t.metaTemplateId}?fields=status,quality_score,rejected_reason,components`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       const data = await res.json() as any;
       if (res.ok && data.status) {
-        await prisma.whatsAppTemplate.update({
-          where: { id: t.id },
-          data:  { status: data.status, qualityScore: data.quality_score?.score ?? null, rejectionReason: data.rejected_reason ?? null },
-        });
+        const update: any = {
+          status:          data.status,
+          qualityScore:    data.quality_score?.score ?? null,
+          rejectionReason: data.rejected_reason ?? null,
+        };
+        if (Array.isArray(data.components) && data.components.length > 0) {
+          update.components = parseMetaComponents(data.components);
+          const { headerFormat, headerHandle } = extractHeaderMeta(data.components);
+          update.headerFormat = headerFormat;
+          update.headerHandle = headerHandle;
+        }
+        await prisma.whatsAppTemplate.update({ where: { id: t.id }, data: update });
       }
     } catch (err) {
       log.warn({ err, templateId: t.id }, "cron sync failed for template");
