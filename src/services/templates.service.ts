@@ -359,28 +359,32 @@ export async function sendTemplateMessage(
         });
       }
     } else if (format === "IMAGE" || format === "VIDEO" || format === "DOCUMENT") {
-      // Resolve a sendable media URL: explicit user-provided override → Vaketta-stored
-      // mediaUrl → Meta's sample URL captured at sync time. Meta's sample CDN URLs are
-      // typically valid HTTPS links; opaque upload handles (no http prefix) cannot be
-      // used in send calls and are skipped.
-      const provided   = values["header_image"] ?? values["header_video"] ?? values["header_document"] ?? values["header_media"];
-      const stored     = header.mediaUrl ?? header.sampleUrl;
-      const link       = (provided && provided.startsWith("http")) ? provided
-                        : (stored   && stored.startsWith("http"))   ? stored
-                        : null;
+      // Resolve a sendable media URL. Priority:
+      //   1. Send-time override from values[]
+      //   2. Vaketta-stored mediaUrl (uploaded via our gallery, publicly fetchable)
+      //
+      // We deliberately do NOT fall back to header.sampleUrl. That field is populated
+      // from Meta's example.header_handle during sync — it is either an opaque upload
+      // handle (only valid during template creation) or a scontent.whatsapp.net CDN URL
+      // that expires. Passing either as a send-time `link` causes Meta to reject the send.
+      //
+      // When no usable link is available, we omit the header component entirely. For
+      // approved templates with a static header, Meta renders the approved sample image
+      // automatically. To send a dynamic header image, upload the media via
+      // POST /{phoneNumberId}/media first and pass the returned id (not implemented here).
+      const provided = values["header_image"] ?? values["header_video"] ?? values["header_document"] ?? values["header_media"];
+      const link =
+        provided && provided.startsWith("http")           ? provided :
+        header.mediaUrl && header.mediaUrl.startsWith("http") ? header.mediaUrl :
+        null;
 
-      if (!link) {
-        throw Object.assign(
-          new Error(`Template "${template.name}" requires a ${format.toLowerCase()} header but no media URL is available. Please re-sync the template from Meta or upload header media.`),
-          { status: 400 }
-        );
+      if (link) {
+        const mediaKey = format.toLowerCase(); // "image" | "video" | "document"
+        sendComponents.push({
+          type: "header",
+          parameters: [{ type: mediaKey, [mediaKey]: { link } }],
+        });
       }
-
-      const mediaKey = format.toLowerCase(); // "image" | "video" | "document"
-      sendComponents.push({
-        type: "header",
-        parameters: [{ type: mediaKey, [mediaKey]: { link } }],
-      });
     }
   }
 
