@@ -400,22 +400,29 @@ export async function sendTemplateMessage(
     }
   } else if (headerFormat === "IMAGE" || headerFormat === "VIDEO" || headerFormat === "DOCUMENT") {
     // Resolve the media reference. Priority:
-    //   1. Send-time override URL from values[] → `link`
-    //   2. template.headerHandle (persistent handle from Meta sync) → `id`
-    //   3. Vaketta-stored mediaUrl (publicly hosted) → `link`
-    // Otherwise omit the header — Meta renders the approved sample image automatically
-    // for static templates.
+    //   1. Send-time override URL from values[] → `link` (dynamic per-booking imagery)
+    //   2. Numeric media id stored in template.headerHandle → `id` (from POST /{phoneNumberId}/media)
+    //   3. Vaketta-stored mediaUrl on our own CDN → `link`
+    //
+    // For static templates approved with a sample image, Meta's GET response returns
+    // a scontent.whatsapp.net CDN URL in example.header_handle[0]. That value is NOT
+    // a numeric media id — passing it as `image.id` is rejected by Meta with a JSON
+    // schema error (expected: [integer, null]). It is also not reliable as `link`
+    // since the URL expires. The correct behaviour is to omit the header component
+    // entirely; Meta then renders the approved sample image automatically.
     const mediaKey = headerFormat.toLowerCase(); // "image" | "video" | "document"
     const provided = values["header_image"] ?? values["header_video"] ?? values["header_document"] ?? values["header_media"];
 
     let mediaParam: any = null;
     if (provided && provided.startsWith("http")) {
       mediaParam = { type: mediaKey, [mediaKey]: { link: provided } };
-    } else if (template.headerHandle) {
+    } else if (template.headerHandle && /^\d+$/.test(template.headerHandle)) {
+      // Numeric handle → reusable Meta media id from the /media upload endpoint
       mediaParam = { type: mediaKey, [mediaKey]: { id: template.headerHandle } };
     } else if (header.mediaUrl && header.mediaUrl.startsWith("http")) {
       mediaParam = { type: mediaKey, [mediaKey]: { link: header.mediaUrl } };
     }
+    // else: scontent CDN URL or unrecognised value — omit header, let Meta render the sample
 
     if (mediaParam) {
       sendComponents.push({ type: "header", parameters: [mediaParam] });
