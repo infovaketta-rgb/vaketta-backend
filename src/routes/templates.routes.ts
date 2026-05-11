@@ -7,6 +7,7 @@ import {
   deleteTemplate,
   syncTemplate,
   parseMetaComponents,
+  extractHeaderMeta,
 } from "../services/templates.service";
 import { uploadToR2 } from "../services/r2.service";
 import prisma from "../db/connect";
@@ -166,6 +167,16 @@ router.post("/sync-from-meta", async (req: Request, res: Response) => {
         : score ? "UNKNOWN" : null;
 
       const components = parseMetaComponents(t.components ?? []);
+      const { headerFormat, headerHandle } = extractHeaderMeta(t.components ?? []);
+
+      // DIAGNOSTIC: dump per-template what Meta returned for the HEADER component
+      // and what we extracted. Remove once headerFormat/headerHandle persistence is confirmed.
+      const rawHeader = Array.isArray(t.components)
+        ? t.components.find((c: any) => c?.type === "HEADER")
+        : null;
+      console.log("[sync-from-meta] template:", t.name, "lang:", t.language);
+      console.log("[sync-from-meta]   raw HEADER component:", JSON.stringify(rawHeader, null, 2));
+      console.log("[sync-from-meta]   extracted headerFormat:", headerFormat, "headerHandle:", headerHandle);
 
       const existing = await prisma.whatsAppTemplate.findUnique({
         where: { hotelId_name_language: { hotelId: hid, name: t.name, language: t.language } },
@@ -183,6 +194,8 @@ router.post("/sync-from-meta", async (req: Request, res: Response) => {
           qualityScore,
           rejectionReason:  t.rejected_reason ?? null,
           components,
+          headerFormat,
+          headerHandle,
         },
         update: {
           status:          status as any,
@@ -190,6 +203,8 @@ router.post("/sync-from-meta", async (req: Request, res: Response) => {
           qualityScore,
           rejectionReason: t.rejected_reason ?? null,
           components,
+          headerFormat,
+          headerHandle,
         },
       });
 

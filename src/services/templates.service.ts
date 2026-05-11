@@ -20,7 +20,7 @@ async function getWaCredentials(hotelId: string) {
 // Pull the header format + persistent media handle out of Meta's raw components
 // response. Stored as top-level columns so the send path can include the header
 // without parsing the JSON components blob.
-function extractHeaderMeta(metaComponents: any[]): { headerFormat: string | null; headerHandle: string | null } {
+export function extractHeaderMeta(metaComponents: any[]): { headerFormat: string | null; headerHandle: string | null } {
   if (!Array.isArray(metaComponents)) return { headerFormat: null, headerHandle: null };
   const headerComp = metaComponents.find((c: any) => c?.type === "HEADER");
   if (!headerComp) return { headerFormat: null, headerHandle: null };
@@ -298,6 +298,21 @@ export async function syncTemplate(hotelId: string, templateId: string) {
   );
   const data = await metaRes.json() as any;
 
+  // DIAGNOSTIC: dump everything Meta sent back so we can see whether
+  // example.header_handle[0] is present, absent, or under a different path.
+  console.log("[sync-debug] templateName:", existing.name);
+  console.log("[sync-debug] metaTemplateId:", existing.metaTemplateId);
+  console.log("[sync-debug] HTTP status:", metaRes.status);
+  console.log("[sync-debug] raw Meta GET response:", JSON.stringify(data, null, 2));
+  console.log("[sync-debug] components (raw):", JSON.stringify(data?.components, null, 2));
+  const headerComp = Array.isArray(data?.components)
+    ? data.components.find((c: any) => c?.type === "HEADER")
+    : null;
+  console.log("[sync-debug] HEADER component:", JSON.stringify(headerComp, null, 2));
+  console.log("[sync-debug] headerComp.format:", headerComp?.format);
+  console.log("[sync-debug] headerComp.example:", JSON.stringify(headerComp?.example, null, 2));
+  console.log("[sync-debug] header_handle[0]:", headerComp?.example?.header_handle?.[0]);
+
   const updateData: any = {
     status:          (data.status ?? existing.status) as TemplateStatus,
     qualityScore:    data.quality_score?.score ?? existing.qualityScore ?? null,
@@ -310,6 +325,8 @@ export async function syncTemplate(hotelId: string, templateId: string) {
     updateData.headerFormat = headerFormat;
     updateData.headerHandle = headerHandle;
   }
+
+  console.log("[sync-debug] Prisma update payload:", JSON.stringify(updateData, null, 2));
 
   return prisma.whatsAppTemplate.update({
     where: { id: templateId },
