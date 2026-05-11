@@ -8,6 +8,7 @@ import {
   syncTemplate,
   parseMetaComponents,
   extractHeaderMeta,
+  uploadHeaderMediaToMeta,
 } from "../services/templates.service";
 import { uploadToR2 } from "../services/r2.service";
 import prisma from "../db/connect";
@@ -225,6 +226,26 @@ router.post("/upload-media", mediaUpload.single("file"), async (req: Request, re
     res.json({ url: result.url, key: result.key });
   } catch (err: any) {
     res.status(err.status ?? 500).json({ error: err.message });
+  }
+});
+
+// POST /hotel-templates/:id/attach-header-media — upload header image/video/document
+// to Meta's /media endpoint and persist the returned numeric id as headerHandle.
+// Required for IMAGE/VIDEO/DOCUMENT templates: Meta rejects sends with no header
+// parameter (error 132012), and scontent URLs from Meta sync aren't usable as
+// image.id or image.link.
+router.post("/:id/attach-header-media", mediaUpload.single("file"), async (req: Request, res: Response) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const result = await uploadHeaderMediaToMeta(
+      hotelId(req),
+      req.params["id"]!,
+      req.file.buffer,
+      req.file.mimetype,
+    );
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message, details: err.details });
   }
 });
 

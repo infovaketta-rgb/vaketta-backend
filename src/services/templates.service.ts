@@ -334,6 +334,54 @@ export async function syncTemplate(hotelId: string, templateId: string) {
   });
 }
 
+// ── Upload header media to Meta /media ────────────────────────────────────────
+
+// Uploads a file to Meta's /{phoneNumberId}/media endpoint and stashes the
+// returned numeric id on the template as headerHandle. Subsequent template
+// sends use that id via image.id / video.id / document.id.
+//
+// Meta retains uploaded media for 30 days from last use. For templates that
+// are sent regularly (e.g. booking_confirmation) the asset effectively never
+// expires; for rarely-sent templates the user must re-attach when the id stales.
+export async function uploadHeaderMediaToMeta(
+  hotelId:    string,
+  templateId: string,
+  fileBuffer: Buffer,
+  mimeType:   string,
+) {
+  const template = await prisma.whatsAppTemplate.findFirst({ where: { id: templateId, hotelId } });
+  if (!template) throw Object.assign(new Error("Template not found"), { status: 404 });
+
+  const { accessToken, phoneNumberId } = await getWaCredentials(hotelId);
+
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("type", mimeType);
+  form.append("file", new Blob([fileBuffer], { type: mimeType }), "header-media");
+
+  const metaRes = await fetch(
+    `https://graph.facebook.com/v23.0/${phoneNumberId}/media`,
+    { method: "POST", headers: { Authorization: `Bearer ${accessToken}` }, body: form }
+  );
+  const data = await metaRes.json() as any;
+  if (!metaRes.ok || !data?.id) {
+    log.warn({ templateName: template.name, metaError: data?.error }, "[templates] Meta /media upload failed");
+    throw Object.assign(
+      new Error(data?.error?.message ?? "Meta media upload failed"),
+      { status: 502, details: data?.error }
+    );
+  }
+  const mediaId = String(data.id);
+
+  await prisma.whatsAppTemplate.update({
+    where: { id: templateId },
+    data:  { headerHandle: mediaId },
+  });
+
+  log.info({ templateName: template.name, mediaId }, "[templates] header media uploaded to Meta");
+  return { mediaId };
+}
+
 // ── Send via WhatsApp Cloud API ───────────────────────────────────────────────
 
 export async function sendTemplateMessage(
@@ -417,16 +465,27 @@ export async function sendTemplateMessage(
     if (provided && provided.startsWith("http")) {
       mediaParam = { type: mediaKey, [mediaKey]: { link: provided } };
     } else if (template.headerHandle && /^\d+$/.test(template.headerHandle)) {
-      // Numeric handle → reusable Meta media id from the /media upload endpoint
+      // Numeric handle → reusable Meta media id from POST /{phoneNumberId}/media
       mediaParam = { type: mediaKey, [mediaKey]: { id: template.headerHandle } };
     } else if (header.mediaUrl && header.mediaUrl.startsWith("http")) {
       mediaParam = { type: mediaKey, [mediaKey]: { link: header.mediaUrl } };
     }
-    // else: scontent CDN URL or unrecognised value — omit header, let Meta render the sample
 
-    if (mediaParam) {
-      sendComponents.push({ type: "header", parameters: [mediaParam] });
+    if (!mediaParam) {
+      // Meta REQUIRES the header parameter for IMAGE/VIDEO/DOCUMENT templates
+      // (omitting it returns error 132012 "received UNKNOWN"). The scontent URL
+      // synced from Meta's example.header_handle is not usable here. Force the
+      // caller to attach a usable media asset first.
+      throw Object.assign(
+        new Error(
+          `Template "${template.name}" has an ${headerFormat} header but no usable media is attached. ` +
+          `Upload header media via POST /hotel-templates/${template.id}/attach-header-media, then retry the send.`
+        ),
+        { status: 400 }
+      );
     }
+
+    sendComponents.push({ type: "header", parameters: [mediaParam] });
   }
 
   // Body variables — supports both positional ({{1}}) and named ({{guestname}}) formats.
