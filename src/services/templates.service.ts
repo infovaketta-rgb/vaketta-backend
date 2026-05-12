@@ -594,17 +594,40 @@ export async function sendTemplateMessage(
 
   log.info({ templateName: template.name, payload }, "[templates] sending template message to Meta");
 
-  const metaRes = await fetch(
-    `https://graph.facebook.com/v23.0/${phoneNumberId}/messages`,
-    {
-      method:  "POST",
-      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-      body:    JSON.stringify(payload),
+  // Hard 30s ceiling on the Meta call. Without this, a stalled request hangs
+  // until the platform's own (much longer) socket timeout fires — meanwhile
+  // the frontend gives up and the user sees a misleading "failed" toast.
+  const controller = new AbortController();
+  const timeoutId  = setTimeout(() => controller.abort(), 30_000);
+  const startedAt  = Date.now();
+
+  let metaRes: Response;
+  try {
+    metaRes = await fetch(
+      `https://graph.facebook.com/v23.0/${phoneNumberId}/messages`,
+      {
+        method:  "POST",
+        headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+        body:    JSON.stringify(payload),
+        signal:  controller.signal,
+      }
+    );
+  } catch (err: any) {
+    if (err?.name === "AbortError") {
+      log.warn({ templateName: template.name, elapsedMs: Date.now() - startedAt }, "[templates] Meta template send timed out");
+      throw Object.assign(
+        new Error("Meta did not respond within 30s — please retry"),
+        { status: 504 }
+      );
     }
-  );
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
   const metaData = await metaRes.json() as any;
   if (!metaRes.ok) {
-    log.warn({ templateName: template.name, payload, metaError: metaData?.error }, "[templates] Meta rejected template send");
+    log.warn({ templateName: template.name, payload, metaError: metaData?.error, elapsedMs: Date.now() - startedAt }, "[templates] Meta rejected template send");
     throw Object.assign(
       new Error(metaData?.error?.message ?? "Failed to send template message"),
       { status: 502 }
@@ -613,6 +636,8 @@ export async function sendTemplateMessage(
 
   const wamid      = metaData?.messages?.[0]?.id ?? null;
   const fromPhone  = hotel?.phone ?? "";
+
+  log.info({ templateName: template.name, wamid, to: guest.phone, elapsedMs: Date.now() - startedAt }, "[templates] Meta accepted template send");
 
   // Render the body text so the bubble shows the actual message content
   const renderedBody = (components.body?.text ?? template.name).replace(
