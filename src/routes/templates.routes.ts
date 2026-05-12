@@ -9,6 +9,7 @@ import {
   parseMetaComponents,
   extractHeaderMeta,
   uploadHeaderMediaToMeta,
+  reattachHeaderMediaFromSample,
 } from "../services/templates.service";
 import { uploadToR2 } from "../services/r2.service";
 import prisma from "../db/connect";
@@ -243,6 +244,20 @@ router.post("/:id/attach-header-media", mediaUpload.single("file"), async (req: 
       req.file.buffer,
       req.file.mimetype,
     );
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(err.status ?? 500).json({ error: err.message, details: err.details });
+  }
+});
+
+// POST /hotel-templates/:id/reattach-header-from-sample — no file upload required.
+// Server fetches the scontent sample URL Meta returned during sync, then re-uploads
+// those bytes to /{phoneNumberId}/media to produce a sendable numeric handle. Use
+// when the original image file isn't on hand. If the scontent URL has expired,
+// re-sync the template first to refresh the signed URL.
+router.post("/:id/reattach-header-from-sample", async (req: Request, res: Response) => {
+  try {
+    const result = await reattachHeaderMediaFromSample(hotelId(req), req.params["id"]!);
     res.json({ success: true, ...result });
   } catch (err: any) {
     res.status(err.status ?? 500).json({ error: err.message, details: err.details });

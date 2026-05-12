@@ -384,6 +384,74 @@ export async function uploadHeaderMediaToMeta(
   return { mediaId };
 }
 
+// Re-attach header media for a template by fetching the scontent sample URL Meta
+// returned during sync, then uploading those bytes to /{phoneNumberId}/media to
+// get a sendable numeric id. Use when the original image file isn't on hand.
+export async function reattachHeaderMediaFromSample(hotelId: string, templateId: string) {
+  const template = await prisma.whatsAppTemplate.findFirst({ where: { id: templateId, hotelId } });
+  if (!template) throw Object.assign(new Error("Template not found"), { status: 404 });
+
+  // The scontent URL lives in two places after sync: the top-level headerHandle
+  // column (if sync ran after the new schema), or components.header.sampleUrl
+  // (always populated by parseMetaComponents).
+  const components = template.components as any;
+  const candidate  = template.headerHandle ?? components?.header?.sampleUrl;
+  if (!candidate || !candidate.startsWith("http")) {
+    throw Object.assign(
+      new Error("No scontent sample URL available for this template. Re-sync from Meta or upload the image directly via /attach-header-media."),
+      { status: 400 }
+    );
+  }
+
+  const { accessToken, phoneNumberId } = await getWaCredentials(hotelId);
+
+  log.info({ templateName: template.name, sampleUrl: candidate }, "[templates] fetching header sample from scontent");
+
+  // scontent URLs are usually public for the duration of their signed window.
+  // If anonymous fetch fails, retry with the WA access token in case Meta has
+  // tightened access on this asset.
+  let imgRes = await fetch(candidate);
+  if (!imgRes.ok) {
+    imgRes = await fetch(candidate, { headers: { Authorization: `Bearer ${accessToken}` } });
+  }
+  if (!imgRes.ok) {
+    throw Object.assign(
+      new Error(`Could not fetch header sample from Meta CDN (HTTP ${imgRes.status}). The URL may have expired — re-sync the template, then retry.`),
+      { status: 502 }
+    );
+  }
+
+  const mimeType   = imgRes.headers.get("content-type") ?? "image/jpeg";
+  const fileBuffer = Buffer.from(await imgRes.arrayBuffer());
+
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("type", mimeType);
+  form.append("file", new Blob([new Uint8Array(fileBuffer)], { type: mimeType }), "header-media");
+
+  const metaRes = await fetch(
+    `https://graph.facebook.com/v23.0/${phoneNumberId}/media`,
+    { method: "POST", headers: { Authorization: `Bearer ${accessToken}` }, body: form }
+  );
+  const data = await metaRes.json() as any;
+  if (!metaRes.ok || !data?.id) {
+    log.warn({ templateName: template.name, metaError: data?.error }, "[templates] Meta /media upload failed in reattach");
+    throw Object.assign(
+      new Error(data?.error?.message ?? "Meta media upload failed"),
+      { status: 502, details: data?.error }
+    );
+  }
+  const mediaId = String(data.id);
+
+  await prisma.whatsAppTemplate.update({
+    where: { id: templateId },
+    data:  { headerHandle: mediaId },
+  });
+
+  log.info({ templateName: template.name, mediaId }, "[templates] header media re-attached from scontent sample");
+  return { mediaId, sourceUrl: candidate, mimeType, bytes: fileBuffer.byteLength };
+}
+
 // ── Send via WhatsApp Cloud API ───────────────────────────────────────────────
 
 export async function sendTemplateMessage(
