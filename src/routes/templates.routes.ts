@@ -143,7 +143,7 @@ router.post("/sync-from-meta", async (req: Request, res: Response) => {
     // Fetch all pages from Meta
     const allTemplates: any[] = [];
     let url: string | null =
-      `https://graph.facebook.com/v23.0/${wabaId}/message_templates` +
+      `https://graph.facebook.com/v25.0/${wabaId}/message_templates` +
       `?limit=100&fields=id,name,language,category,status,quality_score,components,rejected_reason`;
 
     while (url) {

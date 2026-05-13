@@ -175,7 +175,7 @@ export async function createTemplate(hotelId: string, data: any) {
   console.log("[templates] Meta submission payload:", JSON.stringify(metaPayload, null, 2));
 
   const metaRes = await fetch(
-    `https://graph.facebook.com/v23.0/${wabaId}/message_templates`,
+    `https://graph.facebook.com/v25.0/${wabaId}/message_templates`,
     {
       method:  "POST",
       headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
@@ -246,7 +246,7 @@ export async function updateTemplate(hotelId: string, templateId: string, data: 
 
   if (existing.metaTemplateId) {
     const metaRes = await fetch(
-      `https://graph.facebook.com/v23.0/${existing.metaTemplateId}`,
+      `https://graph.facebook.com/v25.0/${existing.metaTemplateId}`,
       {
         method:  "POST",
         headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
@@ -277,7 +277,7 @@ export async function deleteTemplate(hotelId: string, templateId: string) {
   const { wabaId, accessToken } = await getWaCredentials(hotelId);
 
   await fetch(
-    `https://graph.facebook.com/v23.0/${wabaId}/message_templates?name=${encodeURIComponent(existing.name)}`,
+    `https://graph.facebook.com/v25.0/${wabaId}/message_templates?name=${encodeURIComponent(existing.name)}`,
     { method: "DELETE", headers: { Authorization: `Bearer ${accessToken}` } }
   );
 
@@ -293,7 +293,7 @@ export async function syncTemplate(hotelId: string, templateId: string) {
   const { accessToken } = await getWaCredentials(hotelId);
 
   const metaRes = await fetch(
-    `https://graph.facebook.com/v23.0/${existing.metaTemplateId}?fields=status,quality_score,rejected_reason,components`,
+    `https://graph.facebook.com/v25.0/${existing.metaTemplateId}?fields=status,quality_score,rejected_reason,components`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   const data = await metaRes.json() as any;
@@ -362,7 +362,7 @@ export async function uploadHeaderMediaToMeta(
   form.append("file", new Blob([new Uint8Array(fileBuffer)], { type: mimeType }), "header-media");
 
   const metaRes = await fetch(
-    `https://graph.facebook.com/v23.0/${phoneNumberId}/media`,
+    `https://graph.facebook.com/v25.0/${phoneNumberId}/media`,
     { method: "POST", headers: { Authorization: `Bearer ${accessToken}` }, body: form }
   );
   const data = await metaRes.json() as any;
@@ -430,7 +430,7 @@ export async function reattachHeaderMediaFromSample(hotelId: string, templateId:
   form.append("file", new Blob([new Uint8Array(fileBuffer)], { type: mimeType }), "header-media");
 
   const metaRes = await fetch(
-    `https://graph.facebook.com/v23.0/${phoneNumberId}/media`,
+    `https://graph.facebook.com/v25.0/${phoneNumberId}/media`,
     { method: "POST", headers: { Authorization: `Bearer ${accessToken}` }, body: form }
   );
   const data = await metaRes.json() as any;
@@ -604,7 +604,7 @@ export async function sendTemplateMessage(
   let metaRes: Response;
   try {
     metaRes = await fetch(
-      `https://graph.facebook.com/v23.0/${phoneNumberId}/messages`,
+      `https://graph.facebook.com/v25.0/${phoneNumberId}/messages`,
       {
         method:  "POST",
         headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
@@ -680,7 +680,7 @@ export async function syncPendingTemplates() {
       if (!t.metaTemplateId || !t.hotel.config?.metaAccessTokenEncrypted) continue;
       const accessToken = decryptWhatsAppToken(t.hotel.config.metaAccessTokenEncrypted);
       const res = await fetch(
-        `https://graph.facebook.com/v23.0/${t.metaTemplateId}?fields=status,quality_score,rejected_reason,components`,
+        `https://graph.facebook.com/v25.0/${t.metaTemplateId}?fields=status,quality_score,rejected_reason,components`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       const data = await res.json() as any;

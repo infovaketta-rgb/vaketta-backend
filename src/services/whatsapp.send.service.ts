@@ -159,19 +159,15 @@ export async function sendCarouselMessage(
       type: "carousel",
       body: { text: bodyText },
       action: {
-        sections: [
-          {
-            title: "Rooms",
-            cards: cards.slice(0, 10).map((c) => ({
-              header: { type: "image", image: { link: c.imageUrl } },
-              body:   { text: `*${c.title}*\n₹${c.price}/night\n${c.description}` },
-              footer: { text: "Vaketta" },
-              action: {
-                buttons: [{ type: "reply", reply: { id: c.buttonId, title: "Select Room" } }],
-              },
-            })),
+        cards: cards.slice(0, 10).map((c, i) => ({
+          card_index: i,
+          header:     { type: "image", image: { link: c.imageUrl } },
+          body:       { text: `*${c.title}*\n₹${c.price}/night\n${c.description}` },
+          footer:     { text: "Vaketta" },
+          action: {
+            buttons: [{ type: "reply", reply: { id: c.buttonId, title: "Select Room" } }],
           },
-        ],
+        })),
       },
     },
   };
