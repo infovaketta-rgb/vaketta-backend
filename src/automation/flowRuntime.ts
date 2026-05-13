@@ -318,94 +318,6 @@ function buildRoomListText(
   return text;
 }
 
-// ── Booking confirmation template ──────────────────────────────────────────────
-
-async function sendBookingConfirmationTemplate(
-  hotelId:   string,
-  guestId:   string,
-  booking:   { id: string; checkIn: Date; checkOut: Date; referenceNumber: string | null },
-  flowVars:  Record<string, string>
-): Promise<void> {
-  const { sendTemplateMessage } = await import("../services/templates.service");
-
-  const template = await prisma.whatsAppTemplate.findFirst({
-    where: {
-      hotelId,
-      status: "APPROVED",
-      OR: [
-        { name: { contains: "booking_confirmation" } },
-        { name: { contains: "booking_confirmed"   } },
-        { name: { contains: "confirmation"        } },
-      ],
-    },
-    orderBy: { updatedAt: "desc" },
-  });
-
-  if (!template) return;
-
-  const vm         = ((template as any).variableMapping ?? {}) as Record<string, string>;
-  const components = template.components as { body?: { text?: string } };
-  const bodyText   = components?.body?.text ?? "";
-
-  const varRe = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
-  const varIds: string[] = [];
-  const seen = new Set<string>();
-  let m: RegExpExecArray | null;
-  while ((m = varRe.exec(bodyText)) !== null) {
-    const id = m[1]!;
-    if (!seen.has(id)) { seen.add(id); varIds.push(id); }
-  }
-  if (varIds.length === 0) return;
-
-  function fmtDate(d: Date): string {
-    return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
-  }
-
-  const ctx: Record<string, string> = {
-    "guest.name":              flowVars["guestName"] ?? flowVars["bookingGuestName"] ?? "",
-    "guest.phone":             flowVars["guestPhone"] ?? "",
-    "booking.checkIn":         fmtDate(booking.checkIn),
-    "booking.checkOut":        fmtDate(booking.checkOut),
-    "booking.roomTypeName":    flowVars["bookingRoomTypeName"] ?? "",
-    "booking.referenceNumber": booking.referenceNumber ?? booking.id.slice(0, 8).toUpperCase(),
-    "booking.status":          "PENDING",
-    "hotel.name":              flowVars["hotelName"] ?? "",
-  };
-
-  // Position-based defaults when no explicit mapping is set
-  const POS_DEFAULTS: Record<number, string> = {
-    1: "guest.name",
-    2: "booking.checkIn",
-    3: "booking.checkOut",
-    4: "booking.roomTypeName",
-    5: "booking.referenceNumber",
-  };
-
-  // Named-variable name → context-field heuristic
-  const NAME_DEFAULTS: Record<string, string> = {
-    guestname: "guest.name", guest_name: "guest.name", name: "guest.name",
-    phone: "guest.phone", guestphone: "guest.phone", guest_phone: "guest.phone",
-    checkin: "booking.checkIn", check_in: "booking.checkIn",
-    checkout: "booking.checkOut", check_out: "booking.checkOut",
-    roomtype: "booking.roomTypeName", room_type: "booking.roomTypeName", room: "booking.roomTypeName",
-    reference: "booking.referenceNumber", referencenumber: "booking.referenceNumber",
-    bookingref: "booking.referenceNumber", bookingid: "booking.referenceNumber",
-    status: "booking.status", bookingstatus: "booking.status",
-    hotel: "hotel.name", hotelname: "hotel.name", hotel_name: "hotel.name",
-  };
-
-  const values: Record<string, string> = {};
-  for (const id of varIds) {
-    let key = vm[id];
-    if (!key) {
-      if (/^\d+$/.test(id)) key = POS_DEFAULTS[parseInt(id, 10)] ?? "";
-      else                  key = NAME_DEFAULTS[id.toLowerCase()] ?? "";
-    }
-    values[id] = ctx[key] ?? "";
-  }
-
-  await sendTemplateMessage(hotelId, guestId, template.id, values);
-}
 
 // ── Main entry point ───────────────────────────────────────────────────────────
 
@@ -1084,10 +996,8 @@ export async function executeFlowStep(
             bookingId:     booking.id,
           };
 
-          // Fire-and-forget: send booking confirmation template if the hotel has one
-          sendBookingConfirmationTemplate(hotelId, guestId, booking, flowData.flowVars).catch((err: unknown) =>
-            log.warn({ err, bookingId: booking.id }, "confirmation template send skipped")
-          );
+          // TODO: Booking confirmation should be triggered explicitly
+          // via a Send Template node in the flow builder, not auto-sent here.
 
           const next = nextNodeId(currentNodeId, adjacency);
           if (!next) {
