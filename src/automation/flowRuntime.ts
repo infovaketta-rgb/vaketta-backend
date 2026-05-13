@@ -1065,7 +1065,7 @@ export async function executeFlowStep(
           const lockKey = `${hotelId}:${new Date().getFullYear()}`;
 
           const booking = await prisma.$transaction(async (tx) => {
-            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
             const referenceNumber = await generateReferenceNumber(tx);
             return tx.booking.create({
               data: {

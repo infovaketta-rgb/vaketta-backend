@@ -145,7 +145,7 @@ const nights = Math.ceil(
     // Per-hotel-per-year advisory lock — serializes concurrent ref generation.
     // Transaction-scoped: auto-released on commit or rollback.
     // hashtext() → int4, auto-promoted to bigint by Postgres.
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
     const referenceNumber = await generateReferenceNumber(tx);
     return tx.booking.create({
       data: {
