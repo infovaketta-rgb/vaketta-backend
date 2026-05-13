@@ -884,7 +884,11 @@ export async function executeFlowStep(
             displayRooms: displayRooms.slice(0, 10),
             promptText:   prompt,
           });
-          if (carouselSent) return null;
+          // "ALREADY_SENT" sentinel — the carousel was dispatched to Meta
+          // directly, so the upstream pipeline must NOT also send a text reply.
+          // Distinct from `null` ("bot has nothing to say"); see message.service.ts
+          // for the NIGHT-mode handling that depends on this distinction.
+          if (carouselSent) return "ALREADY_SENT";
 
           return listText;
         }

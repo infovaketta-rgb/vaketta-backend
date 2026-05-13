@@ -140,6 +140,13 @@ export async function sendCarouselMessage(
   bodyText:      string,
   cards:         CarouselCard[],
 ): Promise<string> {
+  // Co-located mock guard. Matches sendTextMessage's behaviour so any caller
+  // (current or future) gets dev/test safety without needing its own gate.
+  if (process.env["MOCK_WHATSAPP_SEND"] === "true") {
+    log.info({ toPhone, cardCount: cards.length }, "MOCK CAROUSEL send");
+    return "mock-wamid";
+  }
+
   if (!cards.length) {
     throw new Error("sendCarouselMessage: at least one card is required");
   }

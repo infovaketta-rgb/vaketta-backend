@@ -170,14 +170,26 @@ try {
 
   let sentReplyText: string | null = null;
 
+  // Sentinel returned by botProcess when the flow dispatched a non-text reply
+  // itself (e.g. an interactive carousel) — meaning the upstream pipeline MUST
+  // NOT also send a text. Distinct from `null` ("bot has nothing to say"),
+  // which in NIGHT mode would still send the standalone nightMsg.
+  const BOT_ALREADY_SENT = "ALREADY_SENT";
+
   if (autoReplyMode === "DAY") {
-    sentReplyText = await botProcess(hotel.id, guest.id, body ?? null);
+    const botReply = await botProcess(hotel.id, guest.id, body ?? null);
+    sentReplyText = botReply === BOT_ALREADY_SENT ? null : botReply;
   }
 
   if (autoReplyMode === "NIGHT") {
     const botReply = await botProcess(hotel.id, guest.id, body ?? null);
-    const nightMsg = hotel.config.nightMessage;
-    sentReplyText  = botReply ? `${nightMsg}\n\n${botReply}` : nightMsg;
+    if (botReply === BOT_ALREADY_SENT) {
+      // Bot already dispatched its own reply (carousel) — suppress nightMsg too.
+      sentReplyText = null;
+    } else {
+      const nightMsg = hotel.config.nightMessage;
+      sentReplyText  = botReply ? `${nightMsg}\n\n${botReply}` : nightMsg;
+    }
   }
 
   if (autoReplyMode === "OFF") {
