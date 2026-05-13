@@ -165,7 +165,13 @@ async function safeMenu(hotelId: string): Promise<string | null> {
 async function trySendRoomCarousel(args: {
   hotelId:      string;
   guestId:      string;
-  displayRooms: { id: string; name: string; basePrice: number; description: string | null }[];
+  displayRooms: {
+    id:                   string;
+    name:                 string;
+    basePrice:            number;
+    description:          string | null;
+    carouselButtonLabel?: string | null;
+  }[];
   promptText:   string;
 }): Promise<boolean> {
   const { hotelId, guestId, displayRooms, promptText } = args;
@@ -205,6 +211,7 @@ async function trySendRoomCarousel(args: {
       price:       r.basePrice,
       description: (r.description ?? "").slice(0, 60) || "Comfortable stay",
       buttonId:    `room_${r.id}`,
+      buttonLabel: r.carouselButtonLabel ?? "Select Room",
     }));
 
     const wamid = await sendCarouselMessage(guest.phone, phoneNumberId, accessToken, promptText, cards);
@@ -253,6 +260,7 @@ async function fetchRoomTypes(hotelId: string, filters?: {
       id: true, name: true, basePrice: true,
       capacity: true, maxAdults: true, maxChildren: true,
       description: true,
+      carouselButtonLabel: true,
     },
   });
 }

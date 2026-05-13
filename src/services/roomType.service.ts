@@ -11,14 +11,16 @@ export async function createRoomType({
   maxAdults,
   maxChildren,
   totalRooms,
+  carouselButtonLabel,
 }: {
-  hotelId:     string;
-  name:        string;
-  basePrice:   number;
-  capacity?:   number;
-  maxAdults?:  number;
-  maxChildren?: number;
-  totalRooms?: number;
+  hotelId:              string;
+  name:                 string;
+  basePrice:            number;
+  capacity?:            number;
+  maxAdults?:           number;
+  maxChildren?:         number;
+  totalRooms?:          number;
+  carouselButtonLabel?: string;
 }) {
   return prisma.roomType.create({
     data: {
@@ -29,6 +31,7 @@ export async function createRoomType({
       maxAdults:   maxAdults   ?? null,
       maxChildren: maxChildren ?? null,
       totalRooms:  totalRooms  ?? 1,
+      ...(carouselButtonLabel !== undefined && { carouselButtonLabel }),
     },
   });
 }
@@ -50,15 +53,17 @@ export async function updateRoomType({
   maxAdults,
   maxChildren,
   totalRooms,
+  carouselButtonLabel,
 }: {
-  id:           string;
-  hotelId:      string;
-  name?:        string;
-  basePrice:    number;
-  capacity?:    number;
-  maxAdults?:   number;
-  maxChildren?: number;
-  totalRooms?:  number;
+  id:                   string;
+  hotelId:              string;
+  name?:                string;
+  basePrice:            number;
+  capacity?:            number;
+  maxAdults?:           number;
+  maxChildren?:         number;
+  totalRooms?:          number;
+  carouselButtonLabel?: string;
 }) {
   return prisma.roomType.update({
     where: { id, hotelId },
@@ -69,6 +74,7 @@ export async function updateRoomType({
       maxAdults:   maxAdults   ?? null,
       maxChildren: maxChildren ?? null,
       ...(totalRooms !== undefined && { totalRooms }),
+      ...(carouselButtonLabel !== undefined && { carouselButtonLabel }),
     },
   });
 }

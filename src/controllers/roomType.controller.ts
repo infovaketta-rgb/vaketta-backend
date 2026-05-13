@@ -19,10 +19,15 @@ export async function createRoomTypeController(req: Request, res: Response) {
     const hotelId = (req as any).user?.hotelId; // ✅ fixed
     if (!hotelId) return res.status(401).json({ error: "Unauthorized" });
 
-    const { name, basePrice, capacity, maxAdults, maxChildren, totalRooms } = req.body;
+    const { name, basePrice, capacity, maxAdults, maxChildren, totalRooms, carouselButtonLabel } = req.body;
 
     if (!name || !basePrice) {
       return res.status(400).json({ error: "Name and basePrice are required" });
+    }
+
+    // Meta's quick_reply.title is capped at 20 chars; reject longer values up front.
+    if (typeof carouselButtonLabel === "string" && carouselButtonLabel.length > 20) {
+      return res.status(400).json({ error: "carouselButtonLabel must be 20 characters or fewer" });
     }
 
     const roomType = await createRoomType({
@@ -33,6 +38,7 @@ export async function createRoomTypeController(req: Request, res: Response) {
       ...(maxAdults   ? { maxAdults:   Number(maxAdults)   } : {}),
       ...(maxChildren ? { maxChildren: Number(maxChildren) } : {}),
       ...(totalRooms  ? { totalRooms:  Number(totalRooms)  } : {}),
+      ...(typeof carouselButtonLabel === "string" ? { carouselButtonLabel: carouselButtonLabel.trim() } : {}),
     });
 
     invalidatePromptCache(hotelId);
@@ -63,10 +69,14 @@ export async function updateRoomTypeController(req: Request, res: Response) {
 
     const { id } = req.params;
 if (!id) return res.status(400).json({ error: "Room type ID is required" });
-    const { name, basePrice, capacity, maxAdults, maxChildren, totalRooms } = req.body;
+    const { name, basePrice, capacity, maxAdults, maxChildren, totalRooms, carouselButtonLabel } = req.body;
 
     if (!name || !basePrice) {
       return res.status(400).json({ error: "Name and basePrice are required" });
+    }
+
+    if (typeof carouselButtonLabel === "string" && carouselButtonLabel.length > 20) {
+      return res.status(400).json({ error: "carouselButtonLabel must be 20 characters or fewer" });
     }
 
     const roomType = await updateRoomType({
@@ -78,6 +88,7 @@ if (!id) return res.status(400).json({ error: "Room type ID is required" });
       ...(maxAdults   ? { maxAdults:   Number(maxAdults)   } : {}),
       ...(maxChildren ? { maxChildren: Number(maxChildren) } : {}),
       ...(totalRooms  ? { totalRooms:  Number(totalRooms)  } : {}),
+      ...(typeof carouselButtonLabel === "string" ? { carouselButtonLabel: carouselButtonLabel.trim() } : {}),
     });
 
     invalidatePromptCache(hotelId);

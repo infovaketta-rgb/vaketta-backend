@@ -277,6 +277,11 @@ model RoomType {
   maxAdults   Int?        // max adults allowed
   maxChildren Int?        // max children allowed
   totalRooms  Int         @default(1)
+
+  // Label shown on the WhatsApp carousel "Select Room" button. Max 20 chars
+  // (Meta quick_reply.title limit). Falls back to "Select Room" if null.
+  carouselButtonLabel String? @default("Select Room")
+
   hotelId     String
 
   hotel     Hotel          @relation(fields: [hotelId], references: [id])

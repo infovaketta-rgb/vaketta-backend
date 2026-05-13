@@ -117,11 +117,14 @@ export async function sendTextMessage(input: {
 // ── Carousel interactive message ──────────────────────────────────────────────
 
 export interface CarouselCard {
-  imageUrl:    string;
-  title:       string;
-  price:       number;
-  description: string;
-  buttonId:    string;  // format: "room_{roomId}"
+  imageUrl:     string;
+  title:        string;
+  price:        number;
+  description:  string;
+  buttonId:     string;  // format: "room_{roomId}"
+  /** Per-card override for the quick-reply button label. Max 20 chars (Meta limit).
+   *  Falls back to "Select Room" if omitted. */
+  buttonLabel?: string;
 }
 
 /**
@@ -168,7 +171,12 @@ export async function sendCarouselMessage(
           action: {
             buttons: [{
               type: "quick_reply",
-              quick_reply: { id: c.buttonId, title: "Select Room" },
+              quick_reply: {
+                id:    c.buttonId,
+                // Meta caps quick_reply.title at 20 chars — slice defensively
+                // in case a caller didn't pre-validate.
+                title: (c.buttonLabel ?? "Select Room").slice(0, 20),
+              },
             }],
           },
         })),
