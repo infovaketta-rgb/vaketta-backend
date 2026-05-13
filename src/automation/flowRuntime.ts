@@ -37,8 +37,14 @@ import {
   JumpNodeData,
 } from "./flowTypes";
 import { generateReferenceNumber } from "../utils/booking.utils";
-import { BookingStatus } from "@prisma/client";
+import { BookingStatus, MessageChannel, MessageStatus } from "@prisma/client";
 import { shouldAutoReply } from "./shouldAutoReply";
+import { sendCarouselMessage, type CarouselCard } from "../services/whatsapp.send.service";
+import { decryptWhatsAppToken } from "../utils/encryption.utils";
+
+// Generic placeholder served when a room has no photos. Reliable HTTPS host —
+// Meta requires a publicly fetchable URL for interactive image headers.
+const CAROUSEL_FALLBACK_IMAGE = "https://placehold.co/600x400/png?text=Room";
 
 const MAX_HOPS = 30;
 const DIVIDER  = "━━━━━━━━━━━━━━━━";
@@ -144,6 +150,84 @@ function safeSetVar(
 
 async function safeMenu(hotelId: string): Promise<string | null> {
   return (await buildMenuMessage(hotelId)) ?? MENU_FALLBACK;
+}
+
+// ── Room carousel sender ──────────────────────────────────────────────────────
+
+/**
+ * Attempts to send the visual room carousel for show_rooms phase 1. Resolves
+ * hotel WhatsApp credentials, fetches the lead photo per room, dispatches the
+ * carousel through the Cloud API, and persists an outbound CAROUSEL message.
+ *
+ * Returns true if the carousel was sent (caller should NOT also send text);
+ * false on any failure or missing config (caller falls back to the text list).
+ */
+async function trySendRoomCarousel(args: {
+  hotelId:      string;
+  guestId:      string;
+  displayRooms: { id: string; name: string; basePrice: number; description: string | null }[];
+  promptText:   string;
+}): Promise<boolean> {
+  const { hotelId, guestId, displayRooms, promptText } = args;
+  if (!displayRooms.length) return false;
+
+  try {
+    const [hotel, guest] = await Promise.all([
+      prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
+      prisma.guest.findUnique({ where: { id: guestId } }),
+    ]);
+    if (!hotel || !guest) return false;
+
+    const cfg = hotel.config;
+    const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
+    const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
+    if (!phoneNumberId || !encryptedTok) return false;
+    const accessToken = decryptWhatsAppToken(encryptedTok);
+
+    // Lead photo per room (isMain first, then lowest order).
+    const photos = await prisma.roomPhoto.findMany({
+      where:   { roomTypeId: { in: displayRooms.map((r) => r.id) } },
+      orderBy: [{ isMain: "desc" }, { order: "asc" }],
+      select:  { roomTypeId: true, url: true },
+    });
+    const photoByRoom = new Map<string, string>();
+    for (const p of photos) {
+      if (!photoByRoom.has(p.roomTypeId)) photoByRoom.set(p.roomTypeId, p.url);
+    }
+
+    const cards: CarouselCard[] = displayRooms.map((r) => ({
+      imageUrl:    photoByRoom.get(r.id) ?? CAROUSEL_FALLBACK_IMAGE,
+      title:       r.name,
+      price:       r.basePrice,
+      description: (r.description ?? "").slice(0, 60) || "Comfortable stay",
+      buttonId:    `room_${r.id}`,
+    }));
+
+    const wamid = await sendCarouselMessage(guest.phone, phoneNumberId, accessToken, promptText, cards);
+
+    const saved = await prisma.message.create({
+      data: {
+        direction:   "OUT",
+        fromPhone:   hotel.phone,
+        toPhone:     guest.phone,
+        body:        JSON.stringify({ cards }),
+        messageType: "carousel",
+        hotelId,
+        guestId,
+        channel:     MessageChannel.WHATSAPP,
+        status:      MessageStatus.SENT,
+        wamid,
+      },
+    });
+
+    const { emitToHotel } = await import("../realtime/emit");
+    emitToHotel(hotelId, "message:new", { message: saved });
+
+    return true;
+  } catch (err) {
+    log.warn({ err, hotelId, guestId }, "carousel send failed — falling back to text list");
+    return false;
+  }
 }
 
 // ── Room type fetcher ──────────────────────────────────────────────────────────
@@ -787,6 +871,17 @@ export async function executeFlowStep(
           };
 
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
+
+          // Try carousel send (visual scrollable room cards). Falls back to the
+          // text list if WhatsApp credentials are absent or Meta rejects the send.
+          const carouselSent = await trySendRoomCarousel({
+            hotelId,
+            guestId,
+            displayRooms: displayRooms.slice(0, 10),
+            promptText:   prompt,
+          });
+          if (carouselSent) return null;
+
           return listText;
         }
 
@@ -796,13 +891,24 @@ export async function executeFlowStep(
 
         if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
 
-        const num = parseInt(input, 10);
-        if (isNaN(num) || num < 1 || num > rawList.length) {
+        // Resolve the selected room. Carousel button replies come in as
+        // "room_<roomId>" (synthesised in the webhook handler from
+        // interactive.button_reply.id); text-list replies come in as 1..N.
+        let chosen: typeof rawList[number] | undefined;
+        const roomIdMatch = input.match(/^room_(.+)$/);
+        if (roomIdMatch) {
+          chosen = rawList.find((r) => r.id === roomIdMatch[1]);
+        } else {
+          const num = parseInt(input, 10);
+          if (!isNaN(num) && num >= 1 && num <= rawList.length) {
+            chosen = rawList[num - 1];
+          }
+        }
+
+        if (!chosen) {
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
           return d.validationError || `Please reply with a number between *1* and *${rawList.length}*.`;
         }
-
-        const chosen = rawList[num - 1]!;
         const prefix = d.variableName || "room";
         flowData.flowVars = {
           ...flowData.flowVars,

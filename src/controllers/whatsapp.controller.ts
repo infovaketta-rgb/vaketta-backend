@@ -126,11 +126,28 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
 
     const fromPhone   = normalizePhone(rawFrom);
     const toPhone     = normalizePhone(rawTo);
-    const messageType = (message.type as string) || "text";
+    let   messageType = (message.type as string) || "text";
     const wamid       = (message.id as string | undefined) ?? null;
 
     // Extract text body (text messages) or caption (media messages)
-    const body = message.text?.body ?? message[messageType]?.caption ?? null;
+    let body: string | null = message.text?.body ?? message[messageType]?.caption ?? null;
+
+    // Interactive replies (e.g. carousel "Select Room" tap) — collapse to a
+    // text message whose body is the reply id, so the flow engine can match
+    // patterns like "room_<roomId>" without any new code path downstream.
+    if (messageType === "interactive") {
+      const ir = message.interactive;
+      const replyId =
+        ir?.type === "button_reply" ? (ir.button_reply?.id as string | undefined) :
+        ir?.type === "list_reply"   ? (ir.list_reply?.id   as string | undefined) :
+                                      undefined;
+      if (!replyId) {
+        log.info({ irType: ir?.type }, "skipping interactive reply with no id");
+        return res.sendStatus(200);
+      }
+      messageType = "text";
+      body        = replyId;
+    }
 
     const SUPPORTED_TYPES = new Set(["text", "image", "video", "audio", "document", "sticker"]);
 

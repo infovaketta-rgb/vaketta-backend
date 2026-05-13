@@ -114,6 +114,69 @@ export async function sendTextMessage(input: {
   );
 }
 
+// ── Carousel interactive message ──────────────────────────────────────────────
+
+export interface CarouselCard {
+  imageUrl:    string;
+  title:       string;
+  price:       number;
+  description: string;
+  buttonId:    string;  // format: "room_{roomId}"
+}
+
+/**
+ * Sends a WhatsApp Cloud API "interactive carousel" — a horizontally
+ * scrollable strip of up to 10 cards, each with image header, body text,
+ * footer, and a single quick-reply button. Used by the flow engine's
+ * show_rooms node to render rooms visually instead of as a numbered text list.
+ *
+ * On success returns the wamid (Meta message id). Throws with a descriptive
+ * message on failure.
+ */
+export async function sendCarouselMessage(
+  toPhone:       string,
+  phoneNumberId: string,
+  accessToken:   string,
+  bodyText:      string,
+  cards:         CarouselCard[],
+): Promise<string> {
+  if (!cards.length) {
+    throw new Error("sendCarouselMessage: at least one card is required");
+  }
+
+  const payload = {
+    messaging_product: "whatsapp",
+    to:   toPhone,
+    type: "interactive",
+    interactive: {
+      type: "carousel",
+      body: { text: bodyText },
+      cards: cards.slice(0, 10).map((c) => ({
+        header: { type: "image", image: { link: c.imageUrl } },
+        body:   { text: `*${c.title}*\n₹${c.price}/night\n${c.description}` },
+        footer: { text: "Vaketta" },
+        action: {
+          buttons: [{ type: "reply", reply: { id: c.buttonId, title: "Select Room" } }],
+        },
+      })),
+    },
+  };
+
+  log.info({ toPhone, cardCount: cards.length }, "sending carousel message");
+
+  const data = await withRetry(() =>
+    metaPost(`${phoneNumberId}/messages`, payload, accessToken)
+  );
+
+  const wamid = data?.messages?.[0]?.id;
+  if (!wamid) {
+    throw new Error(
+      `sendCarouselMessage: Meta response missing message id: ${JSON.stringify(data)}`
+    );
+  }
+  return wamid as string;
+}
+
 // ── Media message ─────────────────────────────────────────────────────────────
 
 export async function sendMediaMessage(input: {
