@@ -149,6 +149,20 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
       body        = replyId;
     }
 
+    // Carousel quick_reply taps — Meta delivers these as type "button" with
+    // the quick_reply id in message.button.payload (e.g. "room_<roomId>").
+    // Collapse to a plain text message so the flow engine's Phase 2 regex
+    // (^room_(.+)$) can match without any new downstream code path.
+    if (messageType === "button") {
+      const payload = message.button?.payload as string | undefined;
+      if (!payload) {
+        log.info("skipping button message with no payload");
+        return res.sendStatus(200);
+      }
+      messageType = "text";
+      body        = payload;
+    }
+
     const SUPPORTED_TYPES = new Set(["text", "image", "video", "audio", "document", "sticker"]);
 
     if (!SUPPORTED_TYPES.has(messageType)) {
