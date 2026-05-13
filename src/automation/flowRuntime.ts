@@ -171,6 +171,10 @@ async function trySendRoomCarousel(args: {
   const { hotelId, guestId, displayRooms, promptText } = args;
   if (!displayRooms.length) return false;
 
+  // Honour the same dev/test guard the text sender uses. Without this, a
+  // mock-mode environment with leftover real credentials would POST to Meta.
+  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
+
   try {
     const [hotel, guest] = await Promise.all([
       prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
