@@ -153,19 +153,23 @@ export async function sendCarouselMessage(
 
   const payload = {
     messaging_product: "whatsapp",
-    to:   toPhone,
-    type: "interactive",
+    recipient_type:    "individual",
+    to:                toPhone,
+    type:              "interactive",
     interactive: {
       type: "carousel",
       body: { text: bodyText },
       action: {
         cards: cards.slice(0, 10).map((c, i) => ({
           card_index: i,
+          type:       "cta_url",
           header:     { type: "image", image: { link: c.imageUrl } },
           body:       { text: `*${c.title}*\n₹${c.price}/night\n${c.description}` },
-          footer:     { text: "Vaketta" },
           action: {
-            buttons: [{ type: "reply", reply: { id: c.buttonId, title: "Select Room" } }],
+            buttons: [{
+              type: "quick_reply",
+              quick_reply: { id: c.buttonId, title: "Select Room" },
+            }],
           },
         })),
       },
