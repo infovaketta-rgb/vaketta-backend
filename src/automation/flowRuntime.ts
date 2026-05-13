@@ -114,9 +114,9 @@ function todayUTC(): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
-/** Replace {{varName}} placeholders in text with values from flowVars. */
+/** Replace {{varName}} or {{obj.field}} placeholders in text with values from flowVars. */
 function interpolate(text: string, flowVars: Record<string, string>): string {
-  return text.replace(/\{\{(\w+)\}\}/g, (_, key) => flowVars[key] ?? `{{${key}}}`);
+  return text.replace(/\{\{([\w.]+)\}\}/g, (_, key) => flowVars[key] ?? `{{${key}}}`);
 }
 
 // Variable names that are injected by the runtime or set by action nodes from
@@ -175,7 +175,8 @@ async function trySendRoomCarousel(args: {
   promptText:   string;
 }): Promise<boolean> {
   const { hotelId, guestId, displayRooms, promptText } = args;
-  if (!displayRooms.length) return false;
+  // Meta requires at least 2 cards in a carousel
+  if (displayRooms.length < 2) return false;
 
   // Honour the same dev/test guard the text sender uses. Without this, a
   // mock-mode environment with leftover real credentials would POST to Meta.
@@ -205,13 +206,33 @@ async function trySendRoomCarousel(args: {
       if (!photoByRoom.has(p.roomTypeId)) photoByRoom.set(p.roomTypeId, p.url);
     }
 
-    const cards: CarouselCard[] = displayRooms.map((r) => ({
+    // Build unique button titles: use custom label (if not default) else room
+    // name, max 18 chars base so dedup suffixes fit within Meta's 20-char cap.
+    const baseTitles = displayRooms.map((r) => {
+      const label = r.carouselButtonLabel ?? "Select Room";
+      return (label !== "Select Room" ? label : r.name).slice(0, 18);
+    });
+
+    // Count how many times each base title appears
+    const titleFreq = new Map<string, number>();
+    for (const t of baseTitles) titleFreq.set(t, (titleFreq.get(t) ?? 0) + 1);
+
+    // Assign suffixes only to titles that collide
+    const counters = new Map<string, number>();
+    const uniqueTitles = baseTitles.map((t) => {
+      if ((titleFreq.get(t) ?? 1) <= 1) return t;
+      const n = (counters.get(t) ?? 0) + 1;
+      counters.set(t, n);
+      return `${t} ${n}`;
+    });
+
+    const cards: CarouselCard[] = displayRooms.map((r, i) => ({
       imageUrl:    photoByRoom.get(r.id) ?? CAROUSEL_FALLBACK_IMAGE,
       title:       r.name,
       price:       r.basePrice,
       description: (r.description ?? "").slice(0, 60) || "Comfortable stay",
       buttonId:    `room_${r.id}`,
-      buttonLabel: r.carouselButtonLabel ?? "Select Room",
+      buttonLabel: uniqueTitles[i]!,
     }));
 
     const wamid = await sendCarouselMessage(guest.phone, phoneNumberId, accessToken, promptText, cards);
@@ -925,7 +946,8 @@ export async function executeFlowStep(
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
           return d.validationError || `Please reply with a number between *1* and *${rawList.length}*.`;
         }
-        const prefix = d.variableName || "room";
+        const prefix  = d.variableName || "room";
+        const dotBase = d.variableName || "selectedRoom";
         flowData.flowVars = {
           ...flowData.flowVars,
           [`${prefix}TypeId`]:      chosen.id,
@@ -937,6 +959,12 @@ export async function executeFlowStep(
           bookingRoomTypeId:    chosen.id,
           bookingRoomTypeName:  chosen.name,
           bookingPricePerNight: String(chosen.price),
+          // dot-notation vars: {{selectedRoom.name}}, {{selectedRoom.price}}, etc.
+          [`${dotBase}.id`]:    chosen.id,
+          [`${dotBase}.name`]:  chosen.name,
+          [`${dotBase}.price`]: String(chosen.price),
+          ...(chosen.maxAdults   != null ? { [`${dotBase}.maxAdults`]:   String(chosen.maxAdults)   } : {}),
+          ...(chosen.maxChildren != null ? { [`${dotBase}.maxChildren`]: String(chosen.maxChildren) } : {}),
         };
         delete flowData.waitingFor;
 
