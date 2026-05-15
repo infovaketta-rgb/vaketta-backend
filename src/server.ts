@@ -21,6 +21,7 @@ import prisma from "./db/connect";
 import { logger } from "./utils/logger";
 import { MessageStatus } from "@prisma/client";
 import "./workers/instagram.worker";
+import "./workers/flowResumeWorker";
 
 // ── Startup environment validation ────────────────────────────────────────────
 

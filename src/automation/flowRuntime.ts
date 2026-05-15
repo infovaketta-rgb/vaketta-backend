@@ -12,7 +12,7 @@
  *   text, room_selection (legacy), date, number, yes_no, rating
  *
  * Action types:
- *   create_booking, update_booking_status, start_booking_flow (legacy),
+ *   create_booking, cancel_booking, update_booking_status, start_booking_flow (legacy),
  *   handoff_to_staff, notify_staff, reset_to_menu, set_variable, send_review_request, view_bookings
  */
 
@@ -28,6 +28,7 @@ import {
   SerializedFlowEdge,
   MessageNodeData,
   QuestionNodeData,
+  DelayNodeData,
   BranchNodeData,
   BranchCondition,
   ActionNodeData,
@@ -37,10 +38,13 @@ import {
   JumpNodeData,
 } from "./flowTypes";
 import { generateReferenceNumber } from "../utils/booking.utils";
+import { cancelBooking } from "../services/booking.service";
 import { BookingStatus, MessageChannel, MessageStatus } from "@prisma/client";
 import { shouldAutoReply } from "./shouldAutoReply";
 import { sendCarouselMessage, type CarouselCard } from "../services/whatsapp.send.service";
+import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
+import { getPublishedNodes } from "../services/flow.service";
 
 // Generic placeholder served when a room has no photos. Reliable HTTPS host —
 // Meta requires a publicly fetchable URL for interactive image headers.
@@ -49,6 +53,16 @@ const CAROUSEL_FALLBACK_IMAGE = "https://placehold.co/600x400/png?text=Room";
 const MAX_HOPS = 30;
 const DIVIDER  = "━━━━━━━━━━━━━━━━";
 const MENU_FALLBACK = "Reply *MENU* to see our options.";
+
+const ACTION_TIMEOUT_MS = 10_000;
+function withActionTimeout<T>(promise: Promise<T>): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Action timeout")), ACTION_TIMEOUT_MS)
+    ),
+  ]);
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -138,6 +152,16 @@ const RESERVED_FLOW_VARS = new Set([
   "staffNotified",
 ]);
 
+// Prototype-pollution keys that must never appear as variable names regardless
+// of context.
+const BLOCKED_VAR_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+// Internal runtime variables that start with __ — only the runtime itself
+// should write these; guest input must never be allowed to set them.
+const INTERNAL_DOUBLE_UNDERSCORE = new Set([
+  "__flowError__", "__cancelSuccess__", "__roomList__", "__sysInjected__",
+]);
+
 /** Write a guest-collected answer into flowVars, rejecting reserved key names. */
 function safeSetVar(
   flowVars: Record<string, string>,
@@ -145,6 +169,14 @@ function safeSetVar(
   value: string,
 ): Record<string, string> {
   if (!key || RESERVED_FLOW_VARS.has(key)) return flowVars;
+  if (BLOCKED_VAR_KEYS.has(key)) {
+    log.warn({ key }, "safeSetVar: blocked prototype-pollution key");
+    return flowVars;
+  }
+  if (key.startsWith("__") && !INTERNAL_DOUBLE_UNDERSCORE.has(key)) {
+    log.warn({ key }, "safeSetVar: blocked unlisted internal-namespace key");
+    return flowVars;
+  }
   return { ...flowVars, [key]: value };
 }
 
@@ -332,27 +364,51 @@ export async function executeFlowStep(
   const flowId = parts[1]!;
   const nodeId = parts[2]!;
 
-  const flow = await prisma.flowDefinition.findUnique({ where: { id: flowId } });
-  if (!flow || !flow.isActive) {
+  const flowContent = await getPublishedNodes(flowId);
+  if (!flowContent) {
     await resetSession(guestId, hotelId);
     return safeMenu(hotelId);
   }
 
-  const nodes = Array.isArray(flow.nodes) ? (flow.nodes as unknown as SerializedFlowNode[]) : [];
-  const edges = Array.isArray(flow.edges) ? (flow.edges as unknown as SerializedFlowEdge[]) : [];
+  const { nodes, edges } = flowContent;
   const { nodeMap, adjacency } = buildMaps(nodes, edges);
 
-  const flowData = { ...(sessionData.flow ?? { flowId, flowVars: {} }) };
+  type FlowData = { flowId: string; flowVars: Record<string, string>; waitingFor?: "answer"; lastInput?: string };
+  const rawFlow = sessionData.flow as any;
+  let flowData: FlowData;
+  if (
+    rawFlow !== null &&
+    rawFlow !== undefined &&
+    typeof rawFlow === "object" &&
+    typeof rawFlow.flowVars === "object" &&
+    rawFlow.flowVars !== null
+  ) {
+    flowData = rawFlow as FlowData;
+  } else {
+    if (rawFlow !== null && rawFlow !== undefined) {
+      log.warn({ guestId, sessionFlowType: typeof rawFlow }, "session: corrupted flow data — resetting to defaults");
+    }
+    flowData = { flowId, flowVars: {} };
+  }
   let hops = 0;
+
+  // Fetch hotel config once — used for both system-var injection (timezone) and
+  // the business-hours gate inside advance().
+  const hotelCfg = await prisma.hotelConfig.findUnique({
+    where:  { hotelId },
+    select: {
+      autoReplyEnabled:  true,
+      businessStartHour: true,
+      businessEndHour:   true,
+      timezone:          true,
+      allDay:            true,
+    },
+  });
 
   // ── Inject system variables (available in every flow, every node) ────────────
   // These are read-only runtime values. They're injected once per execution so
   // that guest input cannot overwrite them.
   if (!flowData.flowVars["__sysInjected__"]) {
-    const cfg = await prisma.hotelConfig.findUnique({
-      where:  { hotelId },
-      select: { timezone: true },
-    });
     const hotel = await prisma.hotel.findUnique({
       where:  { id: hotelId },
       select: { name: true },
@@ -361,7 +417,7 @@ export async function executeFlowStep(
       where:  { id: guestId },
       select: { name: true, phone: true },
     });
-    const tz  = cfg?.timezone ?? "UTC";
+    const tz  = hotelCfg?.timezone ?? "UTC";
     const now = new Date();
     const fmt = (opts: Intl.DateTimeFormatOptions) =>
       now.toLocaleString("en-IN", { timeZone: tz, ...opts });
@@ -377,18 +433,6 @@ export async function executeFlowStep(
       ...flowData.flowVars,  // guest-collected vars take precedence over system defaults
     };
   }
-
-  // Fetch hotel config once for the business-hours gate (used inside advance()).
-  const hotelCfg = await prisma.hotelConfig.findUnique({
-    where:  { hotelId },
-    select: {
-      autoReplyEnabled:  true,
-      businessStartHour: true,
-      businessEndHour:   true,
-      timezone:          true,
-      allDay:            true,
-    },
-  });
 
   return advance(nodeId);
 
@@ -488,7 +532,11 @@ export async function executeFlowStep(
             return d.validationError || `Please reply with a number between *1* and *${rawList.length}*.`;
           }
 
-          const chosen = rawList[num - 1]!;
+          const chosen = rawList[num - 1];
+          if (chosen === undefined) {
+            await resetSession(guestId, hotelId);
+            return "No rooms available for your selection. Please try again.";
+          }
           const prefix = d.variableName || "room";
           flowData.flowVars = {
             ...flowData.flowVars,
@@ -710,18 +758,36 @@ export async function executeFlowStep(
         let available = false;
         let availableCount = 0;
 
-        if (roomTypeId && checkIn && checkOut) {
+        if (!roomTypeId || !checkIn || !checkOut) {
+          log.error(
+            { flowId, nodeId: currentNodeId, hotelId, roomTypeIdVar: d.roomTypeIdVar, checkInVar: d.checkInVar, checkOutVar: d.checkOutVar },
+            "check_availability: one or more required variables are missing — check node configuration"
+          );
+          flowData.flowVars = {
+            ...flowData.flowVars,
+            __flowError__: `check_availability misconfigured — roomTypeId=${roomTypeId ?? "missing"}, checkIn=${checkIn ?? "missing"}, checkOut=${checkOut ?? "missing"}`,
+          };
+        } else {
           // Normalize dates to YYYY-MM-DD — guest input may be DD/MM/YYYY
           const checkInParsed  = parseFlexDate(checkIn);
           const checkOutParsed = parseFlexDate(checkOut);
           if (checkInParsed && checkOutParsed && checkOutParsed > checkInParsed) {
-            const result = await checkRoomAvailability(
-              hotelId, roomTypeId,
-              toDateStr(checkInParsed),
-              toDateStr(checkOutParsed)
-            );
-            available      = result.available;
-            availableCount = result.availableCount;
+            try {
+              const result = await withActionTimeout(checkRoomAvailability(
+                hotelId, roomTypeId,
+                toDateStr(checkInParsed),
+                toDateStr(checkOutParsed)
+              ));
+              available      = result.available;
+              availableCount = result.availableCount;
+            } catch (err: any) {
+              if (err.message === "Action timeout") {
+                log.error({ flowId, nodeId: currentNodeId, hotelId }, "check_availability: timed out");
+                flowData.flowVars = { ...flowData.flowVars, __flowError__: "Action timed out. Please try again." };
+              } else {
+                throw err;
+              }
+            }
           } else if (!checkInParsed || !checkOutParsed) {
             log.warn({ flowId, checkIn, checkOut }, "check_availability: invalid date strings");
           }
@@ -850,7 +916,8 @@ export async function executeFlowStep(
         } else {
           const num = parseInt(input, 10);
           if (!isNaN(num) && num >= 1 && num <= rawList.length) {
-            chosen = rawList[num - 1];
+            const candidate = rawList[num - 1];
+            if (candidate !== undefined) chosen = candidate;
           }
         }
 
@@ -976,18 +1043,32 @@ export async function executeFlowStep(
           const advancePaid   = advancePaidRaw ? Math.round(parseFloat(advancePaidRaw)) : 0;
           const lockKey = `${hotelId}:${new Date().getFullYear()}`;
 
-          const booking = await prisma.$transaction(async (tx) => {
-            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
-            const referenceNumber = await generateReferenceNumber(tx);
-            return tx.booking.create({
-              data: {
-                hotelId, guestId, roomTypeId, guestName,
-                checkIn: checkInDate, checkOut: checkOutDate,
-                status: BookingStatus.PENDING, pricePerNight, totalPrice, advancePaid,
-                referenceNumber,
-              },
-            });
-          });
+          let booking: Awaited<ReturnType<typeof prisma.booking.create>>;
+          try {
+            booking = await withActionTimeout(prisma.$transaction(async (tx) => {
+              await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+              const referenceNumber = await generateReferenceNumber(tx);
+              return tx.booking.create({
+                data: {
+                  hotelId, guestId, roomTypeId, guestName,
+                  checkIn: checkInDate, checkOut: checkOutDate,
+                  status: BookingStatus.PENDING, pricePerNight, totalPrice, advancePaid,
+                  referenceNumber,
+                },
+              });
+            }));
+          } catch (err: any) {
+            if (err.message === "Action timeout") {
+              log.error({ flowId, nodeId: currentNodeId, hotelId, guestId }, "create_booking: transaction timed out");
+              flowData.flowVars = { ...flowData.flowVars, __flowError__: "Action timed out. Please try again." };
+              const next = nextNodeId(currentNodeId, adjacency);
+              const msg  = "⏱ Booking request timed out. Please try again.";
+              if (!next) { await resetSession(guestId, hotelId); return msg; }
+              await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+              return advance(next);
+            }
+            throw err;
+          }
 
           flowData.flowVars = {
             ...flowData.flowVars,
@@ -1178,6 +1259,34 @@ export async function executeFlowStep(
           return rest ? `${reply}\n\n${rest}` : reply;
         }
 
+        // ── cancel_booking ─────────────────────────────────────────────────────
+        if (d.actionType === "cancel_booking") {
+          const bookingId = d.bookingRefVar
+            ? flowData.flowVars[d.bookingRefVar]
+            : flowData.flowVars["bookingId"] ?? flowData.flowVars["bookingRef"];
+
+          if (!bookingId) {
+            log.error({ flowId, nodeId: currentNodeId, hotelId, guestId }, "cancel_booking: no bookingId in flowVars");
+            flowData.flowVars = { ...flowData.flowVars, __flowError__: "No booking found to cancel." };
+          } else {
+            try {
+              await withActionTimeout(cancelBooking(bookingId, hotelId));
+              flowData.flowVars = { ...flowData.flowVars, __cancelSuccess__: "true" };
+            } catch (err: any) {
+              const msg = err.message === "Action timeout"
+                ? "Request timed out. Please try again."
+                : (err.message ?? "Could not cancel booking.");
+              log.error({ flowId, nodeId: currentNodeId, hotelId, guestId, err }, "cancel_booking failed");
+              flowData.flowVars = { ...flowData.flowVars, __flowError__: msg };
+            }
+          }
+
+          const next = nextNodeId(currentNodeId, adjacency);
+          if (!next) { await resetSession(guestId, hotelId); return null; }
+          await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+          return advance(next);
+        }
+
         // Unknown action — advance silently
         const next = nextNodeId(currentNodeId, adjacency);
         if (!next) { await resetSession(guestId, hotelId); return null; }
@@ -1360,6 +1469,61 @@ export async function executeFlowStep(
         if (!menuText) return rest;
         if (!rest)     return menuText;
         return `${menuText}\n\n${rest}`;
+      }
+
+      // ── delay ─────────────────────────────────────────────────────────────────
+      // Pauses flow execution for a configurable duration. Saves a PausedFlow
+      // record + enqueues a BullMQ job on 'flow-resume'. The session is reset to
+      // IDLE so the guest can still interact with the menu during the pause.
+      case "delay": {
+        const d = node.data as DelayNodeData;
+
+        const durationMs =
+          d.unit === "minutes" ? (d.duration ?? 1) * 60_000 :
+          d.unit === "hours"   ? (d.duration ?? 1) * 3_600_000 :
+                                 (d.duration ?? 1) * 86_400_000; // days
+
+        const resumeAt    = new Date(Date.now() + durationMs);
+        const resumeNodeId = nextNodeId(currentNodeId, adjacency);
+
+        if (!resumeNodeId) {
+          // No output edge — treat the delay as a terminal node
+          await resetSession(guestId, hotelId);
+          const msg = d.resumeMessage ? interpolate(d.resumeMessage, flowData.flowVars) : null;
+          return msg;
+        }
+
+        // Persist pause context so the worker can restore execution
+        const paused = await prisma.pausedFlow.create({
+          data: {
+            hotelId,
+            guestId,
+            flowId,
+            nodeId:   resumeNodeId,
+            flowVars: flowData.flowVars,
+            resumeAt,
+          },
+        });
+
+        // jobId deduplicates: if the guest triggers the same flow again before
+        // the timer fires, BullMQ silently discards the duplicate enqueue.
+        const jobIdStr = `flow-resume:${guestId}:${flowId}`;
+        const job = await flowResumeQueue.add(
+          "resume",
+          { pausedFlowId: paused.id },
+          { delay: durationMs, jobId: jobIdStr },
+        );
+
+        // Store the actual BullMQ job id for potential future cancellation
+        await prisma.pausedFlow.update({
+          where: { id: paused.id },
+          data:  { jobId: job.id ?? null },
+        });
+
+        // Park the session so mid-pause messages don't re-enter the flow
+        await resetSession(guestId, hotelId);
+
+        return d.resumeMessage ? interpolate(d.resumeMessage, flowData.flowVars) : null;
       }
 
       default: {

@@ -272,7 +272,7 @@ export async function sendManualReply(input: {
   text:      string;
   channel:   MessageChannel;
 }): Promise<{ message: any; delaySeconds: number | null }> {
-  const { hotelId, guestId, fromPhone, toPhone, text ,channel = MessageChannel.WHATSAPP } = input;
+  const { hotelId, guestId, fromPhone, toPhone, text, channel } = input;
 
   // Mark as handled by staff and reset bot session
   await prisma.guest.updateMany({

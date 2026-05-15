@@ -65,6 +65,30 @@ async function withRetry<T>(
   throw lastErr;
 }
 
+/**
+ * Exported retry wrapper for Meta API calls. Linear backoff: attempt * 1000ms.
+ * Retries on network errors, 429, and 5xx responses.
+ */
+export async function withMetaRetry<T>(
+  fn:          () => Promise<T>,
+  maxAttempts = 3,
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastErr = err;
+      const isRetryable = !err.status || err.status === 429 || err.status >= 500;
+      if (!isRetryable || attempt === maxAttempts - 1) throw err;
+      const delay = (attempt + 1) * 1_000;
+      log.warn({ attempt: attempt + 1, delayMs: delay }, "Meta API attempt failed — retrying");
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
 // ── Low-level Meta POST ───────────────────────────────────────────────────────
 
 async function metaPost(

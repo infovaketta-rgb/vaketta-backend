@@ -106,6 +106,7 @@ model Hotel {
   menu   HotelMenu?
   whatsappTemplates WhatsAppTemplate[]
   savedReplies      SavedReply[]
+  pausedFlows       PausedFlow[]
 }
 
 model HotelConfig {
@@ -223,6 +224,7 @@ model Guest {
   bookings             Booking[]
   messages             Message[]
   conversationSessions ConversationSession[]
+  pausedFlows          PausedFlow[]
 
   @@unique([phone, hotelId])
 }
@@ -388,18 +390,44 @@ model FlowDefinition {
   hotelId     String?  // null = global template (Vaketta admin-created)
   name        String
   description String?
-  nodes       Json     @default("[]")
-  edges       Json     @default("[]")
+  nodes       Json     @default("[]")  // deprecated — use publishedVersion via publishedVersionId
+  edges       Json     @default("[]")  // deprecated — use publishedVersion via publishedVersionId
   isActive    Boolean  @default(true)
   isTemplate  Boolean  @default(false)  // true = global template visible to all hotels
+  publishedVersionId String?  // soft ref to current published FlowVersion (no FK constraint)
+  draftVersionId     String?  // soft ref to current draft FlowVersion (no FK constraint)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   hotel     Hotel?          @relation(fields: [hotelId], references: [id], onDelete: Cascade)
   menuItems HotelMenuItem[]
+  versions  FlowVersion[]
 
   @@index([hotelId])
   @@index([isTemplate])
+}
+
+enum FlowVersionStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model FlowVersion {
+  id            String            @id @default(cuid())
+  flowId        String
+  versionNumber Int
+  nodes         Json
+  edges         Json
+  status        FlowVersionStatus @default(DRAFT)
+  publishedAt   DateTime?
+  createdAt     DateTime          @default(now())
+  createdBy     String?
+
+  flow FlowDefinition @relation(fields: [flowId], references: [id], onDelete: Cascade)
+
+  @@unique([flowId, versionNumber])
+  @@index([flowId, status])
 }
 
 // Lead capture — submitted from the public landing page
@@ -604,4 +632,25 @@ model SavedReply {
   hotel     Hotel    @relation(fields: [hotelId], references: [id], onDelete: Cascade)
 
   @@index([hotelId])
+}
+
+// ── Paused flow resumption ─────────────────────────────────────────────────────
+// One record per in-flight delay node. Holds the full flow state so the
+// BullMQ resume job can restore execution without touching ConversationSession.
+model PausedFlow {
+  id        String   @id @default(cuid())
+  hotelId   String
+  guestId   String
+  flowId    String
+  nodeId    String    // the node AFTER the delay — where execution resumes
+  flowVars  Json
+  resumeAt  DateTime
+  jobId     String?   // BullMQ job ID — stored for potential future cancellation
+  createdAt DateTime  @default(now())
+
+  hotel     Hotel    @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  guest     Guest    @relation(fields: [guestId], references: [id], onDelete: Cascade)
+
+  @@index([guestId, hotelId])
+  @@index([resumeAt])
 }

@@ -13,7 +13,8 @@ export type NodeType =
   | "jump"                // jumps to another node in the same flow (enables loops / sub-menus)
   | "show_menu"           // emits the hotel's formatted WhatsApp menu text inline
   | "send_template"       // sends an approved WhatsApp template; routes success / failure
-  | "send_saved_reply";   // sends an internal saved reply with {{var}} resolution
+  | "send_saved_reply"    // sends an internal saved reply with {{var}} resolution
+  | "delay";              // pauses the flow for a configurable duration then resumes
 
 // ── Per-node data shapes ───────────────────────────────────────────────────────
 
@@ -164,6 +165,17 @@ export interface EndNodeData {
 }
 
 /**
+ * delay node
+ * Pauses flow execution for a configurable duration, then resumes from the
+ * next connected node via a BullMQ job on the 'flow-resume' queue.
+ */
+export interface DelayNodeData {
+  duration:       number;                       // e.g. 24
+  unit:           "minutes" | "hours" | "days";
+  resumeMessage?: string;  // optional message sent to guest when the pause starts
+}
+
+/**
  * time_condition node
  * Reads the hotel's businessStartHour / businessEndHour from HotelConfig and the hotel timezone.
  * Routes to one of three handles: "business_hours" | "after_hours" | "weekend"
@@ -219,7 +231,8 @@ export type FlowNodeData =
   | TimeConditionNodeData
   | JumpNodeData
   | ShowMenuNodeData
-  | SendTemplateNodeData;
+  | SendTemplateNodeData
+  | DelayNodeData;
 
 // ── Serialised graph (stored as JSON in FlowDefinition.nodes / .edges) ─────────
 

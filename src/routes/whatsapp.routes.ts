@@ -20,7 +20,7 @@ router.get(
 
 /**
  * Incoming WhatsApp webhooks
- * raw body -> parse -> verify signature -> controller
+ * raw body -> verify signature -> parse JSON -> controller
  */
 router.post(
   "/webhook/whatsapp",
@@ -30,28 +30,28 @@ router.post(
     limit: "1mb"
   }),
 
-  (req:any,res,next)=>{
+  // Save raw body for HMAC verification, then verify signature BEFORE parsing.
+  // This ensures unauthenticated requests are rejected even when JSON is malformed.
+  (req: any, _res, next) => {
     req.rawBody = req.body;
-
-    try{
-      req.body = JSON.parse(
-        req.body.toString()
-      );
-    } catch {
-      logger.warn(
-        "[WhatsApp] Invalid JSON payload"
-      );
-
-      // Always ACK Meta to prevent retries
-      return res.sendStatus(200);
-    }
-
     next();
   },
 
   verifyWebhookSignature(
     process.env.FACEBOOK_APP_SECRET!
   ),
+
+  // Parse JSON after signature is confirmed. ACK Meta on malformed payloads
+  // so it does not retry — malformed but signed bodies are Meta bugs, not ours.
+  (req: any, res, next) => {
+    try {
+      req.body = JSON.parse(req.rawBody.toString());
+    } catch {
+      logger.warn("[WhatsApp] Signed but invalid JSON payload — ACKing to stop retries");
+      return res.sendStatus(200);
+    }
+    next();
+  },
 
   handleWhatsAppWebhook
 );

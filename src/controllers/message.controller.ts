@@ -3,6 +3,7 @@ import { sendManualReply, cancelPendingSend } from "../services/message.service"
 import prisma from "../db/connect";
 import { MessageStatus, MessageChannel } from "@prisma/client";
 import { logger } from "../utils/logger";
+import { redis } from "../queue/redis";
 
 const log = logger.child({ service: "message" });
 import { emitToHotel } from "../realtime/emit";
@@ -21,6 +22,14 @@ export async function manualReply(req: Request, res: Response) {
     }
     if (typeof text !== "string" || text.length > 4096) {
       return res.status(400).json({ error: "text must be 1–4096 characters" });
+    }
+
+    // Rate limit: max 100 manual replies per minute per guest per hotel
+    const rlKey   = `ratelimit:manualreply:${hotelId}:${guestId}`;
+    const rlCount = await redis.incr(rlKey);
+    if (rlCount === 1) await redis.expire(rlKey, 60);
+    if (rlCount > 100) {
+      return res.status(429).json({ error: "Rate limit exceeded. Max 100 messages per minute per guest." });
     }
 
     // Scope lookup to this hotel — prevents cross-tenant guest access

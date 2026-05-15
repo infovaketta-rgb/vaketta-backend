@@ -112,18 +112,25 @@ export async function editBooking(req: Request, res: Response) {
 
     const { guestName, roomTypeId, checkIn, checkOut, pricePerNight, advancePaid } = req.body;
 
-    const booking = await updateBookingService({
-      id: bookingId,
-      hotelId,
-      guestName,
-      roomTypeId,
-      checkIn,
-      checkOut,
-      ...(pricePerNight !== undefined ? { pricePerNight: Number(pricePerNight) } : {}),
-      ...(advancePaid !== undefined ? { advancePaid: Number(advancePaid) } : {}),
+    // Serialize concurrent edits on the same booking to prevent lost updates.
+    // pg_advisory_xact_lock blocks any other transaction locking the same key
+    // until this transaction commits or rolls back — auto-released, no manual unlock.
+    let booking: Awaited<ReturnType<typeof updateBookingService>>;
+    await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${bookingId}))`;
+      booking = await updateBookingService({
+        id: bookingId,
+        hotelId,
+        guestName,
+        roomTypeId,
+        checkIn,
+        checkOut,
+        ...(pricePerNight !== undefined ? { pricePerNight: Number(pricePerNight) } : {}),
+        ...(advancePaid !== undefined ? { advancePaid: Number(advancePaid) } : {}),
+      });
     });
 
-    res.json(booking);
+    res.json(booking!);
   } catch (err: any) {
     log.error({ err: err.message }, "edit booking failed");
     res.status(400).json({ error: err.message || "Failed to edit booking" });

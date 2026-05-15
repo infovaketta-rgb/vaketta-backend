@@ -32,11 +32,12 @@ export async function updateBookingService({
   const finalCheckOut = checkOut ? new Date(checkOut) : booking.checkOut;
   const finalRoomTypeId = roomTypeId ?? booking.roomTypeId;
 
-  if (finalCheckOut <= finalCheckIn) throw new Error("Check-out must be after check-in");
+  const MS_PER_DAY   = 24 * 60 * 60 * 1000;
+  const checkInDay   = Math.floor(finalCheckIn.getTime()  / MS_PER_DAY) * MS_PER_DAY;
+  const checkOutDay  = Math.floor(finalCheckOut.getTime() / MS_PER_DAY) * MS_PER_DAY;
+  const nights       = Math.floor((checkOutDay - checkInDay) / MS_PER_DAY);
 
-  const nights = Math.ceil(
-    (finalCheckOut.getTime() - finalCheckIn.getTime()) / (1000 * 60 * 60 * 24)
-  );
+  if (nights < 1) throw new Error("Check-out must be at least 1 day after check-in");
 
   const finalPrice = pricePerNight ?? booking.pricePerNight;
   const totalPrice = nights * finalPrice;
@@ -110,14 +111,14 @@ if (isNaN(checkInDate.getTime()) || isNaN(checkOutDate.getTime())) {
   throw new Error("Invalid check-in or check-out date");
 }
 
-if (checkOutDate <= checkInDate) {
-  throw new Error("Check-out must be after check-in");
-}
+const MS_PER_DAY  = 24 * 60 * 60 * 1000;
+const checkInDay  = Math.floor(checkInDate.getTime()  / MS_PER_DAY) * MS_PER_DAY;
+const checkOutDay = Math.floor(checkOutDate.getTime() / MS_PER_DAY) * MS_PER_DAY;
+const nights      = Math.floor((checkOutDay - checkInDay) / MS_PER_DAY);
 
-const nights = Math.ceil(
-  (checkOutDate.getTime() - checkInDate.getTime()) /
-  (1000 * 60 * 60 * 24)
-);
+if (nights < 1) {
+  throw new Error("Check-out must be at least 1 day after check-in");
+}
 
 
   const totalPrice = nights * finalPrice;
@@ -168,4 +169,17 @@ const nights = Math.ceil(
   emitToHotel(hotelId, "booking:new", { booking });
 
   return booking;
+}
+
+export async function cancelBooking(bookingId: string, hotelId: string) {
+  const booking = await prisma.booking.findFirst({ where: { id: bookingId, hotelId } });
+  if (!booking) throw new Error("Booking not found");
+  if (booking.status === BookingStatus.CANCELLED) {
+    throw new Error("This booking has already been cancelled.");
+  }
+
+  return prisma.booking.update({
+    where: { id: bookingId },
+    data:  { status: BookingStatus.CANCELLED },
+  });
 }

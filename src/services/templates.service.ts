@@ -3,6 +3,7 @@ import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { TemplateCategory, TemplateStatus, MessageStatus, MessageChannel } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
 import { logger } from "../utils/logger";
+import { withMetaRetry } from "./whatsapp.send.service";
 
 const log = logger.child({ service: "templates" });
 
@@ -217,6 +218,13 @@ export async function createTemplate(hotelId: string, data: any) {
 export async function updateTemplate(hotelId: string, templateId: string, data: any) {
   const existing = await prisma.whatsAppTemplate.findFirst({ where: { id: templateId, hotelId } });
   if (!existing) throw Object.assign(new Error("Template not found"), { status: 404 });
+
+  if ((existing.status as string) === "PERMANENTLY_DELETED") {
+    throw Object.assign(
+      new Error("This template has been permanently deleted on Meta and cannot be edited."),
+      { status: 400 }
+    );
+  }
 
   if (existing.status === "DISABLED") {
     throw Object.assign(
@@ -594,45 +602,27 @@ export async function sendTemplateMessage(
 
   log.info({ templateName: template.name, payload }, "[templates] sending template message to Meta");
 
-  // Hard 30s ceiling on the Meta call. Without this, a stalled request hangs
-  // until the platform's own (much longer) socket timeout fires — meanwhile
-  // the frontend gives up and the user sees a misleading "failed" toast.
-  const controller = new AbortController();
-  const timeoutId  = setTimeout(() => controller.abort(), 30_000);
-  const startedAt  = Date.now();
+  const startedAt = Date.now();
 
-  let metaRes: Response;
-  try {
-    metaRes = await fetch(
+  const metaData = await withMetaRetry(async () => {
+    const res = await fetch(
       `https://graph.facebook.com/v25.0/${phoneNumberId}/messages`,
       {
         method:  "POST",
         headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
         body:    JSON.stringify(payload),
-        signal:  controller.signal,
+        signal:  AbortSignal.timeout(15_000), // 15s per attempt
       }
     );
-  } catch (err: any) {
-    if (err?.name === "AbortError") {
-      log.warn({ templateName: template.name, elapsedMs: Date.now() - startedAt }, "[templates] Meta template send timed out");
-      throw Object.assign(
-        new Error("Meta did not respond within 30s — please retry"),
-        { status: 504 }
-      );
+    const data = await res.json() as any;
+    if (!res.ok) {
+      log.warn({ templateName: template.name, payload, metaError: data?.error, elapsedMs: Date.now() - startedAt }, "[templates] Meta rejected template send");
+      const err: any = new Error(data?.error?.message ?? "Failed to send template message");
+      err.status = res.status;
+      throw err;
     }
-    throw err;
-  } finally {
-    clearTimeout(timeoutId);
-  }
-
-  const metaData = await metaRes.json() as any;
-  if (!metaRes.ok) {
-    log.warn({ templateName: template.name, payload, metaError: metaData?.error, elapsedMs: Date.now() - startedAt }, "[templates] Meta rejected template send");
-    throw Object.assign(
-      new Error(metaData?.error?.message ?? "Failed to send template message"),
-      { status: 502 }
-    );
-  }
+    return data;
+  });
 
   const wamid      = metaData?.messages?.[0]?.id ?? null;
   const fromPhone  = hotel?.phone ?? "";

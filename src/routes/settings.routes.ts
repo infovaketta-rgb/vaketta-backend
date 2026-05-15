@@ -31,6 +31,10 @@ import {
   createHotelFlowHandler,
   updateHotelFlowHandler,
   deleteHotelFlowHandler,
+  saveDraftHandler,
+  publishDraftHandler,
+  rollbackToVersionHandler,
+  listVersionsHandler,
 } from "../controllers/flow.controller";
 import {
   getCalendarHandler,
@@ -80,10 +84,15 @@ router.patch("/availability/toggle", patchToggleHandler);
 router.delete("/chats",            deleteAllChatsHandler);
 
 // Flow definitions (hotel-private + read access to global templates)
-router.get("/flows",           getHotelFlowsHandler);
-router.post("/flows",          createHotelFlowHandler);
-router.get("/flows/:id",       getHotelFlowHandler);
-router.patch("/flows/:id",     updateHotelFlowHandler);
-router.delete("/flows/:id",    deleteHotelFlowHandler);
+router.get("/flows",                               getHotelFlowsHandler);
+router.post("/flows",                              createHotelFlowHandler);
+router.get("/flows/:id",                           getHotelFlowHandler);
+router.patch("/flows/:id",                         updateHotelFlowHandler);
+router.delete("/flows/:id",                        deleteHotelFlowHandler);
+// Versioning
+router.post("/flows/:id/draft",                    saveDraftHandler);
+router.post("/flows/:id/publish",                  publishDraftHandler);
+router.get("/flows/:id/versions",                  listVersionsHandler);
+router.post("/flows/:id/rollback/:versionId",      rollbackToVersionHandler);
 
 export default router;

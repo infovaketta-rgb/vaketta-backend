@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import {
   getHotelFlows, getHotelFlow, createHotelFlow, updateHotelFlow, deleteHotelFlow,
   getAllFlows, getAdminFlow, createAdminFlow, updateAdminFlow, deleteAdminFlow,
+  saveDraft, publishDraft, rollbackToVersion, listVersions,
 } from "../services/flow.service";
 
 // ── Hotel-facing handlers ─────────────────────────────────────────────────────
@@ -56,6 +57,56 @@ export async function deleteHotelFlowHandler(req: Request, res: Response) {
     const hotelId = (req as any).user.hotelId as string;
     await deleteHotelFlow(req.params["id"]!, hotelId);
     res.json({ success: true });
+  } catch (err: any) {
+    const status = err.message.includes("access denied") ? 403 : 500;
+    res.status(status).json({ error: err.message });
+  }
+}
+
+// ── Versioning handlers ───────────────────────────────────────────────────────
+
+export async function saveDraftHandler(req: Request, res: Response) {
+  try {
+    const hotelId  = (req as any).user.hotelId as string;
+    const userName = (req as any).user.name   as string | undefined;
+    const { name, nodes, edges } = req.body;
+    const flow = await saveDraft(req.params["id"]!, hotelId, { name, nodes, edges, ...(userName && { userName }) });
+    res.json(flow);
+  } catch (err: any) {
+    const status = err.message.includes("access denied") ? 403 : 500;
+    res.status(status).json({ error: err.message });
+  }
+}
+
+export async function publishDraftHandler(req: Request, res: Response) {
+  try {
+    const hotelId = (req as any).user.hotelId as string;
+    const flow = await publishDraft(req.params["id"]!, hotelId);
+    res.json(flow);
+  } catch (err: any) {
+    const status = err.message.includes("access denied") ? 403
+      : err.message.includes("No draft") ? 400 : 500;
+    res.status(status).json({ error: err.message });
+  }
+}
+
+export async function rollbackToVersionHandler(req: Request, res: Response) {
+  try {
+    const hotelId = (req as any).user.hotelId as string;
+    const flow = await rollbackToVersion(req.params["id"]!, hotelId, req.params["versionId"]!);
+    res.json(flow);
+  } catch (err: any) {
+    const status = err.message.includes("access denied") ? 403
+      : err.message.includes("not found") ? 404 : 500;
+    res.status(status).json({ error: err.message });
+  }
+}
+
+export async function listVersionsHandler(req: Request, res: Response) {
+  try {
+    const hotelId  = (req as any).user.hotelId as string;
+    const versions = await listVersions(req.params["id"]!, hotelId);
+    res.json(versions);
   } catch (err: any) {
     const status = err.message.includes("access denied") ? 403 : 500;
     res.status(status).json({ error: err.message });
