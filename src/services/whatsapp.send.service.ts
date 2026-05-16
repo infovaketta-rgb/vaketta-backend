@@ -154,8 +154,8 @@ export interface CarouselCard {
 /**
  * Sends a WhatsApp Cloud API "interactive carousel" — a horizontally
  * scrollable strip of up to 10 cards, each with image header, body text,
- * footer, and a single quick-reply button. Used by the flow engine's
- * show_rooms node to render rooms visually instead of as a numbered text list.
+ * footer, and 2 quick-reply buttons: one to select the room, one to view
+ * its photos. Used by the flow engine's show_rooms node.
  *
  * On success returns the wamid (Meta message id). Throws with a descriptive
  * message on failure.
@@ -193,15 +193,24 @@ export async function sendCarouselMessage(
           header:     { type: "image", image: { link: c.imageUrl } },
           body:       { text: `*${c.title}*\n₹${c.price}/night\n${c.description}` },
           action: {
-            buttons: [{
-              type: "quick_reply",
-              quick_reply: {
-                id:    c.buttonId,
-                // Meta caps quick_reply.title at 20 chars — slice defensively
-                // in case a caller didn't pre-validate.
-                title: (c.buttonLabel ?? "Select Room").slice(0, 20),
+            buttons: [
+              {
+                type: "quick_reply",
+                quick_reply: {
+                  id:    c.buttonId,
+                  // Meta caps quick_reply.title at 20 chars — slice defensively
+                  title: (c.buttonLabel ?? "Select Room").slice(0, 20),
+                },
               },
-            }],
+              {
+                type: "quick_reply",
+                quick_reply: {
+                  // buttonId is "room_<roomId>"; derive "photos_<roomId>"
+                  id:    `photos_${c.buttonId.replace(/^room_/, "")}`,
+                  title: "View Photos",
+                },
+              },
+            ],
           },
         })),
       },

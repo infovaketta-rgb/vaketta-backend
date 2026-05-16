@@ -42,7 +42,7 @@ import { generateReferenceNumber } from "../utils/booking.utils";
 import { cancelBooking } from "../services/booking.service";
 import { BookingStatus, MessageChannel, MessageStatus } from "@prisma/client";
 import { shouldAutoReply } from "./shouldAutoReply";
-import { sendCarouselMessage, type CarouselCard } from "../services/whatsapp.send.service";
+import { sendCarouselMessage, sendMediaMessage, type CarouselCard } from "../services/whatsapp.send.service";
 import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
@@ -913,6 +913,78 @@ export async function executeFlowStep(
         try { rawList = JSON.parse(flowData.flowVars["__roomList__"] ?? "[]"); } catch { /* corrupted — treat as empty */ }
 
         if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+
+        // ── View Photos handler ───────────────────────────────────────────────
+        // Carousel "View Photos" buttons emit "photos_<roomId>". Send extra
+        // photos then re-render the carousel so the guest can still select.
+        const photosIdMatch = input.match(/^photos_(.+)$/);
+        if (photosIdMatch) {
+          const roomId = photosIdMatch[1]!;
+
+          const [roomType, guest] = await Promise.all([
+            prisma.roomType.findFirst({
+              where:   { id: roomId, hotelId },
+              include: { photos: { orderBy: { order: "asc" } } },
+            }),
+            prisma.guest.findUnique({ where: { id: guestId }, select: { phone: true } }),
+          ]);
+
+          // Keep session at this node — guest still needs to pick a room
+          await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
+
+          // Skip index 0 (shown as the carousel header image); send up to 5 more
+          const extraPhotos = (roomType?.photos ?? []).slice(1, 6);
+
+          if (!roomType || extraPhotos.length === 0 || !guest) {
+            return "No additional photos available for this room.";
+          }
+
+          for (const photo of extraPhotos) {
+            try {
+              await sendMediaMessage({
+                toPhone:     guest.phone,
+                hotelId,
+                messageType: "image",
+                mediaUrl:    photo.url,
+                mimeType:    "image/jpeg",
+                caption:     null,
+              });
+            } catch (err) {
+              log.warn({ err, roomId, url: photo.url }, "show_rooms: photo send failed");
+            }
+          }
+
+          // Re-send carousel so guest can still select a room.
+          // Re-fetch rooms with full data (description, carouselButtonLabel) using
+          // the stored ID order from __roomList__.
+          let repromptIds: string[] = [];
+          try {
+            const stored: { id: string }[] = JSON.parse(flowData.flowVars["__roomList__"] ?? "[]");
+            repromptIds = stored.map((r) => r.id);
+          } catch { /* ignore */ }
+
+          if (repromptIds.length >= 2) {
+            const fullRooms = await prisma.roomType.findMany({
+              where:   { id: { in: repromptIds }, hotelId },
+              select:  { id: true, name: true, basePrice: true, description: true, carouselButtonLabel: true },
+            });
+            const byId = new Map(fullRooms.map((r) => [r.id, r]));
+            const orderedRooms = repromptIds
+              .map((id) => byId.get(id))
+              .filter((r): r is NonNullable<typeof r> => r !== undefined);
+
+            if (orderedRooms.length >= 2) {
+              await trySendRoomCarousel({
+                hotelId,
+                guestId,
+                displayRooms: orderedRooms.slice(0, 10),
+                promptText:   interpolate(d.text || "Please choose a room type:", flowData.flowVars),
+              });
+            }
+          }
+
+          return "ALREADY_SENT";
+        }
 
         // Resolve the selected room. Carousel button replies come in as
         // "room_<roomId>" (synthesised in the webhook handler from
