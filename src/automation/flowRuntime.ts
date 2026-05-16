@@ -16,6 +16,7 @@
  *   handoff_to_staff, notify_staff, reset_to_menu, set_variable, send_review_request, view_bookings
  */
 
+import * as chrono from "chrono-node";
 import prisma from "../db/connect";
 import { logger } from "../utils/logger";
 
@@ -45,6 +46,7 @@ import { sendCarouselMessage, type CarouselCard } from "../services/whatsapp.sen
 import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
+import { extractDateWithAI } from "../services/ai.service";
 
 // Generic placeholder served when a room has no photos. Reliable HTTPS host —
 // Meta requires a publicly fetchable URL for interactive image headers.
@@ -115,6 +117,13 @@ function parseFlexDate(raw: string): Date | null {
     return isNaN(d.getTime()) ? null : d;
   }
   return null;
+}
+
+/** Parse any natural-language date string from a guest. Tries chrono-node first; falls back to AI extraction. */
+async function parseGuestDate(input: string): Promise<Date | null> {
+  const chronoResult = chrono.parseDate(input.trim(), new Date(), { forwardDate: true }) ?? null;
+  if (chronoResult) return chronoResult;
+  return extractDateWithAI(input);
 }
 
 /** Normalise date to YYYY-MM-DD string */
@@ -560,14 +569,13 @@ export async function executeFlowStep(
           if (!flowData.waitingFor) {
             flowData.waitingFor = "answer";
             await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
-            const hint = " _(DD/MM/YYYY)_";
-            return interpolate(d.text || "Please enter a date:", flowData.flowVars) + hint;
+            return interpolate(d.text || "Please enter a date:", flowData.flowVars);
           }
 
-          const parsed = parseFlexDate(input);
+          const parsed = await parseGuestDate(input);
           if (!parsed) {
             await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
-            return d.validationError || "Please enter a valid date in *DD/MM/YYYY* format.";
+            return d.validationError || "I didn't catch that date 😅 Try something like *25 May* or *25/05/2026*";
           }
 
           if (d.dateMin === "today" && parsed < todayUTC()) {
@@ -718,7 +726,7 @@ export async function executeFlowStep(
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
           return d.validationError || "Please provide a valid email address.";
         }
-        if (rule === "date"    && !parseFlexDate(input)) {
+        if (rule === "date"    && !(await parseGuestDate(input))) {
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
           return d.validationError || "Please provide a valid date.";
         }

@@ -422,3 +422,62 @@ export async function getAIReply(
     return null;
   }
 }
+
+// ── Date extraction (internal utility) ───────────────────────────────────────
+
+/**
+ * Ask the AI to extract a calendar date from free-form guest text.
+ * Returns a Date (midnight UTC) or null. Intentionally cheap: tiny prompt,
+ * max_tokens=15, temperature=0, 3 s timeout. Never throws.
+ *
+ * Called from flowRuntime when chrono-node cannot parse the guest's input.
+ * Does NOT count against incrementAIUsage — this is structural parsing, not
+ * a guest-facing conversational reply.
+ */
+export async function extractDateWithAI(input: string): Promise<Date | null> {
+  const today  = new Date().toISOString().slice(0, 10);
+  const prompt =
+    `Today is ${today}. A hotel guest typed a date. ` +
+    `Extract the calendar date they mean and reply with ONLY a date in YYYY-MM-DD format. ` +
+    `If the year is ambiguous, use the nearest future date from today. ` +
+    `If no date can be determined, reply with exactly: null\n\nGuest input: "${input}"`;
+
+  const provider = activeProvider();
+  let raw: string | null = null;
+
+  const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000));
+
+  try {
+    if (provider === "openai") {
+      const client = getOpenAIClient();
+      if (!client) return null;
+      const call = client.chat.completions.create({
+        model:       OPENAI_MODEL,
+        max_tokens:  15,
+        temperature: 0,
+        messages:    [{ role: "user", content: prompt }],
+      }).then((r) => r.choices[0]?.message?.content?.trim() ?? null);
+      raw = await Promise.race([call, timeout]);
+    } else {
+      const client = getAnthropicClient();
+      if (!client) return null;
+      const call = client.messages.create({
+        model:      ANTHROPIC_MODEL,
+        max_tokens: 15,
+        messages:   [{ role: "user", content: prompt }],
+      }).then((r) => (r.content[0]?.type === "text" ? r.content[0].text.trim() : null));
+      raw = await Promise.race([call, timeout]);
+    }
+  } catch (err) {
+    log.warn({ err }, "extractDateWithAI: API call failed");
+    return null;
+  }
+
+  if (!raw || raw.toLowerCase() === "null") return null;
+
+  // Pull a YYYY-MM-DD substring in case the model adds surrounding text
+  const match = raw.match(/\d{4}-\d{2}-\d{2}/);
+  if (!match) return null;
+  const d = new Date(`${match[0]}T00:00:00Z`);
+  return isNaN(d.getTime()) ? null : d;
+}
