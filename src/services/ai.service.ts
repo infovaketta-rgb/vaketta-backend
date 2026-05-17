@@ -423,6 +423,57 @@ export async function getAIReply(
   }
 }
 
+// ── Booking intent classifier (internal utility) ─────────────────────────────
+
+/**
+ * Classify a guest's freeform reply to a confirm/cancel prompt.
+ * Returns "confirm", "cancel", or "unclear". Never throws.
+ * Intentionally cheap: max_tokens=5, temperature=0, 3 s timeout.
+ */
+export async function classifyBookingIntent(
+  input: string,
+): Promise<"confirm" | "cancel" | "unclear"> {
+  const prompt =
+    `The guest was asked to confirm or cancel their hotel booking. ` +
+    `They replied: '${input}'\n` +
+    `Classify their intent as exactly one word: confirm, cancel, or unclear`;
+
+  const provider = activeProvider();
+  const timeout  = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000));
+
+  let raw: string | null = null;
+
+  try {
+    if (provider === "openai") {
+      const client = getOpenAIClient();
+      if (!client) return "unclear";
+      const call = client.chat.completions.create({
+        model:       OPENAI_MODEL,
+        max_tokens:  5,
+        temperature: 0,
+        messages:    [{ role: "user", content: prompt }],
+      }).then((r) => r.choices[0]?.message?.content?.trim().toLowerCase() ?? null);
+      raw = await Promise.race([call, timeout]);
+    } else {
+      const client = getAnthropicClient();
+      if (!client) return "unclear";
+      const call = client.messages.create({
+        model:      ANTHROPIC_MODEL,
+        max_tokens: 5,
+        messages:   [{ role: "user", content: prompt }],
+      }).then((r) => (r.content[0]?.type === "text" ? r.content[0].text.trim().toLowerCase() : null));
+      raw = await Promise.race([call, timeout]);
+    }
+  } catch (err) {
+    log.warn({ err }, "classifyBookingIntent: API call failed");
+    return "unclear";
+  }
+
+  if (raw === "confirm") return "confirm";
+  if (raw === "cancel")  return "cancel";
+  return "unclear";
+}
+
 // ── Date extraction (internal utility) ───────────────────────────────────────
 
 /**

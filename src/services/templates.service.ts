@@ -635,14 +635,33 @@ export async function sendTemplateMessage(
     (_: string, id: string) => values[id] ?? `{{${id}}}`
   );
 
+  // Snapshot the display components so the dashboard bubble can render
+  // header / footer / buttons after a page refresh. The socket event carries
+  // the raw DB record (no in-memory template field), so the frontend relies
+  // on this JSON to reconstruct the rich card.
+  const hdr = components.header as any;
+  const bubbleComponents = {
+    ...(hdr ? {
+      header: {
+        format:    headerFormat ?? null,
+        text:      hdr.text      ?? null,
+        mediaUrl:  hdr.mediaUrl  ?? null,
+        sampleUrl: hdr.sampleUrl ?? null,
+      },
+    } : {}),
+    body:   { text: renderedBody },
+    ...(components.footer?.text ? { footer: { text: components.footer.text } } : {}),
+    ...((components.buttons as any[])?.length ? { buttons: components.buttons } : {}),
+  };
+
   // Persist so the chat thread shows the outbound bubble immediately
   const savedMessage = await prisma.message.create({
     data: {
       direction:   "OUT",
       fromPhone,
       toPhone:     guest.phone,
-      body:        renderedBody,
-      messageType: "text",
+      body:        JSON.stringify({ renderedBody, components: bubbleComponents }),
+      messageType: "template",
       hotelId,
       guestId,
       channel:     MessageChannel.WHATSAPP,

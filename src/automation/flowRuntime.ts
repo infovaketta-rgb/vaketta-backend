@@ -46,7 +46,7 @@ import { sendCarouselMessage, sendMediaMessage, type CarouselCard } from "../ser
 import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
-import { extractDateWithAI } from "../services/ai.service";
+import { extractDateWithAI, classifyBookingIntent } from "../services/ai.service";
 
 // Generic placeholder served when a room has no photos. Reliable HTTPS host —
 // Meta requires a publicly fetchable URL for interactive image headers.
@@ -653,6 +653,15 @@ export async function executeFlowStep(
           const isNo  = clean === "2" || clean === "no"  || clean === "n";
 
           if (!isYes && !isNo) {
+            const intent = await classifyBookingIntent(input);
+            if (intent === "confirm" || intent === "cancel") {
+              flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, intent === "confirm" ? "yes" : "no");
+              delete flowData.waitingFor;
+              const next = nextNodeId(currentNodeId, adjacency);
+              if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+              await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+              return advance(next);
+            }
             await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
             return d.validationError || `Please reply *1* for *${yesLabel}* or *2* for *${noLabel}*.`;
           }
