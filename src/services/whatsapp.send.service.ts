@@ -232,6 +232,76 @@ export async function sendCarouselMessage(
   return wamid as string;
 }
 
+// ── Interactive list message ──────────────────────────────────────────────────
+
+export interface ListSection {
+  title: string;
+  rows:  Array<{ id: string; title: string; description?: string }>;
+}
+
+/**
+ * Sends a WhatsApp Cloud API "interactive list" message — a bottom-sheet picker
+ * the guest opens by tapping a button. Meta collapses the guest's tap into a
+ * list_reply with the selected row id, which the webhook handler already
+ * synthesises to a plain text body (see whatsapp.controller.ts line ~142).
+ *
+ * Returns the wamid on success. Throws on failure.
+ */
+export async function sendListMessage(
+  toPhone:       string,
+  phoneNumberId: string,
+  accessToken:   string,
+  opts: {
+    bodyText:    string;
+    footerText?: string;
+    buttonLabel: string;
+    sections:    ListSection[];
+  },
+): Promise<string> {
+  if (process.env["MOCK_WHATSAPP_SEND"] === "true") {
+    log.info({ toPhone, rowCount: opts.sections.reduce((n, s) => n + s.rows.length, 0) }, "MOCK LIST send");
+    return "mock-wamid";
+  }
+
+  const interactive: Record<string, unknown> = {
+    type:   "list",
+    body:   { text: opts.bodyText },
+    action: {
+      button:   opts.buttonLabel,
+      sections: opts.sections.map((sec) => ({
+        title: sec.title,
+        rows:  sec.rows.map((r) => ({
+          id:    r.id,
+          title: r.title.slice(0, 24),
+          ...(r.description ? { description: r.description.slice(0, 72) } : {}),
+        })),
+      })),
+    },
+  };
+
+  if (opts.footerText) {
+    interactive["footer"] = { text: opts.footerText };
+  }
+
+  log.info({ toPhone, sections: opts.sections.length }, "sending list message");
+
+  const data = await withRetry(() =>
+    metaPost(`${phoneNumberId}/messages`, {
+      messaging_product: "whatsapp",
+      recipient_type:    "individual",
+      to:                toPhone,
+      type:              "interactive",
+      interactive,
+    }, accessToken)
+  );
+
+  const wamid = data?.messages?.[0]?.id;
+  if (!wamid) {
+    throw new Error(`sendListMessage: Meta response missing message id: ${JSON.stringify(data)}`);
+  }
+  return wamid as string;
+}
+
 // ── Media message ─────────────────────────────────────────────────────────────
 
 export async function sendMediaMessage(input: {

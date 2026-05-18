@@ -42,7 +42,7 @@ import { generateReferenceNumber } from "../utils/booking.utils";
 import { cancelBooking } from "../services/booking.service";
 import { BookingStatus, MessageChannel, MessageStatus } from "@prisma/client";
 import { shouldAutoReply } from "./shouldAutoReply";
-import { sendCarouselMessage, sendMediaMessage, type CarouselCard } from "../services/whatsapp.send.service";
+import { sendCarouselMessage, sendMediaMessage, sendListMessage, type CarouselCard } from "../services/whatsapp.send.service";
 import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
@@ -303,6 +303,75 @@ async function trySendRoomCarousel(args: {
   }
 }
 
+// ── Options list sender ───────────────────────────────────────────────────────
+
+/**
+ * Sends a WhatsApp interactive list message for an options node.
+ * Returns true if sent (caller must return "ALREADY_SENT");
+ * false on any failure or missing credentials (caller falls back to numbered text).
+ */
+async function trySendOptionsList(args: {
+  hotelId:      string;
+  guestId:      string;
+  bodyText:     string;
+  buttonLabel:  string;
+  sectionTitle: string;
+  options:      Array<{ label: string; value?: string; description?: string }>;
+}): Promise<boolean> {
+  const { hotelId, guestId, bodyText, buttonLabel, sectionTitle, options } = args;
+
+  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
+
+  try {
+    const [hotel, guest] = await Promise.all([
+      prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
+      prisma.guest.findUnique({ where: { id: guestId } }),
+    ]);
+    if (!hotel || !guest) return false;
+
+    const cfg = hotel.config;
+    const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
+    const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
+    if (!phoneNumberId || !encryptedTok) return false;
+    const accessToken = decryptWhatsAppToken(encryptedTok);
+
+    const rows = options.map((opt, i) => ({
+      id:    `opt_${i}`,
+      title: (opt.label || `Option ${i + 1}`).slice(0, 24),
+      ...(opt.description ? { description: opt.description.slice(0, 72) } : {}),
+    }));
+
+    const wamid = await sendListMessage(guest.phone, phoneNumberId, accessToken, {
+      bodyText,
+      buttonLabel,
+      sections: [{ title: sectionTitle, rows }],
+    });
+
+    const saved = await prisma.message.create({
+      data: {
+        direction:   "OUT",
+        fromPhone:   hotel.phone,
+        toPhone:     guest.phone,
+        body:        JSON.stringify({ bodyText, buttonLabel, options }),
+        messageType: "list",
+        hotelId,
+        guestId,
+        channel:     MessageChannel.WHATSAPP,
+        status:      MessageStatus.SENT,
+        wamid,
+      },
+    });
+
+    const { emitToHotel } = await import("../realtime/emit");
+    emitToHotel(hotelId, "message:new", { message: saved });
+
+    return true;
+  } catch (err) {
+    log.warn({ err, hotelId, guestId }, "options: list send failed — falling back to text");
+    return false;
+  }
+}
+
 // ── Room type fetcher ──────────────────────────────────────────────────────────
 
 async function fetchRoomTypes(hotelId: string, filters?: {
@@ -369,6 +438,9 @@ export async function executeFlowStep(
   sessionData: SessionData,
   input:       string
 ): Promise<string | null> {
+  // Prevent abuse — very long inputs waste AI tokens and can exhaust session storage.
+  input = input.slice(0, 500);
+
   const parts  = state.split(":");
   const flowId = parts[1]!;
   const nodeId = parts[2]!;
@@ -449,13 +521,18 @@ export async function executeFlowStep(
     if (++hops > MAX_HOPS) {
       log.error({ flowId, guestId, lastNode: currentNodeId }, `MAX_HOPS(${MAX_HOPS}) exceeded — likely infinite loop`);
       await resetSession(guestId, hotelId);
-      return safeMenu(hotelId);
+      const hopMenu = await safeMenu(hotelId);
+      const hopNote = "Something went wrong in our conversation flow. Let's start over.";
+      return hopMenu ? `${hopNote}\n\n${hopMenu}` : hopNote;
     }
 
     const node = nodeMap.get(currentNodeId);
     if (!node) {
+      // Node missing — flow was likely re-published mid-session.
       await resetSession(guestId, hotelId);
-      return safeMenu(hotelId);
+      const driftMenu = await safeMenu(hotelId);
+      const driftNote = "We've just updated our options — starting fresh.";
+      return driftMenu ? `${driftNote}\n\n${driftMenu}` : driftNote;
     }
 
     // ── Business hours gate ──────────────────────────────────────────────────
@@ -1156,7 +1233,13 @@ export async function executeFlowStep(
               await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
               return advance(next);
             }
-            throw err;
+            log.error({ flowId, nodeId: currentNodeId, hotelId, guestId, err }, "create_booking: unexpected error");
+            flowData.flowVars = { ...flowData.flowVars, __flowError__: "Booking failed unexpectedly." };
+            const cbNext = nextNodeId(currentNodeId, adjacency);
+            const cbMsg  = "⚠️ Something went wrong while creating your booking. Please try again or contact us directly.";
+            if (!cbNext) { await resetSession(guestId, hotelId); return cbMsg; }
+            await updateSession(guestId, hotelId, `FLOW:${flowId}:${cbNext}`, { ...sessionData, flow: { ...flowData } });
+            return advance(cbNext);
           }
 
           flowData.flowVars = {
@@ -1392,15 +1475,10 @@ export async function executeFlowStep(
       }
 
       // ── time_condition ───────────────────────────────────────────────────────
-      // Reads the hotel's businessStartHour / businessEndHour + timezone from
-      // HotelConfig and routes to: "business_hours" | "after_hours" | "weekend"
+      // Uses hotelCfg already fetched at the top of executeFlowStep — no extra
+      // DB query. Routes to: "business_hours" | "after_hours" | "weekend"
       case "time_condition": {
-        const cfg = await prisma.hotelConfig.findUnique({
-          where:  { hotelId },
-          select: { businessStartHour: true, businessEndHour: true, timezone: true },
-        });
-
-        const tz       = cfg?.timezone ?? "UTC";
+        const tz       = hotelCfg?.timezone ?? "UTC";
         const now      = new Date();
         const nowLocal = new Date(now.toLocaleString("en-US", { timeZone: tz }));
         const day      = nowLocal.getDay();   // 0=Sun,6=Sat
@@ -1410,8 +1488,8 @@ export async function executeFlowStep(
         if (day === 0 || day === 6) {
           handle = "weekend";
         } else if (
-          hour >= (cfg?.businessStartHour ?? 9) &&
-          hour <  (cfg?.businessEndHour   ?? 21)
+          hour >= (hotelCfg?.businessStartHour ?? 9) &&
+          hour <  (hotelCfg?.businessEndHour   ?? 21)
         ) {
           handle = "business_hours";
         } else {
@@ -1613,6 +1691,72 @@ export async function executeFlowStep(
         await resetSession(guestId, hotelId);
 
         return d.resumeMessage ? interpolate(d.resumeMessage, flowData.flowVars) : null;
+      }
+
+      // ── options ──────────────────────────────────────────────────────────────
+      // Phase 1: build and send the options list (plain text or WhatsApp list).
+      // Phase 2: accept "opt_N" (list_reply) or "1"–"N" (text reply); store selection.
+      case "options": {
+        const d    = node.data as any;
+        const opts: Array<{ label: string; value?: string; description?: string }> =
+          Array.isArray(d.options) ? d.options : [];
+
+        if (!opts.length) {
+          await resetSession(guestId, hotelId);
+          return safeMenu(hotelId);
+        }
+
+        if (!flowData.waitingFor) {
+          const bodyText = interpolate((d.text as string | undefined) || "Please choose an option:", flowData.flowVars);
+          flowData.waitingFor = "answer";
+          await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
+
+          if (d.useListMessage === true) {
+            const listSent = await trySendOptionsList({
+              hotelId,
+              guestId,
+              bodyText,
+              buttonLabel:  ((d.listButtonLabel as string | undefined) || "View Options").slice(0, 20),
+              sectionTitle: ((d.sectionTitle   as string | undefined) || "Options"     ).slice(0, 24),
+              options:      opts,
+            });
+            if (listSent) return "ALREADY_SENT";
+          }
+
+          // Plain numbered text (default or fallback when list send fails)
+          let text = `${bodyText}\n\n${DIVIDER}\n`;
+          opts.forEach((opt, i) => {
+            text += `*${i + 1}.* ${opt.label}\n`;
+            if (opt.description) text += `     _${opt.description}_\n`;
+          });
+          text += `${DIVIDER}\n\n_Reply with a number (1–${opts.length}). Type *MENU* to cancel._`;
+          return text;
+        }
+
+        // Phase 2: validate selection
+        let chosenIdx: number | null = null;
+        const optIdMatch = input.match(/^opt_(\d+)$/);
+        if (optIdMatch) {
+          chosenIdx = parseInt(optIdMatch[1]!, 10);
+        } else {
+          const num = parseInt(input, 10);
+          if (!isNaN(num) && num >= 1 && num <= opts.length) chosenIdx = num - 1;
+        }
+
+        if (chosenIdx === null || chosenIdx < 0 || chosenIdx >= opts.length) {
+          await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
+          return (d.validationError as string | undefined) || `Please reply with a number between *1* and *${opts.length}*.`;
+        }
+
+        const chosen  = opts[chosenIdx]!;
+        const varName = (d.variableName as string | undefined) || "selectedOption";
+        flowData.flowVars = safeSetVar(flowData.flowVars, varName, chosen.value || chosen.label);
+        delete flowData.waitingFor;
+
+        const next = nextNodeId(currentNodeId, adjacency);
+        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+        await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+        return advance(next);
       }
 
       default: {

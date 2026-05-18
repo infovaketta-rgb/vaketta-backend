@@ -14,7 +14,8 @@ export type NodeType =
   | "show_menu"           // emits the hotel's formatted WhatsApp menu text inline
   | "send_template"       // sends an approved WhatsApp template; routes success / failure
   | "send_saved_reply"    // sends an internal saved reply with {{var}} resolution
-  | "delay";              // pauses the flow for a configurable duration then resumes
+  | "delay"              // pauses the flow for a configurable duration then resumes
+  | "options";           // presents a custom options list; optionally sends as WhatsApp list message
 
 // ── Per-node data shapes ───────────────────────────────────────────────────────
 
@@ -219,6 +220,33 @@ export interface SendTemplateNodeData {
   failureMessage?: string;                   // optional message sent (via plain text) on failure
 }
 
+/** A single selectable option inside an options node. */
+export interface OptionsItem {
+  id?:          string;  // frontend key; runtime always derives row id as "opt_{index}"
+  label:        string;  // displayed to guest (max 24 chars when sent as list message)
+  value?:       string;  // value stored in flowVars; defaults to label if omitted
+  description?: string;  // optional subtitle (max 72 chars when sent as list message)
+}
+
+/**
+ * options node
+ * Presents a custom list of choices to the guest and stores the selected value.
+ * When useListMessage is true, sends a WhatsApp interactive list message (tap-to-select
+ * sheet) instead of plain numbered text. Falls back to numbered text if credentials
+ * are missing or the API call fails.
+ */
+export interface OptionsNodeData {
+  text:             string;        // body text / prompt
+  options:          OptionsItem[]; // the choices
+  variableName:     string;        // flowVar to store the selected value
+  validationError?: string;
+
+  // WhatsApp list message settings (ignored when useListMessage is false)
+  useListMessage?:  boolean;  // default: false → plain numbered text
+  listButtonLabel?: string;   // CTA button label, max 20 chars; default: "View Options"
+  sectionTitle?:    string;   // section header shown inside the picker, max 24 chars; default: "Options"
+}
+
 export type FlowNodeData =
   | StartNodeData
   | MessageNodeData
@@ -232,7 +260,8 @@ export type FlowNodeData =
   | JumpNodeData
   | ShowMenuNodeData
   | SendTemplateNodeData
-  | DelayNodeData;
+  | DelayNodeData
+  | OptionsNodeData;
 
 // ── Serialised graph (stored as JSON in FlowDefinition.nodes / .edges) ─────────
 
