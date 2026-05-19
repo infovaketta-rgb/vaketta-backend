@@ -14,11 +14,14 @@
  */
 
 import prisma from "../db/connect";
-import { buildMenuMessage } from "./buildMenuResponse";
+import { buildMenuMessage, buildMenuListPayload } from "./buildMenuResponse";
 import { getOrCreateSession, updateSession, resetSession, SessionData } from "../services/session.service";
 import { executeFlowStep } from "./flowRuntime";
 import { getAIReply } from "../services/ai.service";
 import { incrementAIUsage } from "../services/usage.service";
+import { sendListMessage } from "../services/whatsapp.send.service";
+import { decryptWhatsAppToken } from "../utils/encryption.utils";
+import { MessageChannel, MessageStatus } from "@prisma/client";
 
 // ── Reset trigger keywords ─────────────────────────────────────────────────────
 
@@ -96,7 +99,51 @@ async function showMenu(
     }
   }
 
-  // Fallback: hardcoded menu builder
+  // List-message menu — send interactive tap-to-open list if enabled in botMessages
+  const botMsgsMap = (cfg?.botMessages as Record<string, string> | null) ?? {};
+  if (botMsgsMap.menuUseListMessage === "true") {
+    try {
+      const payload = await buildMenuListPayload(hotelId);
+      if (payload) {
+        const [hotel, guest] = await Promise.all([
+          prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } }),
+          prisma.guest.findUnique({ where: { id: guestId }, select: { phone: true } }),
+        ]);
+        const phoneNumberId = (cfg as any)?.metaPhoneNumberId as string ?? "";
+        const encTok        = (cfg as any)?.metaAccessTokenEncrypted as string ?? "";
+        if (hotel && guest && phoneNumberId && encTok) {
+          const accessToken = decryptWhatsAppToken(encTok);
+          const wamid = await sendListMessage(guest.phone, phoneNumberId, accessToken, {
+            bodyText:    payload.bodyText,
+            buttonLabel: payload.buttonLabel,
+            sections:    payload.sections,
+          });
+          const saved = await prisma.message.create({
+            data: {
+              direction:   "OUT",
+              fromPhone:   hotel.phone,
+              toPhone:     guest.phone,
+              body:        JSON.stringify({ bodyText: payload.bodyText, buttonLabel: payload.buttonLabel }),
+              messageType: "list",
+              hotelId,
+              guestId,
+              channel:     MessageChannel.WHATSAPP,
+              status:      MessageStatus.SENT,
+              wamid,
+            },
+          });
+          await updateSession(guestId, hotelId, "AWAITING_SELECTION", {});
+          const { emitToHotel } = await import("../realtime/emit");
+          emitToHotel(hotelId, "message:new", { message: saved });
+          return null; // list message already dispatched — no text reply needed
+        }
+      }
+    } catch {
+      // credentials missing or send failed — fall through to plain text
+    }
+  }
+
+  // Fallback: plain-text menu
   await updateSession(guestId, hotelId, "AWAITING_SELECTION", {});
   return buildMenuMessage(hotelId);
 }
