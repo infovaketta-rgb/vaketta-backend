@@ -3,6 +3,7 @@ import { createBookingService, updateBookingService } from "../services/booking.
 import prisma from "../db/connect";
 import { BookingStatus } from "@prisma/client";
 import { logger } from "../utils/logger";
+import { emitToHotel } from "../realtime/emit";
 
 const log = logger.child({ service: "booking" });
 
@@ -97,6 +98,7 @@ export async function updateBookingStatus(req: Request, res: Response) {
       return res.status(404).json({ success: false, message: "Booking not found or unauthorized" });
     }
 
+    emitToHotel(hotelId, "booking:updated", { bookingId, status });
     return res.json({ success: true });
   } catch (err) {
     log.error({ err }, "update booking status failed");
@@ -131,6 +133,7 @@ export async function editBooking(req: Request, res: Response) {
     });
 
     res.json(booking!);
+    emitToHotel(hotelId, "booking:updated", { booking: booking! });
   } catch (err: any) {
     log.error({ err: err.message }, "edit booking failed");
     res.status(400).json({ error: err.message || "Failed to edit booking" });

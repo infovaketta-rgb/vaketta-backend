@@ -46,6 +46,9 @@ export async function assignPlanToHotel(hotelId: string, planId: string) {
     },
   });
 
+  const { emitToAdmin } = await import("../realtime/emit");
+  emitToAdmin("admin:subscription_changed", { hotelId, planId, status: "active", billingEndDate: endDate });
+
   return subscription;
 }
 
@@ -99,6 +102,9 @@ export async function startTrial(
       billingEndDate:     endDate,
     },
   });
+
+  const { emitToAdmin } = await import("../realtime/emit");
+  emitToAdmin("admin:subscription_changed", { hotelId, planId: null, status: "trial", billingEndDate: endDate });
 
   return {
     subscriptionStatus: "trial",

@@ -15,7 +15,7 @@ import {
   deleteHotelUserService,
 } from "../services/admin.service";
 import { blockToken } from "../utils/tokenBlocklist";
-import { verifyVakettaToken } from "../utils/vakettaJwt";
+import { verifyVakettaToken, issueSocketToken } from "../utils/vakettaJwt";
 
 const COOKIE_NAME = "vaketta_token";
 const isProd = process.env.NODE_ENV === "production";
@@ -63,6 +63,12 @@ export async function getMeHandler(req: Request, res: Response) {
   res.json({ admin: (req as any).vakettaAdmin });
 }
 
+export async function getAdminSocketToken(req: Request, res: Response) {
+  const a = (req as any).vakettaAdmin as { id: string; email: string; name: string };
+  const token = issueSocketToken({ id: a.id, email: a.email, name: a.name });
+  res.json({ token });
+}
+
 // ─── Hotel CRUD ────────────────────────────────────────────────────────────
 
 export async function createHotelHandler(req: Request, res: Response) {
@@ -73,6 +79,8 @@ export async function createHotelHandler(req: Request, res: Response) {
     }
     const hotel = await createHotel(name, phone);
     res.status(201).json(hotel);
+    const { emitToAdmin } = await import("../realtime/emit");
+    emitToAdmin("admin:hotel_new", { hotel });
   } catch (e: any) {
     res.status(400).json({ error: e.message });
   }
@@ -108,6 +116,8 @@ export async function updateHotelHandler(req: Request, res: Response) {
     const { name, phone } = req.body;
     const hotel = await updateHotelService(id, { name, phone });
     res.json(hotel);
+    const { emitToAdmin } = await import("../realtime/emit");
+    emitToAdmin("admin:hotel_updated", { hotel });
   } catch (e: any) {
     res.status(400).json({ error: e.message });
   }
@@ -119,6 +129,8 @@ export async function deleteHotelHandler(req: Request, res: Response) {
     if (!id) return res.status(400).json({ error: "id required" });
     await deleteHotelService(id);
     res.json({ success: true });
+    const { emitToAdmin } = await import("../realtime/emit");
+    emitToAdmin("admin:hotel_deleted", { hotelId: id });
   } catch (e: any) {
     res.status(400).json({ error: e.message });
   }

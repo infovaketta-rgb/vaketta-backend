@@ -15,6 +15,7 @@ import {
   createHotelUserHandler,
   updateHotelUserHandler,
   deleteHotelUserHandler,
+  getAdminSocketToken,
 } from "../controllers/hotel.controller";
 import { vakettaAdminAuth } from "../middleware/vakettaAdminAuth";
 import {
@@ -53,8 +54,9 @@ const router = Router();
 router.post("/login",  adminLogin);
 
 // Protected — require valid Vaketta admin JWT (cookie or header)
-router.post("/logout", vakettaAdminAuth, adminLogout);
-router.get("/me",      vakettaAdminAuth, getMeHandler);
+router.post("/logout",       vakettaAdminAuth, adminLogout);
+router.get("/me",            vakettaAdminAuth, getMeHandler);
+router.get("/socket-token",  vakettaAdminAuth, getAdminSocketToken);
 
 router.get("/hotels",        vakettaAdminAuth, listHotelsHandler);
 router.post("/hotels",       vakettaAdminAuth, createHotelHandler);
