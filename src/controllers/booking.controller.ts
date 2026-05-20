@@ -180,6 +180,10 @@ export async function bulkUpdateBookingStatus(req: Request, res: Response) {
       data:  { status: status as BookingStatus },
     });
 
+    for (const bookingId of ids) {
+      emitToHotel(hotelId, "booking:updated", { bookingId, status });
+    }
+
     return res.json({ updated: result.count });
   } catch (err) {
     log.error({ err }, "bulk booking status update failed");
