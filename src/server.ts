@@ -78,16 +78,18 @@ async function sweepStalePendingMessages() {
 }
 
 sweepStalePendingMessages().catch((err) =>
-  logger.error({ err }, "startup PENDING sweep failed")
+  logger.warn({ err }, "startup PENDING sweep failed — DB may not be ready yet")
 );
 
-// Recurring sweep — catches any messages that slip through after startup
-const pendingSweepInterval = setInterval(
-  () => sweepStalePendingMessages().catch((err) =>
-    logger.error({ err }, "periodic PENDING sweep failed")
-  ),
-  5 * 60 * 1000 // every 5 minutes
-).unref();
+// Recurring sweep — catches any messages that slip through after startup.
+// Wrapped in try/catch so a DB hiccup never crashes the process or blocks the health check.
+const pendingSweepInterval = setInterval(async () => {
+  try {
+    await sweepStalePendingMessages();
+  } catch (err) {
+    logger.warn({ err }, "sweepStalePendingMessages failed, skipping cycle");
+  }
+}, 5 * 60 * 1000).unref();
 
 // ── Server setup ──────────────────────────────────────────────────────────────
 
