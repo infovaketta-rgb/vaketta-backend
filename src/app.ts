@@ -132,8 +132,10 @@ app.use((req, res, next) => {
 });
 
 // ── Auth routes ───────────────────────────────────────────────────────────────
-app.use("/auth/login",  loginLimiter);
-app.use("/auth",        authRoutes);
+app.use("/auth/login",            loginLimiter);
+app.use("/auth/forgot-password",  loginLimiter);
+app.use("/auth/reset-password",   loginLimiter);
+app.use("/auth",                  authRoutes);
 app.use("/admin/login", loginLimiter);
 app.use("/admin",       hotelRoutes);
 

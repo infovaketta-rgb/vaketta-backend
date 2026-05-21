@@ -528,8 +528,22 @@ model User {
   hotel     Hotel @relation(fields:[hotelId],references:[id])
 
   pushSubscriptions PushSubscription[]
+  passwordResetOtps PasswordResetOtp[]
 
   createdAt DateTime @default(now())
+}
+
+model PasswordResetOtp {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String   // bcrypt hash of the 6-digit OTP — never store the raw code
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  consumed  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
 }
 
 model PushSubscription {

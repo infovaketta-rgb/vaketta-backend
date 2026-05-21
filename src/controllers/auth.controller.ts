@@ -4,6 +4,7 @@ import { UserRole } from "@prisma/client";
 import { verifyToken } from "../utils/jwt";
 import { blockToken, invalidateUserTokens } from "../utils/tokenBlocklist";
 import { comparePassword, hashPassword } from "../utils/hash";
+import { requestPasswordResetService, resetPasswordService } from "../services/passwordReset.service";
 import prisma from "../db/connect";
 
 const CREATABLE_ROLES: UserRole[] = [UserRole.MANAGER, UserRole.STAFF];
@@ -27,6 +28,50 @@ export async function login(req:Request,res:Response){
     res.json(result);
   }catch(e:any){
     res.status(401).json({error:e.message});
+  }
+}
+
+/** POST /auth/forgot-password — send a reset OTP to the user's email */
+export async function forgotPassword(req: Request, res: Response) {
+  try {
+    const { email } = req.body;
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ error: "A valid email is required" });
+    }
+
+    await requestPasswordResetService(email);
+
+    // Always 200 regardless of whether the account exists — anti-enumeration.
+    return res.json({ message: "If an account exists for that email, a reset code has been sent." });
+  } catch (e: any) {
+    // Surface only the mailer-not-configured case as a server error; everything
+    // else is swallowed by the service to avoid leaking account existence.
+    if (e.message === "Email service is not configured") {
+      return res.status(503).json({ error: "Unable to send email right now. Please try again later." });
+    }
+    return res.json({ message: "If an account exists for that email, a reset code has been sent." });
+  }
+}
+
+/** POST /auth/reset-password — verify OTP and set a new password */
+export async function resetPassword(req: Request, res: Response) {
+  try {
+    const { email, code, newPassword } = req.body;
+
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ error: "A valid email is required" });
+    }
+    if (!code || !/^\d{6}$/.test(String(code))) {
+      return res.status(400).json({ error: "A valid 6-digit code is required" });
+    }
+    if (!newPassword || newPassword.length < 8) {
+      return res.status(400).json({ error: "New password must be at least 8 characters" });
+    }
+
+    await resetPasswordService(email, String(code), newPassword);
+    return res.json({ message: "Password reset successfully. Please log in with your new password." });
+  } catch (e: any) {
+    return res.status(400).json({ error: e.message || "Could not reset password" });
   }
 }
 
