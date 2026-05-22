@@ -173,27 +173,32 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
     const mediaInfo = extractMediaFromWebhookMessage(message);
 
     if (mediaInfo) {
-      // Save immediately with placeholder so the UI bubble appears at once
-      await logIncomingMessage({
+      // ACK Meta first so the webhook returns in milliseconds. A slow ACK makes
+      // Meta retry the same delivery, which causes duplicate processing.
+      res.sendStatus(200);
+
+      // Save the placeholder bubble, THEN download to R2 (download finds the row
+      // by its pending:// mediaUrl, so it must run after the message is created).
+      logIncomingMessage({
         fromPhone, toPhone, body, messageType,
         mediaUrl: `pending://${mediaInfo.mediaId}`,
         mimeType: mediaInfo.mimeType,
         fileName: mediaInfo.fileName,
         wamid,
-      });
+      })
+        .then(() => downloadAndStoreMedia(mediaInfo, toPhone))
+        .catch((err) => log.error({ err }, "media message processing failed"));
 
-      // Upload to R2 in the background — never blocks the webhook ACK
-      downloadAndStoreMedia(mediaInfo, toPhone).catch((err) =>
-        log.error({ err }, "media background upload failed")
-      );
-
-      return res.sendStatus(200);
+      return;
     }
 
-    // Non-media message — existing flow unchanged
-    await logIncomingMessage({ fromPhone, toPhone, body, messageType, mediaUrl: null, mimeType: null, fileName: null, wamid });
+    // Non-media message — ACK Meta immediately, then run the bot/AI/send pipeline
+    // asynchronously so it never delays the webhook response.
+    res.sendStatus(200);
+    logIncomingMessage({ fromPhone, toPhone, body, messageType, mediaUrl: null, mimeType: null, fileName: null, wamid })
+      .catch((err) => log.error({ err, fromPhone, toPhone }, "logIncomingMessage failed"));
 
-    return res.sendStatus(200);
+    return;
   } catch (err) {
     log.error({ err }, "WhatsApp webhook error");
     return res.sendStatus(200); // always ACK to prevent Meta retries

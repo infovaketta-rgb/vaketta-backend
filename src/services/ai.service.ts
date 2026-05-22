@@ -406,6 +406,14 @@ export async function getAIReply(
     }
   }
 
+  // Anthropic and OpenAI both require the first message to be a "user" turn.
+  // If the recent history begins with a bot reply, finalTurns[0] is "assistant"
+  // and the API call 400s — silently killing the AI reply. Drop leading
+  // assistant turns so the array always starts with the guest.
+  while (finalTurns.length > 1 && finalTurns[0]!.role === "assistant") {
+    finalTurns.shift();
+  }
+
   try {
     let raw: string | null = null;
 
