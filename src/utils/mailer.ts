@@ -60,13 +60,23 @@ export async function sendOtpEmail(to: string, code: string, name?: string): Pro
       </p>
     </div>`;
 
-  await t.sendMail({
-    from:    FROM,
-    to,
-    subject: `${APP_NAME} password reset code: ${code}`,
-    text:    `${greeting}\n\nYour ${APP_NAME} password reset code is ${code}. It expires in 10 minutes.\n\nIf you didn't request this, ignore this email.`,
-    html,
-  });
-
-  log.info({ to }, "OTP email sent");
+  try {
+    const info = await t.sendMail({
+      from:    FROM,
+      to,
+      subject: `${APP_NAME} password reset code: ${code}`,
+      text:    `${greeting}\n\nYour ${APP_NAME} password reset code is ${code}. It expires in 10 minutes.\n\nIf you didn't request this, ignore this email.`,
+      html,
+    });
+    log.info(
+      { to, messageId: info.messageId, accepted: info.accepted, rejected: info.rejected },
+      "OTP email sent",
+    );
+  } catch (err: any) {
+    log.error(
+      { to, err: err?.message, code: err?.code, command: err?.command, response: err?.response },
+      "OTP email send failed",
+    );
+    throw err;
+  }
 }
