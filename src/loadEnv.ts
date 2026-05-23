@@ -9,10 +9,11 @@ import dotenv from "dotenv";
 import path from "path";
 import dns from "dns";
 
-// This network has no working IPv6 route (same issue as Prisma DIRECT_URL).
-// Node tries IPv6 first by default, so every outbound connection — notably
-// SMTP for OTP emails — stalls ~21s before falling back to IPv4. Force IPv4
-// first. Harmless on hosts where IPv6 works.
+// Render's free tier (and local dev here) has no IPv6 egress. Prefer IPv4 for
+// any client that resolves via dns.lookup (e.g. Redis), so it doesn't stall or
+// fail (ENETUNREACH) on an AAAA record. NOTE: nodemailer ignores this — it uses
+// dns.resolve4/resolve6 directly and is forced to IPv4 in utils/mailer.ts.
+// Harmless on hosts where IPv6 works.
 dns.setDefaultResultOrder("ipv4first");
 
 const envFile =

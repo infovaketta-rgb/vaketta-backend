@@ -1,14 +1,29 @@
 import nodemailer, { Transporter } from "nodemailer";
+import dns from "dns";
+import net from "net";
 import { logger } from "./logger";
 
 const log = logger.child({ service: "mailer" });
 
-// Lazily-created singleton transporter. Built from SMTP_* env vars.
+// Re-resolve the SMTP host's IPv4 address at most this often (handles IP rotation).
+const RESOLVE_TTL_MS = 5 * 60 * 1000;
+
+// Cached transporter + when it was built (so we periodically re-resolve the IP).
 let transporter: Transporter | null = null;
+let builtAt = 0;
 
-function getTransporter(): Transporter | null {
-  if (transporter) return transporter;
-
+/**
+ * Force the SMTP connection over IPv4.
+ *
+ * Render's free tier has NO IPv6 egress — outbound to an IPv6 address fails with
+ * `ENETUNREACH`. nodemailer resolves both A/AAAA records and picks one at RANDOM
+ * (see lib/shared formatDNSValue), so ~half of sends land on IPv6 and fail.
+ * `dns.setDefaultResultOrder` does NOT help because nodemailer uses
+ * `dns.resolve4`/`resolve6`, not `dns.lookup`. So we resolve an IPv4 address
+ * ourselves and connect to that literal, passing `servername` so TLS/SNI still
+ * validate against the real hostname.
+ */
+async function buildTransporter(): Promise<Transporter | null> {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT ?? 587);
   const user = process.env.SMTP_USER;
@@ -19,12 +34,34 @@ function getTransporter(): Transporter | null {
     return null;
   }
 
-  transporter = nodemailer.createTransport({
-    host,
+  let connectHost = host;
+  let servername: string | undefined;
+
+  if (!net.isIP(host)) {
+    try {
+      const { address } = await dns.promises.lookup(host, { family: 4 });
+      connectHost = address;   // IPv4 literal — nodemailer connects directly, no AAAA pick
+      servername = host;       // keep hostname for SNI + certificate validation
+    } catch (err: any) {
+      // If IPv4 resolution fails, fall back to the hostname (normal behaviour).
+      log.warn({ host, err: err?.message }, "IPv4 lookup failed — connecting by hostname");
+    }
+  }
+
+  return nodemailer.createTransport({
+    host: connectHost,
     port,
     secure: port === 465, // 465 = implicit TLS; 587 = STARTTLS
     auth: { user, pass },
+    ...(servername ? { servername, tls: { servername } } : {}),
   });
+}
+
+async function getTransporter(): Promise<Transporter | null> {
+  const now = Date.now();
+  if (transporter && now - builtAt < RESOLVE_TTL_MS) return transporter;
+  transporter = await buildTransporter();
+  builtAt = now;
   return transporter;
 }
 
@@ -37,7 +74,7 @@ const APP_NAME = "Vaketta Chat";
  * are expected to be present.
  */
 export async function sendOtpEmail(to: string, code: string, name?: string): Promise<void> {
-  const t = getTransporter();
+  const t = await getTransporter();
   if (!t) {
     // In dev without SMTP, log the code so the flow remains testable.
     log.warn({ to, code }, "SMTP not configured — OTP not emailed (dev fallback log)");
