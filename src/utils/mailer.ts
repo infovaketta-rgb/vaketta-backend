@@ -5,23 +5,45 @@ import { logger } from "./logger";
 
 const log = logger.child({ service: "mailer" });
 
-// Re-resolve the SMTP host's IPv4 address at most this often (handles IP rotation).
-const RESOLVE_TTL_MS = 5 * 60 * 1000;
+const APP_NAME = "Vaketta Chat";
+const FROM = process.env.SMTP_FROM ?? `Vaketta <${process.env.SMTP_USER ?? "no-reply@vaketta.com"}>`;
 
-// Cached transporter + when it was built (so we periodically re-resolve the IP).
+// ── Resend HTTP API (production) ─────────────────────────────────────────────
+// Render's free tier blocks outbound SMTP ports (25/465/587) on both IPv4 and
+// IPv6, so raw SMTP can never connect from there. Resend sends over HTTPS (443),
+// which is not blocked. Used whenever RESEND_API_KEY is set; otherwise we fall
+// back to SMTP (handy for local dev where SMTP works fine).
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const RESEND_FROM = process.env.RESEND_FROM ?? FROM;
+
+async function sendViaResend(to: string, subject: string, html: string, text: string): Promise<void> {
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ from: RESEND_FROM, to, subject, html, text }),
+  });
+
+  const body: any = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    log.error({ to, status: res.status, err: body?.message, name: body?.name }, "OTP email send failed (Resend)");
+    throw new Error(body?.message || `Resend API error ${res.status}`);
+  }
+  log.info({ to, id: body?.id }, "OTP email sent (Resend)");
+}
+
+// ── SMTP transport (local dev fallback) ──────────────────────────────────────
+const RESOLVE_TTL_MS = 5 * 60 * 1000;
 let transporter: Transporter | null = null;
 let builtAt = 0;
 
 /**
- * Force the SMTP connection over IPv4.
- *
- * Render's free tier has NO IPv6 egress — outbound to an IPv6 address fails with
- * `ENETUNREACH`. nodemailer resolves both A/AAAA records and picks one at RANDOM
- * (see lib/shared formatDNSValue), so ~half of sends land on IPv6 and fail.
- * `dns.setDefaultResultOrder` does NOT help because nodemailer uses
- * `dns.resolve4`/`resolve6`, not `dns.lookup`. So we resolve an IPv4 address
- * ourselves and connect to that literal, passing `servername` so TLS/SNI still
- * validate against the real hostname.
+ * Build an SMTP transport forced over IPv4. nodemailer otherwise resolves both
+ * A/AAAA records and picks one at random, which breaks on networks without IPv6
+ * egress. We resolve an IPv4 literal ourselves and pass `servername` so TLS/SNI
+ * still validate against the real hostname.
  */
 async function buildTransporter(): Promise<Transporter | null> {
   const host = process.env.SMTP_HOST;
@@ -40,10 +62,9 @@ async function buildTransporter(): Promise<Transporter | null> {
   if (!net.isIP(host)) {
     try {
       const { address } = await dns.promises.lookup(host, { family: 4 });
-      connectHost = address;   // IPv4 literal — nodemailer connects directly, no AAAA pick
-      servername = host;       // keep hostname for SNI + certificate validation
+      connectHost = address;
+      servername = host;
     } catch (err: any) {
-      // If IPv4 resolution fails, fall back to the hostname (normal behaviour).
       log.warn({ host, err: err?.message }, "IPv4 lookup failed — connecting by hostname");
     }
   }
@@ -65,23 +86,31 @@ async function getTransporter(): Promise<Transporter | null> {
   return transporter;
 }
 
-const FROM = process.env.SMTP_FROM ?? `Vaketta <${process.env.SMTP_USER ?? "no-reply@vaketta.com"}>`;
-const APP_NAME = "Vaketta Chat";
-
-/**
- * Send a password-reset OTP email. Throws if SMTP is not configured so the
- * caller can surface a clear error during setup; in production the env vars
- * are expected to be present.
- */
-export async function sendOtpEmail(to: string, code: string, name?: string): Promise<void> {
+async function sendViaSmtp(to: string, subject: string, html: string, text: string): Promise<void> {
   const t = await getTransporter();
   if (!t) {
     // In dev without SMTP, log the code so the flow remains testable.
-    log.warn({ to, code }, "SMTP not configured — OTP not emailed (dev fallback log)");
+    log.warn({ to }, "SMTP not configured — OTP not emailed (dev fallback log)");
     throw new Error("Email service is not configured");
   }
+  try {
+    const info = await t.sendMail({ from: FROM, to, subject, text, html });
+    log.info({ to, messageId: info.messageId, accepted: info.accepted, rejected: info.rejected }, "OTP email sent (SMTP)");
+  } catch (err: any) {
+    log.error({ to, err: err?.message, code: err?.code, command: err?.command, response: err?.response }, "OTP email send failed (SMTP)");
+    throw err;
+  }
+}
 
+/**
+ * Send a password-reset OTP email. Prefers the Resend HTTP API when configured
+ * (required on Render — SMTP ports are blocked); falls back to SMTP otherwise.
+ * Throws if no email transport is configured so the caller can surface an error.
+ */
+export async function sendOtpEmail(to: string, code: string, name?: string): Promise<void> {
   const greeting = name ? `Hi ${name},` : "Hi,";
+  const subject = `${APP_NAME} password reset code: ${code}`;
+  const text = `${greeting}\n\nYour ${APP_NAME} password reset code is ${code}. It expires in 10 minutes.\n\nIf you didn't request this, ignore this email.`;
   const html = `
     <div style="font-family:Inter,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#0C1B33">
       <h2 style="margin:0 0 12px;font-size:20px;color:#0C1B33">Reset your password</h2>
@@ -97,23 +126,8 @@ export async function sendOtpEmail(to: string, code: string, name?: string): Pro
       </p>
     </div>`;
 
-  try {
-    const info = await t.sendMail({
-      from:    FROM,
-      to,
-      subject: `${APP_NAME} password reset code: ${code}`,
-      text:    `${greeting}\n\nYour ${APP_NAME} password reset code is ${code}. It expires in 10 minutes.\n\nIf you didn't request this, ignore this email.`,
-      html,
-    });
-    log.info(
-      { to, messageId: info.messageId, accepted: info.accepted, rejected: info.rejected },
-      "OTP email sent",
-    );
-  } catch (err: any) {
-    log.error(
-      { to, err: err?.message, code: err?.code, command: err?.command, response: err?.response },
-      "OTP email send failed",
-    );
-    throw err;
+  if (RESEND_API_KEY) {
+    return sendViaResend(to, subject, html, text);
   }
+  return sendViaSmtp(to, subject, html, text);
 }
