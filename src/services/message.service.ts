@@ -41,7 +41,7 @@ function extractProviderMessageId(result: unknown, channel: MessageChannel): str
   return (result as any)?.messages?.[0]?.id;
 }
 
-type IncomingMessageInput = {
+export type IncomingMessageInput = {
   fromPhone:   string;
   toPhone:     string;
   body?:       string | null;

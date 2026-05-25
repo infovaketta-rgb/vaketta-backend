@@ -1,10 +1,10 @@
 import { Request, Response } from "express";
-import { logIncomingMessage } from "../services/message.service";
 import { normalizePhone } from "../utils/phone";
 import prisma from "../db/connect";
 import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
-import { extractMediaFromWebhookMessage, downloadMetaMedia } from "../services/media.service";
+import { extractMediaFromWebhookMessage } from "../services/media.service";
+import { whatsappInboundQueue } from "../queue/whatsappInbound.queue";
 import { processHistoryWebhook, processSmbMessageEcho } from "../services/history.service";
 import crypto from "crypto";
 import { logger } from "../utils/logger";
@@ -172,71 +172,36 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
 
     const mediaInfo = extractMediaFromWebhookMessage(message);
 
-    if (mediaInfo) {
-      // ACK Meta first so the webhook returns in milliseconds. A slow ACK makes
-      // Meta retry the same delivery, which causes duplicate processing.
-      res.sendStatus(200);
+    // Build the durable job payload. For media we persist a `pending://` bubble
+    // first (inside logIncomingMessage), then the worker downloads the file to R2.
+    const input = mediaInfo
+      ? {
+          fromPhone, toPhone, body, messageType,
+          mediaUrl: `pending://${mediaInfo.mediaId}`,
+          mimeType: mediaInfo.mimeType,
+          fileName: mediaInfo.fileName,
+          wamid,
+        }
+      : { fromPhone, toPhone, body, messageType, mediaUrl: null, mimeType: null, fileName: null, wamid };
 
-      // Save the placeholder bubble, THEN download to R2 (download finds the row
-      // by its pending:// mediaUrl, so it must run after the message is created).
-      logIncomingMessage({
-        fromPhone, toPhone, body, messageType,
-        mediaUrl: `pending://${mediaInfo.mediaId}`,
-        mimeType: mediaInfo.mimeType,
-        fileName: mediaInfo.fileName,
-        wamid,
-      })
-        .then(() => downloadAndStoreMedia(mediaInfo, toPhone))
-        .catch((err) => log.error({ err }, "media message processing failed"));
-
-      return;
+    // Enqueue BEFORE ACK so a Redis failure makes Meta retry (no lost message).
+    // The bot/AI/send pipeline then runs in a bounded-concurrency worker instead
+    // of an unbounded in-process promise. jobId = wamid dedups Meta re-deliveries;
+    // logIncomingMessage also dedups by wamid at the DB level as a second guard.
+    try {
+      await whatsappInboundQueue.add(
+        "inbound",
+        { input, media: mediaInfo ?? null },
+        wamid ? { jobId: wamid } : {},
+      );
+    } catch (err) {
+      log.error({ err, fromPhone, toPhone }, "failed to enqueue inbound message — 500 so Meta retries");
+      return res.sendStatus(500);
     }
 
-    // Non-media message — ACK Meta immediately, then run the bot/AI/send pipeline
-    // asynchronously so it never delays the webhook response.
-    res.sendStatus(200);
-    logIncomingMessage({ fromPhone, toPhone, body, messageType, mediaUrl: null, mimeType: null, fileName: null, wamid })
-      .catch((err) => log.error({ err, fromPhone, toPhone }, "logIncomingMessage failed"));
-
-    return;
+    return res.sendStatus(200);
   } catch (err) {
     log.error({ err }, "WhatsApp webhook error");
     return res.sendStatus(200); // always ACK to prevent Meta retries
   }
-}
-
-async function downloadAndStoreMedia(
-  mediaInfo: { mediaId: string; mimeType: string; fileName: string | null },
-  toPhone: string,
-): Promise<void> {
-  const hotel = await prisma.hotel.findUnique({
-    where:   { phone: toPhone },
-    include: { config: true },
-  });
-  if (!hotel) return;
-
-  const message = await prisma.message.findFirst({
-    where:   { mediaUrl: `pending://${mediaInfo.mediaId}`, hotelId: hotel.id },
-    orderBy: { timestamp: "desc" },
-  });
-  if (!message) return;
-
-  const downloaded = await downloadMetaMedia(mediaInfo.mediaId, mediaInfo.mimeType, toPhone);
-  if (!downloaded) return;
-
-  const updated = await prisma.message.update({
-    where: { id: message.id },
-    data: {
-      mediaUrl: downloaded.localUrl,
-      mimeType: downloaded.mimeType,
-      fileName: downloaded.fileName,
-    },
-  });
-
-  emitToHotel(hotel.id, "message:media_ready", {
-    messageId: updated.id,
-    mediaUrl:  downloaded.localUrl,
-    mimeType:  downloaded.mimeType,
-    fileName:  downloaded.fileName,
-  });
 }

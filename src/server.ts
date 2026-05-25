@@ -22,6 +22,7 @@ import { logger } from "./utils/logger";
 import { MessageStatus } from "@prisma/client";
 import "./workers/instagram.worker";
 import "./workers/flowResumeWorker";
+import "./workers/whatsappInbound.worker"; // inbound WhatsApp bot pipeline (web process — see file header)
 
 // ── Startup environment validation ────────────────────────────────────────────
 
