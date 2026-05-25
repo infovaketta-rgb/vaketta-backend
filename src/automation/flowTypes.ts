@@ -55,7 +55,9 @@ export interface QuestionNodeData {
   validationError: string;
 
   // ── date options ────────────────────────────────────────────────────────────
-  dateMin?:     "today" | "none"; // if "today", reject past dates
+  // "today" rejects past dates; "none"/undefined = no minimum; any other string is
+  // the name of an earlier date variable — the answer must be strictly after it.
+  dateMin?:     "today" | "none" | (string & {});
   dateMaxDays?: number;           // reject dates more than N days from today
 
   // ── number options ──────────────────────────────────────────────────────────

@@ -655,9 +655,19 @@ export async function executeFlowStep(
             return d.validationError || "I didn't catch that date 😅 Try something like *25 May* or *25/05/2026*";
           }
 
-          if (d.dateMin === "today" && parsed < todayUTC()) {
-            await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
-            return d.validationError || "Please enter a *future* date.";
+          if (d.dateMin === "today") {
+            if (parsed < todayUTC()) {
+              await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
+              return d.validationError || "Please enter a *future* date.";
+            }
+          } else if (d.dateMin && d.dateMin !== "none") {
+            // dateMin names an earlier date variable — the answer must be strictly after it.
+            const minRaw  = flowData.flowVars[d.dateMin];
+            const minDate = minRaw ? parseFlexDate(minRaw) : null;
+            if (minDate && toDateStr(parsed) <= toDateStr(minDate)) {
+              await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
+              return d.validationError || `Please enter a date after *${minRaw}*.`;
+            }
           }
 
           if (d.dateMaxDays) {
