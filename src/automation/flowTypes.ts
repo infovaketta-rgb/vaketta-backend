@@ -15,7 +15,8 @@ export type NodeType =
   | "send_template"       // sends an approved WhatsApp template; routes success / failure
   | "send_saved_reply"    // sends an internal saved reply with {{var}} resolution
   | "delay"              // pauses the flow for a configurable duration then resumes
-  | "options";           // presents a custom options list; optionally sends as WhatsApp list message
+  | "options"            // presents a custom options list; optionally sends as WhatsApp list message
+  | "advanced_room_allocation"; // multi-room allocation with occupancy + extra-bed logic (see ./nodes/advancedRoomAllocation.ts)
 
 // ── Per-node data shapes ───────────────────────────────────────────────────────
 
@@ -249,6 +250,27 @@ export interface OptionsNodeData {
   sectionTitle?:    string;   // section header shown inside the picker, max 24 chars; default: "Options"
 }
 
+/**
+ * advanced_room_allocation node
+ * Multi-room booking allocator. Reads bookingCheckIn/Out + bookingAdults/Children
+ * from flowVars, fetches live availability via getCalendarData, generates a
+ * recommended allocation respecting per-room occupancy + per-roomType availableCount,
+ * applies extra-bed logic, and prompts the guest to confirm or modify manually.
+ *
+ * On confirm, writes the output contract documented in nodes/advancedRoomAllocation.ts
+ * (single-room compat keys + multi-room JSON payload). The downstream create_booking
+ * action reads bookingRoomTypeId/CheckIn/CheckOut/GuestName as before.
+ */
+export interface AdvancedRoomAllocationNodeData {
+  baseAdults?:        number;  // default 2  — adults that fit without an extra bed
+  maxAdults?:         number;  // default 3  — hard cap per room (extra-bed boundary)
+  maxChildren?:       number;  // default 1  — hard cap per room
+  extraAdultCharge?:  number;  // default 0  — per night, applied to adults beyond baseAdults
+  allowExtraBed?:     boolean; // default false — when true, maxAdults gains +1 via extra bed
+  childAgeLimit?:     number;  // informational only — surfaced in the summary text
+  label?:             string;
+}
+
 export type FlowNodeData =
   | StartNodeData
   | MessageNodeData
@@ -263,7 +285,8 @@ export type FlowNodeData =
   | ShowMenuNodeData
   | SendTemplateNodeData
   | DelayNodeData
-  | OptionsNodeData;
+  | OptionsNodeData
+  | AdvancedRoomAllocationNodeData;
 
 // ── Serialised graph (stored as JSON in FlowDefinition.nodes / .edges) ─────────
 

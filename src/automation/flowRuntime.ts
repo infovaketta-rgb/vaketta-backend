@@ -47,6 +47,7 @@ import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
 import { extractDateWithAI, classifyBookingIntent } from "../services/ai.service";
+import { handleAdvancedRoomAllocation } from "./nodes/advancedRoomAllocation";
 
 // Generic placeholder served when a room has no photos. Reliable HTTPS host —
 // Meta requires a publicly fetchable URL for interactive image headers.
@@ -1127,6 +1128,30 @@ export async function executeFlowStep(
         if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
         return advance(next);
+      }
+
+      // ── advanced_room_allocation ─────────────────────────────────────────────
+      // Multi-room allocation with occupancy + extra-bed logic. Self-contained in
+      // ./nodes/advancedRoomAllocation.ts — all deps injected, no module state.
+      case "advanced_room_allocation": {
+        return handleAdvancedRoomAllocation({
+          node,
+          currentNodeId,
+          hotelId,
+          guestId,
+          flowId,
+          flowData,
+          sessionData,
+          input,
+          adjacency,
+          advance,
+          nextNodeId,
+          updateSession,
+          resetSession,
+          safeMenu,
+          fetchRoomTypes,
+          getCalendarData,
+        });
       }
 
       // ── branch ───────────────────────────────────────────────────────────────
