@@ -48,6 +48,8 @@ import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
 import { extractDateWithAI, classifyBookingIntent } from "../services/ai.service";
 import { handleAdvancedRoomAllocation } from "./nodes/advancedRoomAllocation";
+import { aggregateRoomQuantities } from "./bookingAllocation";
+import { randomUUID } from "crypto";
 
 // Generic placeholder served when a room has no photos. Reliable HTTPS host —
 // Meta requires a publicly fetchable URL for interactive image headers.
@@ -1193,6 +1195,141 @@ export async function executeFlowStep(
         if (d.actionType === "create_booking") {
           const vars = flowData.flowVars;
 
+          // Multi-room allocation (advanced_room_allocation) stores every room in
+          // the `bookingRooms` flowVar. When present, create one Booking row per
+          // room atomically; otherwise fall through to the unchanged single-room
+          // path below (moved verbatim into the else branch).
+          const roomsRaw = vars["bookingRooms"];
+          let allocRooms: any[] = [];
+          try { allocRooms = JSON.parse(roomsRaw ?? "[]"); } catch { allocRooms = []; }
+
+          if (Array.isArray(allocRooms) && allocRooms.length > 0) {
+            // ── MULTI-ROOM PATH (new code, fully isolated) ──────────────────────
+            const guestName = (d.guestNameVar && vars[d.guestNameVar]) || vars["bookingGuestName"] || null;
+            const checkIn   = (d.checkInVar   && vars[d.checkInVar])   || vars["bookingCheckIn"]   || null;
+            const checkOut  = (d.checkOutVar  && vars[d.checkOutVar])  || vars["bookingCheckOut"]  || null;
+
+            // Mirrors the existing path's tail: advance to the next node, or reset +
+            // return the message when this is the last node.
+            const finishMulti = async (msg: string | null): Promise<string | null> => {
+              const nx = nextNodeId(currentNodeId, adjacency);
+              if (!nx) { await resetSession(guestId, hotelId); return msg; }
+              await updateSession(guestId, hotelId, `FLOW:${flowId}:${nx}`, { ...sessionData, flow: { ...flowData } });
+              return advance(nx);
+            };
+
+            // 1. Idempotency — duplicate webhook after the group was already created.
+            if (vars["bookingGroupId"]) {
+              return finishMulti(
+                d.message ? interpolate(d.message, flowData.flowVars)
+                          : `✅ Your booking is already confirmed. Reference: *${vars["bookingRef"] ?? ""}*`
+              );
+            }
+
+            // 2. Required details (same message + advance behaviour as single-room).
+            if (!guestName || !checkIn || !checkOut) {
+              return finishMulti("⚠️ Could not create booking — missing required details. Please contact us directly.");
+            }
+
+            // 3. Dates (same reversed-date handling as single-room).
+            const checkInDate  = parseFlexDate(checkIn);
+            const checkOutDate = parseFlexDate(checkOut);
+            if (!checkInDate || !checkOutDate || checkOutDate <= checkInDate) {
+              return finishMulti("⚠️ Booking failed — invalid or reversed dates. Please contact us directly.");
+            }
+
+            // 4. Booking-enabled gate (same message as single-room).
+            const cfg = await prisma.hotelConfig.findUnique({
+              where: { hotelId },
+              select: { bookingEnabled: true, availabilityEnabled: true },
+            });
+            if (cfg && !cfg.bookingEnabled) {
+              return finishMulti("⚠️ Online booking is currently unavailable. Please contact us directly to make a reservation.");
+            }
+
+            // 5. Availability — aggregate by room type; require N rooms of each type.
+            if (cfg?.availabilityEnabled) {
+              for (const { roomTypeId: rtId, quantity } of aggregateRoomQuantities(allocRooms)) {
+                const { availableCount } = await checkRoomAvailability(
+                  hotelId, rtId, toDateStr(checkInDate), toDateStr(checkOutDate)
+                );
+                if (availableCount < quantity) {
+                  const rtName = allocRooms.find((r) => r?.roomTypeId === rtId)?.roomTypeName ?? "rooms of that type";
+                  await resetSession(guestId, hotelId);
+                  return `❌ Sorry, we only have ${availableCount} ${rtName} available for those dates. Please contact us to adjust your booking.`;
+                }
+              }
+            }
+
+            // 6. Create one row per room in a single transaction (reuse advisory lock).
+            const bookingGroupId = randomUUID();
+            const lockKey = `${hotelId}:${new Date().getFullYear()}`;
+            let createdRows: Awaited<ReturnType<typeof prisma.booking.create>>[];
+            try {
+              createdRows = await withActionTimeout(prisma.$transaction(async (tx) => {
+                await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+                const rows: Awaited<ReturnType<typeof prisma.booking.create>>[] = [];
+                for (const room of allocRooms) {
+                  const referenceNumber = await generateReferenceNumber(tx);
+                  const row = await tx.booking.create({
+                    data: {
+                      hotelId, guestId,
+                      roomTypeId: room.roomTypeId, guestName,
+                      checkIn: checkInDate, checkOut: checkOutDate,
+                      status: BookingStatus.PENDING,
+                      pricePerNight: Number(room.pricePerNight) || 0,
+                      totalPrice:    Number(room.totalPrice)    || 0,
+                      advancePaid:   0,   // group advance handling is out of scope
+                      referenceNumber, bookingGroupId,
+                    },
+                  });
+                  rows.push(row);
+                }
+                return rows;
+              }));
+            } catch (err: any) {
+              if (err.message === "Action timeout") {
+                log.error({ flowId, nodeId: currentNodeId, hotelId, guestId }, "create_booking(multi): transaction timed out");
+                flowData.flowVars = { ...flowData.flowVars, __flowError__: "Action timed out. Please try again." };
+                return finishMulti("⏱ Booking request timed out. Please try again.");
+              }
+              log.error({ flowId, nodeId: currentNodeId, hotelId, guestId, err }, "create_booking(multi): unexpected error");
+              flowData.flowVars = { ...flowData.flowVars, __flowError__: "Booking failed unexpectedly." };
+              return finishMulti("⚠️ Something went wrong while creating your booking. Please try again or contact us directly.");
+            }
+
+            // 7. Flow vars — additive; keep single-room keys for back-compat.
+            const firstRow = createdRows[0]!;
+            const groupRef = firstRow.referenceNumber ?? firstRow.id.slice(0, 8).toUpperCase();
+            if (!flowData.flowVars["bookingGroupId"]) {
+              flowData.flowVars = {
+                ...flowData.flowVars,
+                bookingGroupId,
+                bookingRef:    groupRef,
+                bookingId:     firstRow.id,
+                bookingStatus: BookingStatus.PENDING,
+                bookingRefs:   JSON.stringify(createdRows.map((b) => b.referenceNumber ?? b.id.slice(0, 8).toUpperCase())),
+                bookingIds:    JSON.stringify(createdRows.map((b) => b.id)),
+              };
+            }
+
+            // 8. Confirmation — one reservation, rooms listed underneath.
+            const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+            const fmtDate = (dt: Date) => `${dt.getUTCDate()} ${MON[dt.getUTCMonth()]}`;
+            const grandTotal = allocRooms.reduce((s, r) => s + (Number(r.totalPrice) || 0), 0);
+            const roomLines = allocRooms
+              .map((r) => `• ${r.roomTypeName ?? "Room"} — ${fmtDate(checkInDate)} → ${fmtDate(checkOutDate)}`)
+              .join("\n");
+            const confirmation =
+              `✅ *Booking Confirmed!*\n` +
+              `Reference: *${groupRef}*\n\n` +
+              `🛏 ${allocRooms.length} room${allocRooms.length > 1 ? "s" : ""} reserved:\n` +
+              `${roomLines}\n\n` +
+              `*Total: ₹${Math.round(grandTotal).toLocaleString("en-IN")}*`;
+
+            return finishMulti(d.message ? interpolate(d.message, flowData.flowVars) : confirmation);
+          } else {
+
           const guestName  = (d.guestNameVar  && vars[d.guestNameVar])  || vars["bookingGuestName"]  || null;
           const roomTypeId = (d.roomTypeIdVar && vars[d.roomTypeIdVar]) || vars["bookingRoomTypeId"] || null;
           const checkIn    = (d.checkInVar    && vars[d.checkInVar])    || vars["bookingCheckIn"]    || null;
@@ -1302,6 +1439,7 @@ export async function executeFlowStep(
           }
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
           return advance(next);
+          } // ── end single-room path (else) ──
         }
 
         // ── update_booking_status ──────────────────────────────────────────────

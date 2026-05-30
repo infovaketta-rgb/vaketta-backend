@@ -256,6 +256,10 @@ model Booking {
   guestId String
   roomTypeId String
 
+  // Links rooms booked together as one reservation (multi-room allocation).
+  // Null = single-room booking.
+  bookingGroupId String?
+
   hotel Hotel @relation(fields: [hotelId], references: [id])
   guest Guest @relation(fields: [guestId], references: [id])
   roomType RoomType @relation(fields: [roomTypeId], references: [id])
@@ -266,6 +270,7 @@ model Booking {
   @@index([hotelId, createdAt])   // dashboard date-range analytics
   @@index([guestId])              // guest booking history
   @@index([checkIn, checkOut])    // availability overlap queries
+  @@index([bookingGroupId])       // pull all rooms in a group together
 }
 
 
