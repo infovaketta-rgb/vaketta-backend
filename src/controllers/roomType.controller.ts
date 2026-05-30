@@ -12,6 +12,65 @@ import multer from "multer";
 const log = logger.child({ service: "room-type" });
 import { uploadRoomPhoto, deleteRoomPhoto, setMainPhoto, reorderRoomPhotos, getRoomTypeById } from "../services/roomType.service";
 
+// ── Occupancy / pricing field validation ─────────────────────────────────────
+type OccupancyPricing = {
+  baseAdults?:       number;
+  baseChildren?:     number;
+  extraAdultCharge?: number;
+  allowExtraBed?:    boolean;
+  extraBedCharge?:   number;
+  childAgeLimit?:    number;
+};
+
+function isBlank(v: unknown): boolean {
+  return v === undefined || v === null || v === "";
+}
+
+/**
+ * Validates + normalizes the six occupancy/pricing fields from a request body.
+ * Only keys actually provided are returned, so omitted fields fall back to the
+ * service-layer defaults (mirrors how capacity/maxAdults are handled).
+ */
+function parseOccupancyPricing(
+  body: any,
+): { values: OccupancyPricing } | { error: string } {
+  const values: OccupancyPricing = {};
+
+  // Bounded integer fields: [key, min, max?]
+  const intSpecs: Array<[keyof OccupancyPricing, number, number?]> = [
+    ["baseAdults", 1],
+    ["baseChildren", 0],
+    ["childAgeLimit", 0, 17],
+  ];
+  for (const [key, min, max] of intSpecs) {
+    if (isBlank(body[key])) continue;
+    const n = Number(body[key]);
+    if (!Number.isInteger(n) || n < min || (max !== undefined && n > max)) {
+      return {
+        error: `${key} must be an integer >= ${min}${max !== undefined ? ` and <= ${max}` : ""}`,
+      };
+    }
+    (values as any)[key] = n;
+  }
+
+  // Non-negative float fields
+  for (const key of ["extraAdultCharge", "extraBedCharge"] as const) {
+    if (isBlank(body[key])) continue;
+    const n = Number(body[key]);
+    if (!Number.isFinite(n) || n < 0) {
+      return { error: `${key} must be a number >= 0` };
+    }
+    (values as any)[key] = n;
+  }
+
+  // Boolean (defaults to false at the service layer when omitted)
+  if (!isBlank(body.allowExtraBed)) {
+    values.allowExtraBed = body.allowExtraBed === true || body.allowExtraBed === "true";
+  }
+
+  return { values };
+}
+
 
 
 export async function createRoomTypeController(req: Request, res: Response) {
@@ -30,6 +89,9 @@ export async function createRoomTypeController(req: Request, res: Response) {
       return res.status(400).json({ error: "carouselButtonLabel must be 20 characters or fewer" });
     }
 
+    const occ = parseOccupancyPricing(req.body);
+    if ("error" in occ) return res.status(400).json({ error: occ.error });
+
     const roomType = await createRoomType({
       hotelId,
       name,
@@ -39,6 +101,7 @@ export async function createRoomTypeController(req: Request, res: Response) {
       ...(maxChildren ? { maxChildren: Number(maxChildren) } : {}),
       ...(totalRooms  ? { totalRooms:  Number(totalRooms)  } : {}),
       ...(typeof carouselButtonLabel === "string" ? { carouselButtonLabel: carouselButtonLabel.trim() } : {}),
+      ...occ.values,
     });
 
     invalidatePromptCache(hotelId);
@@ -79,6 +142,9 @@ if (!id) return res.status(400).json({ error: "Room type ID is required" });
       return res.status(400).json({ error: "carouselButtonLabel must be 20 characters or fewer" });
     }
 
+    const occ = parseOccupancyPricing(req.body);
+    if ("error" in occ) return res.status(400).json({ error: occ.error });
+
     const roomType = await updateRoomType({
       id,
       hotelId,
@@ -89,6 +155,7 @@ if (!id) return res.status(400).json({ error: "Room type ID is required" });
       ...(maxChildren ? { maxChildren: Number(maxChildren) } : {}),
       ...(totalRooms  ? { totalRooms:  Number(totalRooms)  } : {}),
       ...(typeof carouselButtonLabel === "string" ? { carouselButtonLabel: carouselButtonLabel.trim() } : {}),
+      ...occ.values,
     });
 
     invalidatePromptCache(hotelId);

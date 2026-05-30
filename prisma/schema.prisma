@@ -279,6 +279,16 @@ model RoomType {
   capacity    Int?        // total guests (adults + children)
   maxAdults   Int?        // max adults allowed
   maxChildren Int?        // max children allowed
+
+  // Occupancy pricing rules (used by the advanced_room_allocation flow node).
+  // All nullable/defaulted — zero impact on existing rows.
+  baseAdults        Int?     // adults included in base price (default 2)
+  baseChildren      Int?     // children included in base price (default 0)
+  extraAdultCharge  Float?   // extra charge per adult per night above baseAdults
+  allowExtraBed     Boolean  @default(false)
+  extraBedCharge    Float?   // charge per night for the extra bed
+  childAgeLimit     Int?     // children above this age counted as adults
+
   totalRooms  Int         @default(1)
 
   // Label shown on the WhatsApp carousel "Select Room" button. Max 20 chars

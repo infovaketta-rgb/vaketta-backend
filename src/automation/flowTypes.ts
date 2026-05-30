@@ -263,10 +263,12 @@ export interface OptionsNodeData {
  */
 export interface AdvancedRoomAllocationNodeData {
   baseAdults?:        number;  // default 2  — adults that fit without an extra bed
+  baseChildren?:      number;  // default 0  — children included in the base price
   maxAdults?:         number;  // default 3  — hard cap per room (extra-bed boundary)
   maxChildren?:       number;  // default 1  — hard cap per room
   extraAdultCharge?:  number;  // default 0  — per night, applied to adults beyond baseAdults
   allowExtraBed?:     boolean; // default false — when true, maxAdults gains +1 via extra bed
+  extraBedCharge?:    number;  // default 0  — per night charge for the extra bed
   childAgeLimit?:     number;  // informational only — surfaced in the summary text
   label?:             string;
 }

@@ -9,6 +9,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   allocateRooms,
+  renderAllocationSummary,
   handleAdvancedRoomAllocation,
   type AdvancedRoomAllocationDeps,
   type AllocationConfig,
@@ -26,10 +27,13 @@ import type { SessionData } from "../../services/session.service";
 
 const baseConfig: AllocationConfig = {
   baseAdults:       2,
+  baseChildren:     0,
   maxAdults:        3,
   maxChildren:      1,
   extraAdultCharge: 0,
   allowExtraBed:    false,
+  extraBedCharge:   0,
+  childAgeLimit:    null,
 };
 
 function room(over: Partial<AllocationRoomInput>): AllocationRoomInput {
@@ -366,5 +370,92 @@ describe("handleAdvancedRoomAllocation — handler", () => {
     expect(result).toBeNull();
     // No further advance — we're already past this node.
     expect((deps.advance as ReturnType<typeof vi.fn>).mock.calls.length).toBe(advanceCallsBefore);
+  });
+});
+
+// ── Pricing formula (new occupancy-pricing fields) ─────────────────────────────
+describe("pricing formula", () => {
+  // 1. Extra adults above baseAdults are charged extraAdultCharge per night.
+  it("Case P1: 3 adults, baseAdults=2, extraAdultCharge=1000 → +1000/night", () => {
+    const result = allocateRooms({
+      adults: 3, children: 0,
+      rooms: [room({ roomTypeId: "rt_std", name: "Standard", basePrice: 6000, maxAdults: 3 })],
+      config: { ...baseConfig, baseAdults: 2, extraAdultCharge: 1000 },
+      nights: 2,
+    })!;
+    expect(result).toHaveLength(1);
+    expect(result[0]!.extraAdultCost).toBe(1000);          // (3 - 2) * 1000
+    expect(result[0]!.pricePerNight).toBe(6000 + 1000);    // basePrice + extra adult
+    expect(result[0]!.totalPrice).toBe((6000 + 1000) * 2); // × nights
+  });
+
+  // 2. Exactly baseAdults → no extra-adult charge.
+  it("Case P2: 2 adults (= baseAdults), extraAdultCharge=1000 → no extra charge", () => {
+    const result = allocateRooms({
+      adults: 2, children: 0,
+      rooms: [room({ roomTypeId: "rt_std", name: "Standard", basePrice: 6000, maxAdults: 3 })],
+      config: { ...baseConfig, baseAdults: 2, extraAdultCharge: 1000 },
+      nights: 2,
+    })!;
+    expect(result[0]!.extraAdultCost).toBe(0);
+    expect(result[0]!.pricePerNight).toBe(6000);
+    expect(result[0]!.totalPrice).toBe(6000 * 2);
+  });
+
+  // 3. allowExtraBed=true + extra bed allocated → extraBedCharge added per night.
+  it("Case P3: allowExtraBed=true, extra bed allocated, extraBedCharge=500 → +500/night", () => {
+    const result = allocateRooms({
+      adults: 3, children: 0,
+      rooms: [room({ roomTypeId: "rt_dlx", name: "Deluxe", basePrice: 6000, maxAdults: 5 })],
+      config: { ...baseConfig, baseAdults: 2, allowExtraBed: true, extraBedCharge: 500 },
+      nights: 2,
+    })!;
+    expect(result[0]!.extraBed).toBe(true);
+    expect(result[0]!.extraBedCost).toBe(500);
+    expect(result[0]!.pricePerNight).toBe(6000 + 500);
+    expect(result[0]!.totalPrice).toBe((6000 + 500) * 2); // includes 500 × 2
+  });
+
+  // 4. allowExtraBed=false → extraBedCharge never applied, even when set.
+  it("Case P4: allowExtraBed=false → extraBedCharge ignored even if set", () => {
+    const result = allocateRooms({
+      adults: 3, children: 0,
+      rooms: [room({ roomTypeId: "rt_std", name: "Standard", basePrice: 6000, maxAdults: 3 })],
+      config: { ...baseConfig, baseAdults: 2, allowExtraBed: false, extraBedCharge: 500, extraAdultCharge: 1000 },
+      nights: 2,
+    })!;
+    expect(result[0]!.extraBed).toBe(true);  // 3 > baseAdults(2)
+    expect(result[0]!.extraBedCost).toBe(0); // but charge not applied
+    expect(result[0]!.pricePerNight).toBe(6000 + 1000); // only the extra-adult charge
+    expect(result[0]!.totalPrice).toBe((6000 + 1000) * 2);
+  });
+
+  // 5. childAgeLimit set → summary message includes the informational note.
+  it("Case P5: childAgeLimit=8 → summary contains the age-limit note", () => {
+    const result = allocateRooms({
+      adults: 2, children: 1,
+      rooms: [room({ roomTypeId: "rt_std", name: "Standard", basePrice: 6000, maxAdults: 3, maxChildren: 1 })],
+      config: { ...baseConfig, childAgeLimit: 8 },
+      nights: 2,
+    })!;
+    const summary = renderAllocationSummary(result);
+    expect(summary).toContain("Children above 8 years are charged as adults");
+  });
+
+  // 6. No extra charges → summary shows only the base price line (no breakdown).
+  it("Case P6: all charges zero → summary shows only the base price line", () => {
+    const result = allocateRooms({
+      adults: 2, children: 0,
+      rooms: [room({ roomTypeId: "rt_std", name: "Standard", basePrice: 6000, maxAdults: 3 })],
+      config: baseConfig,
+      nights: 2,
+    })!;
+    const summary = renderAllocationSummary(result);
+    expect(summary).toContain("₹6,000/night × 2 nights");
+    expect(summary).not.toContain("base +");
+    expect(summary).not.toContain("extra adult");
+    expect(summary).not.toContain("extra bed");
+    // No age-limit note when childAgeLimit is null.
+    expect(summary).not.toContain("charged as adults");
   });
 });

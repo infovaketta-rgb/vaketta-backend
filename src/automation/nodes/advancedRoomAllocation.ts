@@ -30,7 +30,11 @@ export type AllocationRoom = {
   adults:        number;
   children:      number;
   extraBed:      boolean;
-  pricePerNight: number; // basePrice + extraAdults * extraAdultCharge (per night)
+  basePrice:     number; // room base price per night (for the breakdown line)
+  extraAdultCost: number; // extra-adult charge per night (extraAdults * extraAdultCharge)
+  extraBedCost:  number; // extra-bed charge per night (0 when not applied)
+  childAgeLimit: number | null; // informational; surfaced in the summary note
+  pricePerNight: number; // basePrice + extraAdultCost + extraBedCost (per night)
   nights:        number;
   totalPrice:    number; // pricePerNight * nights
 };
@@ -49,15 +53,46 @@ export type AllocationRoomInput = {
   maxAdults:      number | null;
   maxChildren:    number | null;
   availableCount: number;
+  // Per-room-type occupancy/pricing overrides (DB). Null/undefined → fall back
+  // to the node-level config. Allocation caps still use the node config; these
+  // only influence the per-room price breakdown.
+  baseAdults?:       number | null;
+  baseChildren?:     number | null;
+  extraAdultCharge?: number | null;
+  allowExtraBed?:    boolean | null;
+  extraBedCharge?:   number | null;
+  childAgeLimit?:    number | null;
 };
 
 export type AllocationConfig = {
-  baseAdults:       number;
-  maxAdults:        number;
-  maxChildren:      number;
-  extraAdultCharge: number;
+  baseAdults:       number;   // adults included in base price
+  baseChildren:     number;   // children included in base price
+  maxAdults:        number;   // hard cap per room
+  maxChildren:      number;   // hard cap per room
+  extraAdultCharge: number;   // per adult per night above baseAdults
   allowExtraBed:    boolean;
+  extraBedCharge:   number;   // per night for the extra bed
+  childAgeLimit:    number | null; // null = no age-based reclassification
 };
+
+/**
+ * Per-room-type pricing config: DB value → node-level fallback. Allocation caps
+ * (maxAdults/maxChildren/extra-bed capacity) deliberately keep using the
+ * node-level config so inventory behaviour is unchanged; only the price
+ * breakdown is room-type specific.
+ */
+function resolveRoomConfig(room: AllocationRoomInput, base: AllocationConfig): AllocationConfig {
+  return {
+    baseAdults:       room.baseAdults       ?? base.baseAdults,
+    baseChildren:     room.baseChildren     ?? base.baseChildren,
+    maxAdults:        room.maxAdults         ?? base.maxAdults,
+    maxChildren:      room.maxChildren       ?? base.maxChildren,
+    extraAdultCharge: room.extraAdultCharge ?? base.extraAdultCharge,
+    allowExtraBed:    room.allowExtraBed    ?? base.allowExtraBed,
+    extraBedCharge:   room.extraBedCharge   ?? base.extraBedCharge,
+    childAgeLimit:    room.childAgeLimit    ?? base.childAgeLimit,
+  };
+}
 
 // ── Allocation engine (pure) ──────────────────────────────────────────────────
 
@@ -130,9 +165,13 @@ export function allocateRooms(args: {
 
     if (!chosen) return null; // out of available rooms
 
-    const extraAdults  = Math.max(0, chosenAdults - config.baseAdults);
-    const extraBed     = chosenAdults > config.baseAdults;
-    const pricePerNight = chosen.basePrice + extraAdults * config.extraAdultCharge;
+    const rc           = resolveRoomConfig(chosen, config);
+    const extraAdults  = Math.max(0, chosenAdults - rc.baseAdults);
+    const extraBed     = chosenAdults > rc.baseAdults;
+    const extraAdultCost = extraAdults * rc.extraAdultCharge;
+    // Extra-bed charge only applies when the room type permits an extra bed.
+    const extraBedCost = rc.allowExtraBed && extraBed ? rc.extraBedCharge : 0;
+    const pricePerNight = chosen.basePrice + extraAdultCost + extraBedCost;
 
     allocated.push({
       roomTypeId:    chosen.roomTypeId,
@@ -140,6 +179,10 @@ export function allocateRooms(args: {
       adults:        chosenAdults,
       children:      chosenChildren,
       extraBed,
+      basePrice:     chosen.basePrice,
+      extraAdultCost,
+      extraBedCost,
+      childAgeLimit: rc.childAgeLimit,
       pricePerNight,
       nights,
       totalPrice:    pricePerNight * nights,
@@ -162,17 +205,36 @@ function inr(n: number): string {
 }
 
 export function renderAllocationSummary(allocated: AllocationRoom[], opts?: { trailing?: string }): string {
-  let text = `🛏 Suggested Allocation\n${DIVIDER}\n`;
+  let text = `🛏 *Suggested Allocation*\n${DIVIDER}\n`;
   allocated.forEach((r, i) => {
     const childPart = r.children > 0
       ? `, ${r.children} child${r.children > 1 ? "ren" : ""}`
       : "";
-    const extraBedPart = r.extraBed ? " + extra bed" : "";
-    text += `Room ${i + 1}: ${r.roomTypeName} — ${r.adults} adult${r.adults > 1 ? "s" : ""}${childPart}${extraBedPart}\n`;
-    text += `${inr(r.pricePerNight)}/night × ${r.nights} night${r.nights > 1 ? "s" : ""} = ${inr(r.totalPrice)}\n`;
+    text += `*Room ${i + 1}: ${r.roomTypeName}*\n`;
+    text += `👥 ${r.adults} adult${r.adults > 1 ? "s" : ""}${childPart}\n`;
+    if (r.extraBed) text += `🛏 Extra bed included\n`;
+
+    // Price breakdown — only show the lines that carry a non-zero charge.
+    const nightsLine = `${inr(r.pricePerNight)}/night × ${r.nights} night${r.nights > 1 ? "s" : ""} = *${inr(r.totalPrice)}*`;
+    const parts: string[] = [];
+    if (r.extraAdultCost > 0) parts.push(`${inr(r.extraAdultCost)} extra adult`);
+    if (r.extraBedCost   > 0) parts.push(`${inr(r.extraBedCost)} extra bed`);
+    if (parts.length > 0) {
+      text += `💰 ${inr(r.basePrice)} base + ${parts.join(" + ")}\n   = ${nightsLine}\n`;
+    } else {
+      text += `💰 ${nightsLine}\n`;
+    }
   });
   const total = allocated.reduce((s, r) => s + r.totalPrice, 0);
-  text += `${DIVIDER}\nTotal: ${inr(total)}`;
+  text += `${DIVIDER}\n*Total: ${inr(total)}*`;
+
+  // Informational age-limit note (childAgeLimit is display-only — no automatic
+  // reclassification, since guest input does not include individual ages).
+  const ageLimit = allocated.find((r) => r.childAgeLimit != null)?.childAgeLimit;
+  if (ageLimit != null) {
+    text += `\n_Note: Children above ${ageLimit} years are charged as adults._`;
+  }
+
   if (opts?.trailing) text += `\n\n${opts.trailing}`;
   return text;
 }
@@ -244,6 +306,12 @@ export type FetchRoomTypesFn = (
   maxAdults:    number | null;
   maxChildren:  number | null;
   description?: string | null;
+  baseAdults?:       number | null;
+  baseChildren?:     number | null;
+  extraAdultCharge?: number | null;
+  allowExtraBed?:    boolean | null;
+  extraBedCharge?:   number | null;
+  childAgeLimit?:    number | null;
 }>>;
 
 export type GetCalendarDataFn = (
@@ -287,10 +355,13 @@ export type AdvancedRoomAllocationDeps = {
 function resolveConfig(data: AdvancedRoomAllocationNodeData): AllocationConfig {
   return {
     baseAdults:       data.baseAdults       ?? 2,
+    baseChildren:     data.baseChildren     ?? 0,
     maxAdults:        data.maxAdults        ?? 3,
     maxChildren:      data.maxChildren      ?? 1,
     extraAdultCharge: data.extraAdultCharge ?? 0,
     allowExtraBed:    data.allowExtraBed    ?? false,
+    extraBedCharge:   data.extraBedCharge   ?? 0,
+    childAgeLimit:    data.childAgeLimit    ?? null,
   };
 }
 
@@ -330,6 +401,12 @@ async function buildInventoryRooms(
       maxAdults:     r.maxAdults,
       maxChildren:   r.maxChildren,
       availableCount,
+      baseAdults:       r.baseAdults       ?? null,
+      baseChildren:     r.baseChildren     ?? null,
+      extraAdultCharge: r.extraAdultCharge ?? null,
+      allowExtraBed:    r.allowExtraBed    ?? null,
+      extraBedCharge:   r.extraBedCharge   ?? null,
+      childAgeLimit:    r.childAgeLimit    ?? null,
     };
   });
 }
@@ -582,9 +659,12 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     return `All your guests are already placed. Reply *DONE* to confirm or *MENU* to cancel.\n\n${renderAllocationSummary(state.selectedRooms)}`;
   }
 
-  const extraAdults  = Math.max(0, takeAdults - config.baseAdults);
-  const extraBed     = takeAdults > config.baseAdults;
-  const pricePerNight = room.basePrice + extraAdults * config.extraAdultCharge;
+  const rc           = resolveRoomConfig(room, config);
+  const extraAdults  = Math.max(0, takeAdults - rc.baseAdults);
+  const extraBed     = takeAdults > rc.baseAdults;
+  const extraAdultCost = extraAdults * rc.extraAdultCharge;
+  const extraBedCost = rc.allowExtraBed && extraBed ? rc.extraBedCharge : 0;
+  const pricePerNight = room.basePrice + extraAdultCost + extraBedCost;
 
   const newRoom: AllocationRoom = {
     roomTypeId:    room.roomTypeId,
@@ -592,6 +672,10 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     adults:        takeAdults,
     children:      takeChildren,
     extraBed,
+    basePrice:     room.basePrice,
+    extraAdultCost,
+    extraBedCost,
+    childAgeLimit: rc.childAgeLimit,
     pricePerNight,
     nights,
     totalPrice:    pricePerNight * nights,

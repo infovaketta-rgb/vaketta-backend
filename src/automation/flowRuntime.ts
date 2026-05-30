@@ -393,6 +393,12 @@ async function fetchRoomTypes(hotelId: string, filters?: {
       capacity: true, maxAdults: true, maxChildren: true,
       description: true,
       carouselButtonLabel: true,
+      baseAdults: true,
+      baseChildren: true,
+      extraAdultCharge: true,
+      allowExtraBed: true,
+      extraBedCharge: true,
+      childAgeLimit: true,
     },
   });
 }

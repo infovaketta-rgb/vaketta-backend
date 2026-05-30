@@ -12,6 +12,12 @@ export async function createRoomType({
   maxChildren,
   totalRooms,
   carouselButtonLabel,
+  baseAdults,
+  baseChildren,
+  extraAdultCharge,
+  allowExtraBed,
+  extraBedCharge,
+  childAgeLimit,
 }: {
   hotelId:              string;
   name:                 string;
@@ -21,6 +27,12 @@ export async function createRoomType({
   maxChildren?:         number;
   totalRooms?:          number;
   carouselButtonLabel?: string;
+  baseAdults?:          number;
+  baseChildren?:        number;
+  extraAdultCharge?:    number;
+  allowExtraBed?:       boolean;
+  extraBedCharge?:      number;
+  childAgeLimit?:       number;
 }) {
   return prisma.roomType.create({
     data: {
@@ -31,6 +43,12 @@ export async function createRoomType({
       maxAdults:   maxAdults   ?? null,
       maxChildren: maxChildren ?? null,
       totalRooms:  totalRooms  ?? 1,
+      baseAdults:       baseAdults       ?? null,
+      baseChildren:     baseChildren     ?? null,
+      extraAdultCharge: extraAdultCharge ?? null,
+      allowExtraBed:    allowExtraBed    ?? false,
+      extraBedCharge:   extraBedCharge   ?? null,
+      childAgeLimit:    childAgeLimit    ?? null,
       ...(carouselButtonLabel !== undefined && { carouselButtonLabel }),
     },
   });
@@ -54,6 +72,12 @@ export async function updateRoomType({
   maxChildren,
   totalRooms,
   carouselButtonLabel,
+  baseAdults,
+  baseChildren,
+  extraAdultCharge,
+  allowExtraBed,
+  extraBedCharge,
+  childAgeLimit,
 }: {
   id:                   string;
   hotelId:              string;
@@ -64,6 +88,12 @@ export async function updateRoomType({
   maxChildren?:         number;
   totalRooms?:          number;
   carouselButtonLabel?: string;
+  baseAdults?:          number;
+  baseChildren?:        number;
+  extraAdultCharge?:    number;
+  allowExtraBed?:       boolean;
+  extraBedCharge?:      number;
+  childAgeLimit?:       number;
 }) {
   return prisma.roomType.update({
     where: { id, hotelId },
@@ -73,6 +103,12 @@ export async function updateRoomType({
       capacity:    capacity    ?? null,
       maxAdults:   maxAdults   ?? null,
       maxChildren: maxChildren ?? null,
+      baseAdults:       baseAdults       ?? null,
+      baseChildren:     baseChildren     ?? null,
+      extraAdultCharge: extraAdultCharge ?? null,
+      allowExtraBed:    allowExtraBed    ?? false,
+      extraBedCharge:   extraBedCharge   ?? null,
+      childAgeLimit:    childAgeLimit    ?? null,
       ...(totalRooms !== undefined && { totalRooms }),
       ...(carouselButtonLabel !== undefined && { carouselButtonLabel }),
     },
