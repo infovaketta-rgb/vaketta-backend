@@ -43,8 +43,26 @@ export type AraState = {
   guests:          { adults: number; children: number; childrenAges?: number[] };
   selectedRooms:   AllocationRoom[];
   remainingGuests: { adults: number; children: number };
-  phase:           "confirm" | "manual";
+  phase:           "confirm" | "manual" | "room_menu" | "move_from_count" | "move_to_room" | "plan_selection";
+  // Structured-modify navigation (all optional — older state shapes stay valid):
+  selectedRoomIndex?: number; // which room the guest is editing (room_menu / move_*)
+  pendingMove?: { fromRoomIndex: number; adults: number; children: number };
+  // Multi-plan selection (Phase 1 carousel):
+  plans?:             AllocationPlan[]; // candidate plans offered to the guest
+  selectedPlanIndex?: number;           // which plan the guest chose
 };
+
+/** One candidate allocation plan offered in the Phase-1 carousel. */
+export interface AllocationPlan {
+  label:             string;            // "Most Comfortable" | "Fewer Rooms" | "Premium"
+  rooms:             AllocationRoom[];
+  totalPrice:        number;
+  nights:            number;
+  roomCount:         number;
+  extraBedCount:     number;
+  primaryRoomTypeId: string;            // most-used type in this plan (for the photo)
+  planTag:           "comfort" | "value" | "premium";
+}
 
 export type AllocationRoomInput = {
   roomTypeId:     string;
@@ -180,8 +198,12 @@ export function allocateRooms(args: {
   rooms:    AllocationRoomInput[];
   config:   AllocationConfig;
   nights:   number;
+  /** "base-first" (default) keeps base occupancy / fewer beds; "max-fill"
+   *  minimises room count by cramming each room toward max occupancy. */
+  strategy?: "base-first" | "max-fill";
 }): AllocationRoom[] | null {
   const { adults, children, rooms, config, nights } = args;
+  const strategy = args.strategy ?? "base-first";
 
   if (adults <= 0 && children <= 0) return [];
   if (nights <= 0) return null;
@@ -194,13 +216,16 @@ export function allocateRooms(args: {
   const availTotal = rooms.reduce((s, r) => s + Math.max(0, r.availableCount), 0);
   if (availTotal <= 0) return null;
 
-  // ── Adults drive the room count (base-first, absorb the remainder) ──
+  // ── Adults drive the room count ──
+  // base-first → absorb the remainder (fewer beds); max-fill → fewest rooms.
   let R = 0;
   let adultCounts: number[] = [];
   if (adults > 0) {
-    const rBase = baseFirstRoomCount(adults, baseA, maxA);
-    if (rBase <= availTotal) {
-      R = rBase;
+    const wanted = strategy === "max-fill"
+      ? Math.ceil(adults / maxA)               // minimise rooms
+      : baseFirstRoomCount(adults, baseA, maxA); // base-first / absorb
+    if (wanted <= availTotal) {
+      R = wanted;
     } else {
       R = availTotal;                       // availability-limited → cram available rooms
       if (R * maxA < adults) return null;   // can't house everyone even at max occupancy
@@ -266,6 +291,81 @@ export function allocateRooms(args: {
     });
   }
   return allocated;
+}
+
+// ── Multi-plan generator (pure, testable) ─────────────────────────────────────
+
+/** Build an AllocationPlan from an allocated room list. */
+function toPlan(
+  label: AllocationPlan["label"], planTag: AllocationPlan["planTag"],
+  rooms: AllocationRoom[], nights: number,
+): AllocationPlan {
+  const counts = new Map<string, number>();
+  for (const r of rooms) counts.set(r.roomTypeId, (counts.get(r.roomTypeId) ?? 0) + 1);
+  let primaryRoomTypeId = rooms[0]?.roomTypeId ?? "";
+  let best = -1;
+  for (const [id, c] of counts) if (c > best) { best = c; primaryRoomTypeId = id; }
+  return {
+    label, planTag,
+    rooms,
+    totalPrice:    rooms.reduce((s, r) => s + r.totalPrice, 0),
+    nights,
+    roomCount:     rooms.length,
+    extraBedCount: rooms.filter((r) => r.extraBed).length,
+    primaryRoomTypeId,
+  };
+}
+
+/**
+ * Generate up to 3 meaningfully different allocation plans:
+ *   A "comfort" — base-first (current default suggestion).
+ *   B "value"   — max-fill (minimise room count).
+ *   C "premium" — base-first on the next-cheapest type (skip the cheapest).
+ * Deduplicates by (roomCount, totalPrice, extraBedCount). Returns [] if nothing
+ * fits, [one] when only a single unique plan exists (no carousel needed), or
+ * 2–3 plans sorted by score = roomCount × averagePricePerRoom (lowest first).
+ */
+export function generatePlans(params: {
+  adults:   number;
+  children: number;
+  rooms:    AllocationRoomInput[];
+  config:   AllocationConfig;
+  nights:   number;
+}): AllocationPlan[] {
+  const { adults, children, rooms, config, nights } = params;
+  const candidates: AllocationPlan[] = [];
+
+  const a = allocateRooms({ adults, children, rooms, config, nights });
+  if (a && a.length) candidates.push(toPlan("Most Comfortable", "comfort", a, nights));
+
+  const b = allocateRooms({ adults, children, rooms, config, nights, strategy: "max-fill" });
+  if (b && b.length) candidates.push(toPlan("Fewer Rooms", "value", b, nights));
+
+  // Premium: drop the single cheapest type, base-first on the rest.
+  const cheapest = [...rooms].sort((x, y) => x.basePrice - y.basePrice)[0];
+  if (cheapest) {
+    const premiumRooms = rooms.filter((r) => r.roomTypeId !== cheapest.roomTypeId);
+    if (premiumRooms.length > 0) {
+      const c = allocateRooms({ adults, children, rooms: premiumRooms, config, nights });
+      if (c && c.length) candidates.push(toPlan("Premium", "premium", c, nights));
+    }
+  }
+
+  // Deduplicate by (roomCount, totalPrice, extraBedCount).
+  const seen = new Set<string>();
+  const unique = candidates.filter((p) => {
+    const key = `${p.roomCount}|${p.totalPrice}|${p.extraBedCount}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // Sort by score = roomCount × averagePricePerRoom (lowest first) — surfaces the
+  // most efficient allocation regardless of whether efficiency is fewer or cheaper rooms.
+  const score = (p: AllocationPlan): number =>
+    p.roomCount > 0 ? p.roomCount * (p.totalPrice / p.roomCount) : 0;
+  unique.sort((x, y) => score(x) - score(y));
+  return unique;
 }
 
 // ── Manual modification (pure, testable appliers) ─────────────────────────────
@@ -524,6 +624,143 @@ function buildManualRoomList(rooms: AllocationRoomInput[], remaining: { adults: 
   return text;
 }
 
+/** Room types the guest can still add: availableCount minus what's already
+ *  selected of that type, > 0. Used for the optional "add another room" list. */
+function addableRooms(rooms: AllocationRoomInput[], selected: AllocationRoom[]): AllocationRoomInput[] {
+  return rooms.filter((r) => {
+    const picked = selected.filter((s) => s.roomTypeId === r.roomTypeId).length;
+    return r.availableCount - picked > 0;
+  });
+}
+
+/** Room-type capacity hint, e.g. " _(fits 3 adults, 1 child)_". */
+function capHint(r: { maxAdults: number | null; maxChildren: number | null }): string {
+  const cap: string[] = [];
+  if (r.maxAdults != null) cap.push(`${r.maxAdults} adults`);
+  if (r.maxChildren != null && r.maxChildren > 0) cap.push(`${r.maxChildren} child`);
+  return cap.length ? ` _(fits ${cap.join(", ")})_` : "";
+}
+
+/** Occupancy phrase for a room, e.g. "2 adults, 1 child, extra bed". */
+function occupancyPhrase(room: AllocationRoom): string {
+  const parts = [`${room.adults} adult${room.adults === 1 ? "" : "s"}`];
+  if (room.children > 0) parts.push(`${room.children} child${room.children > 1 ? "ren" : ""}`);
+  if (room.extraBed) parts.push("extra bed");
+  return parts.join(", ");
+}
+
+// ── Structured-modify menu (deterministic, AI-free) ──────────────────────────
+
+export type RoomAction = "add_bed" | "remove_bed" | "move_guest" | "remove_room";
+
+/**
+ * The actions offered for a room, in fixed order. Pure function of the room +
+ * its config, so render and handler derive the SAME numbered list without
+ * storing the mapping in state.
+ */
+export function roomMenuOptions(room: AllocationRoom, cfg: AllocationConfig): RoomAction[] {
+  const opts: RoomAction[] = [];
+  if (cfg.allowExtraBed && !room.extraBed) opts.push("add_bed");
+  if (room.extraBed)                       opts.push("remove_bed");
+  if (room.adults > 0 || room.children > 0) opts.push("move_guest");
+  opts.push("remove_room");
+  return opts;
+}
+
+const ROOM_ACTION_LABELS: Record<RoomAction, string> = {
+  add_bed:     "Add extra bed",
+  remove_bed:  "Remove extra bed",
+  move_guest:  "Move a guest out",
+  remove_room: "Remove this room",
+};
+
+/**
+ * Manual-mode prompt: existing rooms are editable (numbered 1..N), with an
+ * OPTIONAL add-room list numbered AFTER them (N+1..N+M). Fully navigable with
+ * no AI. When nothing is addable, only the edit list + DONE/MENU are shown.
+ */
+export function renderManualMode(state: AraState, addable: AllocationRoomInput[]): string {
+  const n = state.selectedRooms.length;
+  let text = `✏️ *Modify your booking*\n${DIVIDER}\n`;
+  state.selectedRooms.forEach((r, i) => {
+    text += `*Room ${i + 1}: ${r.roomTypeName}* — ${occupancyPhrase(r)} — ${inr(r.totalPrice)}\n`;
+  });
+  const total = state.selectedRooms.reduce((s, r) => s + r.totalPrice, 0);
+  text += `${DIVIDER}\n*Total: ${inr(total)}*\n`;
+  if (n > 0) text += `\nReply *1–${n}* to edit a room.\n`;
+  if (addable.length > 0) {
+    text += `\n➕ *Add a room:*\n`;
+    addable.forEach((r, i) => {
+      text += `*${n + i + 1}.* ${r.name}${capHint(r)} _(${r.availableCount} avail)_ — ${inr(r.basePrice)}/night\n`;
+    });
+  }
+  text += `\nReply *DONE* to confirm · *MENU* to cancel`;
+  return text;
+}
+
+/** Per-room action menu (room_menu phase). */
+export function renderRoomMenu(room: AllocationRoom, options: RoomAction[], roomIndex: number): string {
+  let text = `*Room ${roomIndex + 1}: ${room.roomTypeName}*\n👥 ${occupancyPhrase(room)}\n💰 ${inr(room.pricePerNight)}/night\n\nWhat would you like to do?\n${DIVIDER}\n`;
+  options.forEach((a, i) => { text += `*${i + 1}.* ${ROOM_ACTION_LABELS[a]}\n`; });
+  text += `${DIVIDER}\nReply *0* to go back · *MENU* to cancel`;
+  return text;
+}
+
+/** "How many to move out" prompt (move_from_count phase). */
+export function renderMoveFromCount(room: AllocationRoom, roomIndex: number): string {
+  return `Moving guests out of *Room ${roomIndex + 1}: ${room.roomTypeName}*\n` +
+    `(currently ${room.adults} adult${room.adults === 1 ? "" : "s"}, ${room.children} child${room.children === 1 ? "" : "ren"})\n\n` +
+    `How many adults and children to move?\n` +
+    `Format: *adults children*  e.g. *1 0* for 1 adult, 0 children.\n` +
+    `Reply *0* to go back · *MENU* to cancel.`;
+}
+
+/** Destination picker (move_to_room phase). Lists every room except the source,
+ *  numbered 1.. in display order, with current occupancy + caps. */
+export function renderMoveToRoom(
+  state: AraState,
+  pending: { adults: number; children: number },
+  fromIndex: number,
+  resolveCfg: RoomConfigResolver,
+): string {
+  const moving: string[] = [];
+  if (pending.adults > 0)   moving.push(`${pending.adults} adult${pending.adults === 1 ? "" : "s"}`);
+  if (pending.children > 0) moving.push(`${pending.children} child${pending.children > 1 ? "ren" : ""}`);
+  let text = `Move ${moving.join(", ")} to which room?\n${DIVIDER}\n`;
+  let n = 0;
+  state.selectedRooms.forEach((r, i) => {
+    if (i === fromIndex) return;
+    n++;
+    const cfg = resolveCfg(r);
+    text += `*${n}.* ${r.roomTypeName} — currently ${r.adults} adults, ${r.children} child (max ${cfg.maxAdults} adults, ${cfg.maxChildren} child)\n`;
+  });
+  text += `${DIVIDER}\nReply *0* to go back · *MENU* to cancel.`;
+  return text;
+}
+
+/** Primary room-type name for a plan ("Deluxe" or "Deluxe mix" for mixed types). */
+function planTypeName(plan: AllocationPlan): string {
+  const primary = plan.rooms.find((r) => r.roomTypeId === plan.primaryRoomTypeId) ?? plan.rooms[0];
+  const name    = primary?.roomTypeName ?? "Room";
+  const allSame = plan.rooms.length > 0 && plan.rooms.every((r) => r.roomTypeId === plan.primaryRoomTypeId);
+  return allSame ? name : `${name} mix`;
+}
+
+/** Text fallback when the carousel can't be sent (or only 2 plans). Pure. */
+export function renderPlanTextFallback(plans: AllocationPlan[]): string {
+  let text = `🏨 *Choose your room plan:*\n${DIVIDER}\n`;
+  plans.forEach((p, i) => {
+    const beds = p.extraBedCount > 0 ? "Extra beds incl." : "No extra beds";
+    text += `*${i + 1}. ${p.label} — ${inr(p.totalPrice)}*\n`;
+    text += `   ${p.roomCount} room${p.roomCount === 1 ? "" : "s"} · ${planTypeName(p)} · ${beds}\n`;
+    p.rooms.forEach((r, j) => {
+      text += `   Room ${j + 1}: ${r.roomTypeName} — ${occupancyPhrase(r)}\n`;
+    });
+  });
+  text += `${DIVIDER}\nReply *1–${plans.length}* to choose · *MENU* to cancel`;
+  return text;
+}
+
 // ── Output contract ───────────────────────────────────────────────────────────
 
 /**
@@ -617,7 +854,18 @@ export type AdvancedRoomAllocationDeps = {
   // free-text edits that structured parsing can't. Absent → no AI fallback
   // (manual mode behaves exactly as before).
   interpretModification?: InterpretModificationFn;
+  // OPTIONAL — sends the Phase-1 multi-plan carousel. Absent → Phase 1 falls
+  // back to the text plan list even when multiple plans exist.
+  sendPlanCarousel?: SendPlanCarouselFn;
 };
+
+/** Sends the multi-plan carousel; returns true if sent (→ "ALREADY_SENT"). */
+export type SendPlanCarouselFn = (args: {
+  hotelId:  string;
+  guestId:  string;
+  plans:    AllocationPlan[];
+  bodyText: string;
+}) => Promise<boolean>;
 
 /** Free-text → one structured allocation-edit op. Mirrors ai.service. */
 export type InterpretModificationFn = (
@@ -745,6 +993,11 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
   if (existing) {
     flowData.waitingFor = "answer";
     await persist(deps);
+    // Mid plan-selection (webhook retry) → re-show the TEXT list, never re-send
+    // the carousel (avoids a double-send).
+    if (existing.phase === "plan_selection" && existing.plans && existing.plans.length > 0) {
+      return renderPlanTextFallback(existing.plans);
+    }
     return renderAllocationSummary(existing.selectedRooms, { trailing: confirmPromptFooter(), childrenAges: existing.guests.childrenAges });
   }
 
@@ -782,26 +1035,49 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
   }
 
   const roomInputs = await buildInventoryRooms(hotelId, checkIn, checkOut, fetchRoomTypes, getCalendarData);
-  const allocated  = allocateRooms({ adults, children, rooms: roomInputs, config, nights });
+  const plans = generatePlans({ adults, children, rooms: roomInputs, config, nights });
 
-  if (!allocated || allocated.length === 0) {
+  if (plans.length === 0) {
     await resetSession(guestId, hotelId);
     return `Sorry, we don't have enough rooms for ${adults + children} guests on those dates. Please contact us directly or try different dates.`;
     // ↑ Spec-mandated graceful failure (step 3 inventory-exhaustion path).
   }
 
-  const newState: AraState = {
-    guests:          { adults, children, ...(childrenAges.length > 0 ? { childrenAges } : {}) },
-    selectedRooms:   allocated,
-    remainingGuests: { adults: 0, children: 0 },
-    phase:           "confirm",
-  };
-  writeState(vars, newState);
+  const guestsField = { adults, children, ...(childrenAges.length > 0 ? { childrenAges } : {}) };
 
+  // Single unique plan → existing single-summary confirm flow (no carousel).
+  if (plans.length === 1) {
+    const only = plans[0]!;
+    const newState: AraState = {
+      guests:          guestsField,
+      selectedRooms:   only.rooms,
+      remainingGuests: { adults: 0, children: 0 },
+      phase:           "confirm",
+    };
+    writeState(vars, newState);
+    flowData.waitingFor = "answer";
+    await persist(deps);
+    return renderAllocationSummary(only.rooms, { trailing: confirmPromptFooter(), childrenAges });
+  }
+
+  // 2–3 plans → plan_selection: store plans, offer a carousel (fall back to text).
+  const planState: AraState = {
+    guests:          guestsField,
+    selectedRooms:   [],
+    remainingGuests: { adults: 0, children: 0 },
+    phase:           "plan_selection",
+    plans,
+  };
+  writeState(vars, planState);
   flowData.waitingFor = "answer";
   await persist(deps);
 
-  return renderAllocationSummary(allocated, { trailing: confirmPromptFooter(), childrenAges });
+  const bodyText = "Here are your room options:";
+  if (deps.sendPlanCarousel) {
+    const sent = await deps.sendPlanCarousel({ hotelId, guestId, plans, bodyText });
+    if (sent) return "ALREADY_SENT";
+  }
+  return renderPlanTextFallback(plans);
 }
 
 // ── Phase 2 helpers ───────────────────────────────────────────────────────────
@@ -995,28 +1271,68 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     return safeMenu(hotelId);
   }
 
+  // ── Plan selection sub-phase ───────────────────────────────────────────────
+  // (MENU is already handled globally above.)
+  if (state.phase === "plan_selection") {
+    const plans = state.plans ?? [];
+    if (plans.length === 0) {            // corrupt state → reset gracefully
+      clearState(vars);
+      await resetSession(guestId, hotelId);
+      return safeMenu(hotelId);
+    }
+
+    // Accept either a carousel button reply ("plan_N", 0-based) or a text reply ("1".."N").
+    let idx = -1;
+    const t = input.trim();
+    const m = t.match(/^plan_(\d+)$/i);
+    if (m) {
+      idx = parseInt(m[1]!, 10);
+    } else {
+      const num = parseInt(t, 10);
+      if (Number.isFinite(num)) idx = num - 1;
+    }
+
+    if (idx < 0 || idx >= plans.length) {
+      // Invalid / unknown → re-show the TEXT list (never re-send the carousel). No mutation.
+      return renderPlanTextFallback(plans);
+    }
+
+    const chosen = plans[idx]!;
+    const confirmState: AraState = {
+      guests:            state.guests,
+      selectedRooms:     chosen.rooms,
+      remainingGuests:   { adults: 0, children: 0 },
+      phase:             "confirm",
+      selectedPlanIndex: idx,
+    };
+    writeState(vars, confirmState);
+    await persist(deps);
+    return renderAllocationSummary(chosen.rooms, { trailing: confirmPromptFooter(), childrenAges: state.guests.childrenAges });
+  }
+
   // ── Confirm sub-phase ──────────────────────────────────────────────────────
   if (state.phase === "confirm") {
     if (isConfirmInput(input)) {
       return finalizeAndAdvance(deps, state.selectedRooms);
     }
     if (isModifyInput(input)) {
-      // Switch to manual mode. Start from a CLEAN slate: clear selected rooms
-      // and reset remaining guests to the full requested count.
+      // Switch to manual mode but KEEP the suggested rooms as the starting point
+      // (all guests already placed). The guest can add/remove rooms, move guests,
+      // or DONE to confirm as-is — no rebuild from zero.
       const next: AraState = {
         guests:          state.guests,
-        selectedRooms:   [],
-        remainingGuests: { adults: state.guests.adults, children: state.guests.children },
+        selectedRooms:   state.selectedRooms,
+        remainingGuests: { adults: 0, children: 0 },
         phase:           "manual",
       };
       writeState(vars, next);
       await persist(deps);
 
-      // Re-fetch room inputs so the prompt has live availability info.
+      // Re-fetch room inputs so the add-room prompt has live availability info.
       const checkIn  = vars["bookingCheckIn"]!;
       const checkOut = vars["bookingCheckOut"]!;
       const rooms = await buildInventoryRooms(hotelId, checkIn, checkOut, deps.fetchRoomTypes, deps.getCalendarData);
-      return buildManualRoomList(rooms, next.remainingGuests);
+      return renderManualMode(next, addableRooms(rooms, next.selectedRooms));
     }
     // Free text at the confirm step → AI modification, staying in confirm phase
     // (Fix B). No interpreter dep → unchanged behaviour (no AI call, no fetch).
@@ -1042,6 +1358,123 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     return safeMenu(hotelId);
   }
   const rooms = await buildInventoryRooms(hotelId, checkIn, checkOut, deps.fetchRoomTypes, deps.getCalendarData);
+  const data   = (deps.node.data ?? {}) as AdvancedRoomAllocationNodeData;
+  const config = resolveConfig(data);
+  const nights = countNights(checkIn, checkOut);
+
+  // Per-room config resolver from live inventory (DB overrides → node config) —
+  // used by the appliers and the destination caps shown in move_to_room.
+  const inputById = new Map(rooms.map((ri) => [ri.roomTypeId, ri]));
+  const resolveCfg: RoomConfigResolver = (ar) => {
+    const ri = inputById.get(ar.roomTypeId);
+    return ri ? resolveRoomConfig(ri, config) : config;
+  };
+
+  // Return to manual mode showing the modify menu. (remainingGuests is preserved
+  // from `state`; the structured-modify phases only run when all guests are placed.)
+  const toManual = async (selectedRooms: AllocationRoom[]): Promise<string> => {
+    const m: AraState = {
+      guests:          state.guests,
+      selectedRooms,
+      remainingGuests: state.remainingGuests,
+      phase:           "manual",
+    };
+    writeState(vars, m);
+    await persist(deps);
+    return renderManualMode(m, addableRooms(rooms, selectedRooms));
+  };
+
+  // ── room_menu — per-room action picker (deterministic, no AI) ──────────────
+  if (state.phase === "room_menu") {
+    const idx = state.selectedRoomIndex ?? -1;
+    if (!inRange(state.selectedRooms, idx)) return toManual(state.selectedRooms);
+    const targetRoom = state.selectedRooms[idx]!;
+    const options    = roomMenuOptions(targetRoom, resolveCfg(targetRoom));
+    const t = input.trim();
+    if (t === "0") return toManual(state.selectedRooms);
+    const sel = parseInt(t, 10);
+    if (!Number.isFinite(sel) || sel < 1 || sel > options.length) {
+      return `Please reply 1–${options.length} or 0 to go back.\n\n${renderRoomMenu(targetRoom, options, idx)}`;
+    }
+    const action = options[sel - 1]!;
+    if (action === "move_guest") {
+      const mv: AraState = {
+        guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
+        phase: "move_from_count", selectedRoomIndex: idx,
+      };
+      writeState(vars, mv);
+      await persist(deps);
+      return renderMoveFromCount(targetRoom, idx);
+    }
+    const res: ApplyResult =
+      action === "add_bed"    ? applyAddExtraBed(state.selectedRooms, idx, resolveCfg)
+      : action === "remove_bed" ? applyRemoveExtraBed(state.selectedRooms, idx)
+      : /* remove_room */         applyRemoveRoom(state.selectedRooms, idx);
+    if (res.ok) return toManual(res.rooms);
+    const reason = res.reason || "Sorry, that didn't work. Please choose another option.";
+    return `${reason}\n\n${renderRoomMenu(targetRoom, options, idx)}`;
+  }
+
+  // ── move_from_count — how many adults/children to move out ─────────────────
+  if (state.phase === "move_from_count") {
+    const idx = state.selectedRoomIndex ?? -1;
+    if (!inRange(state.selectedRooms, idx)) return toManual(state.selectedRooms);
+    const targetRoom = state.selectedRooms[idx]!;
+    const t = input.trim();
+    if (t === "0") {
+      const rm: AraState = {
+        guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
+        phase: "room_menu", selectedRoomIndex: idx,
+      };
+      writeState(vars, rm);
+      await persist(deps);
+      return renderRoomMenu(targetRoom, roomMenuOptions(targetRoom, resolveCfg(targetRoom)), idx);
+    }
+    const nums = t.split(/\s+/).map((s) => parseInt(s, 10));
+    const mvA = Number.isFinite(nums[0]) ? nums[0]! : NaN;
+    const mvC = nums.length >= 2 && Number.isFinite(nums[1]) ? nums[1]! : 0;
+    if (!Number.isFinite(mvA) || mvA < 0 || mvC < 0 || (mvA === 0 && mvC === 0) ||
+        mvA > targetRoom.adults || mvC > targetRoom.children) {
+      return `Please reply like *1 0* (adults children) — at least one above 0, and no more than the room has.\n\n${renderMoveFromCount(targetRoom, idx)}`;
+    }
+    const mv: AraState = {
+      guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
+      phase: "move_to_room", selectedRoomIndex: idx, pendingMove: { fromRoomIndex: idx, adults: mvA, children: mvC },
+    };
+    writeState(vars, mv);
+    await persist(deps);
+    return renderMoveToRoom(mv, mv.pendingMove!, idx, resolveCfg);
+  }
+
+  // ── move_to_room — pick the destination room ───────────────────────────────
+  if (state.phase === "move_to_room") {
+    const pm = state.pendingMove;
+    if (!pm || !inRange(state.selectedRooms, pm.fromRoomIndex)) return toManual(state.selectedRooms);
+    const fromIdx = pm.fromRoomIndex;
+    const t = input.trim();
+    if (t === "0") {
+      const back: AraState = {
+        guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
+        phase: "move_from_count", selectedRoomIndex: fromIdx, pendingMove: pm, // preserve pendingMove
+      };
+      writeState(vars, back);
+      await persist(deps);
+      return renderMoveFromCount(state.selectedRooms[fromIdx]!, fromIdx);
+    }
+    const destIndices = state.selectedRooms.map((_, i) => i).filter((i) => i !== fromIdx);
+    const sel = parseInt(t, 10);
+    if (!Number.isFinite(sel) || sel < 1 || sel > destIndices.length) {
+      return renderMoveToRoom(state, pm, fromIdx, resolveCfg);
+    }
+    const toIdx = destIndices[sel - 1]!;
+    const res = applyMoveGuest(state.selectedRooms, fromIdx, toIdx, pm.adults, pm.children, resolveCfg);
+    if (res.ok) return toManual(res.rooms);
+    if (res.outOfRange) return renderMoveToRoom(state, pm, fromIdx, resolveCfg);
+    return `${res.reason}\n\n${renderMoveToRoom(state, pm, fromIdx, resolveCfg)}`;
+  }
+
+  // ── phase "manual" ─────────────────────────────────────────────────────────
+  const allPlaced = state.remainingGuests.adults + state.remainingGuests.children === 0;
 
   if (isDoneInput(input)) {
     if (state.selectedRooms.length === 0) {
@@ -1050,33 +1483,75 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     return finalizeAndAdvance(deps, state.selectedRooms);
   }
 
-  // Room pick by number.
   const pick = parseInt(input.trim(), 10);
+
+  // All guests placed → numbered menu: 1..N edit an existing room (room_menu),
+  // N+1..N+M add a room type (offset). Anything else → AI free text, else re-render.
+  if (allPlaced) {
+    const addable = addableRooms(rooms, state.selectedRooms);
+    const n = state.selectedRooms.length;
+
+    if (Number.isFinite(pick) && pick >= 1 && pick <= n) {
+      const targetRoom = state.selectedRooms[pick - 1]!;
+      const menu: AraState = {
+        guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
+        phase: "room_menu", selectedRoomIndex: pick - 1,
+      };
+      writeState(vars, menu);
+      await persist(deps);
+      return renderRoomMenu(targetRoom, roomMenuOptions(targetRoom, resolveCfg(targetRoom)), pick - 1);
+    }
+
+    if (Number.isFinite(pick) && pick >= n + 1 && pick <= n + addable.length) {
+      const room = addable[pick - n - 1]!;
+      const rc   = resolveRoomConfig(room, config);
+      const effMaxAdults   = Math.min(config.maxAdults + (config.allowExtraBed ? 1 : 0), room.maxAdults ?? Infinity);
+      const effMaxChildren = Math.min(config.maxChildren, room.maxChildren ?? Infinity);
+      // Extra room by choice → base occupancy, no extra bed (base never exceeds base).
+      const addAdults   = Math.min(rc.baseAdults,   effMaxAdults);
+      const addChildren = Math.min(rc.baseChildren, effMaxChildren);
+      const p = computeRoomPricing(room.basePrice, addAdults, false, nights, rc);
+      const extraRoom: AllocationRoom = {
+        roomTypeId:    room.roomTypeId,
+        roomTypeName:  room.name,
+        adults:        addAdults,
+        children:      addChildren,
+        extraBed:      false,
+        basePrice:     room.basePrice,
+        extraAdultCost: p.extraAdultCost,
+        extraBedCost:   p.extraBedCost,
+        childAgeLimit: rc.childAgeLimit,
+        pricePerNight:  p.pricePerNight,
+        nights,
+        totalPrice:     p.totalPrice,
+      };
+      return toManual([...state.selectedRooms, extraRoom]);
+    }
+
+    // Not a valid menu number → AI free-text convenience, else re-show the menu.
+    const aiReply = await tryModify(deps, state, rooms, input, "manual");
+    return aiReply ?? renderManualMode(state, addable);
+  }
+
+  // ── Guests still need rooms → fill-by-number flow (legacy / rebuild path) ──
   if (!Number.isFinite(pick) || pick < 1 || pick > rooms.length) {
-    // Structured parsing failed → try the AI fallback (returns null only when the
-    // interpreter dep is absent → keep the exact structured re-prompt, no ack).
     const aiReply = await tryModify(deps, state, rooms, input, "manual");
     return aiReply ?? `Please reply with a room number (1–${rooms.length}), *DONE* to finish, or *MENU* to cancel.`;
   }
   const room = rooms[pick - 1]!;
 
-  // Subtract this room's availability against what's already selected of the same type.
   const alreadyPickedOfType = state.selectedRooms.filter((r) => r.roomTypeId === room.roomTypeId).length;
   if (room.availableCount - alreadyPickedOfType <= 0) {
     return `Sorry, no more *${room.name}* rooms available for those dates. Please pick another.`;
   }
 
-  // Fill this room with as many remaining guests as it can hold (config policy + DB caps).
-  const data = (deps.node.data ?? {}) as AdvancedRoomAllocationNodeData;
-  const config = resolveConfig(data);
-  const nights = countNights(checkIn, checkOut);
   const effMaxAdults   = Math.min(config.maxAdults + (config.allowExtraBed ? 1 : 0), room.maxAdults ?? Infinity);
   const effMaxChildren = Math.min(config.maxChildren, room.maxChildren ?? Infinity);
   const takeAdults     = Math.min(state.remainingGuests.adults,   effMaxAdults);
   const takeChildren   = Math.min(state.remainingGuests.children, effMaxChildren);
 
   if (takeAdults + takeChildren === 0) {
-    return `All your guests are already placed. Reply *DONE* to confirm or *MENU* to cancel.\n\n${renderAllocationSummary(state.selectedRooms, { childrenAges: state.guests.childrenAges })}`;
+    return `Sorry, *${room.name}* can't take your remaining guests. Please pick another.\n\n${buildManualRoomList(rooms, state.remainingGuests)}`;
   }
 
   const rc       = resolveRoomConfig(room, config);
@@ -1110,9 +1585,9 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
   writeState(vars, updated);
   await persist(deps);
 
-  const summary = renderAllocationSummary(updated.selectedRooms, { childrenAges: updated.guests.childrenAges });
   if (updated.remainingGuests.adults + updated.remainingGuests.children === 0) {
-    return `${summary}\n\nAll guests placed. Reply *DONE* to confirm or *MENU* to cancel.`;
+    return renderManualMode(updated, addableRooms(rooms, updated.selectedRooms));
   }
+  const summary = renderAllocationSummary(updated.selectedRooms, { childrenAges: updated.guests.childrenAges });
   return `${summary}\n\n${buildManualRoomList(rooms, updated.remainingGuests)}`;
 }
