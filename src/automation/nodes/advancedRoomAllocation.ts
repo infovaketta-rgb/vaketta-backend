@@ -94,6 +94,26 @@ function resolveRoomConfig(room: AllocationRoomInput, base: AllocationConfig): A
   };
 }
 
+/**
+ * Single source of truth for per-room pricing. Given a base price, the room's
+ * occupancy, an explicit extra-bed flag and the resolved config, returns the
+ * price breakdown. Extra-bed charge applies only when the room type permits one.
+ * Used by the allocator, the manual room-pick path, and the manual modifiers.
+ */
+function computeRoomPricing(
+  basePrice: number,
+  adults:    number,
+  extraBed:  boolean,
+  nights:    number,
+  cfg:       AllocationConfig,
+): { extraAdultCost: number; extraBedCost: number; pricePerNight: number; totalPrice: number } {
+  const extraAdults    = Math.max(0, adults - cfg.baseAdults);
+  const extraAdultCost = extraAdults * cfg.extraAdultCharge;
+  const extraBedCost   = cfg.allowExtraBed && extraBed ? cfg.extraBedCharge : 0;
+  const pricePerNight  = basePrice + extraAdultCost + extraBedCost;
+  return { extraAdultCost, extraBedCost, pricePerNight, totalPrice: pricePerNight * nights };
+}
+
 // ── Allocation engine (pure) ──────────────────────────────────────────────────
 
 /**
@@ -165,13 +185,9 @@ export function allocateRooms(args: {
 
     if (!chosen) return null; // out of available rooms
 
-    const rc           = resolveRoomConfig(chosen, config);
-    const extraAdults  = Math.max(0, chosenAdults - rc.baseAdults);
-    const extraBed     = chosenAdults > rc.baseAdults;
-    const extraAdultCost = extraAdults * rc.extraAdultCharge;
-    // Extra-bed charge only applies when the room type permits an extra bed.
-    const extraBedCost = rc.allowExtraBed && extraBed ? rc.extraBedCharge : 0;
-    const pricePerNight = chosen.basePrice + extraAdultCost + extraBedCost;
+    const rc       = resolveRoomConfig(chosen, config);
+    const extraBed = chosenAdults > rc.baseAdults;
+    const p        = computeRoomPricing(chosen.basePrice, chosenAdults, extraBed, nights, rc);
 
     allocated.push({
       roomTypeId:    chosen.roomTypeId,
@@ -180,12 +196,12 @@ export function allocateRooms(args: {
       children:      chosenChildren,
       extraBed,
       basePrice:     chosen.basePrice,
-      extraAdultCost,
-      extraBedCost,
+      extraAdultCost: p.extraAdultCost,
+      extraBedCost:   p.extraBedCost,
       childAgeLimit: rc.childAgeLimit,
-      pricePerNight,
+      pricePerNight:  p.pricePerNight,
       nights,
-      totalPrice:    pricePerNight * nights,
+      totalPrice:     p.totalPrice,
     });
 
     remA -= chosenAdults;
@@ -194,6 +210,89 @@ export function allocateRooms(args: {
   }
 
   return allocated;
+}
+
+// ── Manual modification (pure, testable appliers) ─────────────────────────────
+//
+// These apply ONE structured operation (the safe set the AI maps to) to the
+// current selectedRooms and return the updated rooms with prices recomputed via
+// computeRoomPricing. All validation lives here, not in the AI — out-of-range
+// indices and disallowed extra beds are rejected, never thrown.
+
+/** Resolves the effective per-room config for an already-allocated room. */
+export type RoomConfigResolver = (room: AllocationRoom) => AllocationConfig;
+
+export type ApplyResult =
+  | { ok: true;  rooms: AllocationRoom[]; returnedGuests?: { adults: number; children: number } }
+  | { ok: false; outOfRange: boolean; reason: string };
+
+function inRange(rooms: AllocationRoom[], i: number): boolean {
+  return Number.isInteger(i) && i >= 0 && i < rooms.length;
+}
+
+/** Reprice a room with an explicit extra-bed flag using the resolved config. */
+function repriceRoom(room: AllocationRoom, extraBed: boolean, cfg: AllocationConfig): AllocationRoom {
+  const p = computeRoomPricing(room.basePrice, room.adults, extraBed, room.nights, cfg);
+  return {
+    ...room,
+    extraBed,
+    extraAdultCost: p.extraAdultCost,
+    extraBedCost:   p.extraBedCost,
+    pricePerNight:  p.pricePerNight,
+    totalPrice:     p.totalPrice,
+  };
+}
+
+/** Remove the extra bed (no config needed — extra-adult charge is unchanged). */
+function stripExtraBed(room: AllocationRoom): AllocationRoom {
+  const pricePerNight = room.basePrice + room.extraAdultCost; // extraBedCost → 0
+  return { ...room, extraBed: false, extraBedCost: 0, pricePerNight, totalPrice: pricePerNight * room.nights };
+}
+
+export function applyAddExtraBed(
+  rooms: AllocationRoom[], roomIndex: number, resolveCfg: RoomConfigResolver,
+): ApplyResult {
+  if (!inRange(rooms, roomIndex)) return { ok: false, outOfRange: true, reason: "" };
+  const room = rooms[roomIndex]!;
+  const cfg  = resolveCfg(room);
+  if (!cfg.allowExtraBed) {
+    return { ok: false, outOfRange: false, reason: `${room.roomTypeName} rooms don't support an extra bed.` };
+  }
+  return { ok: true, rooms: rooms.map((r, i) => (i === roomIndex ? repriceRoom(room, true, cfg) : r)) };
+}
+
+export function applyRemoveExtraBed(rooms: AllocationRoom[], roomIndex: number): ApplyResult {
+  if (!inRange(rooms, roomIndex)) return { ok: false, outOfRange: true, reason: "" };
+  return { ok: true, rooms: rooms.map((r, i) => (i === roomIndex ? stripExtraBed(r) : r)) };
+}
+
+export function applyMoveExtraBed(
+  rooms: AllocationRoom[], fromIndex: number, toIndex: number, resolveCfg: RoomConfigResolver,
+): ApplyResult {
+  if (!inRange(rooms, fromIndex) || !inRange(rooms, toIndex) || fromIndex === toIndex) {
+    return { ok: false, outOfRange: true, reason: "" };
+  }
+  const toRoom = rooms[toIndex]!;
+  const toCfg  = resolveCfg(toRoom);
+  if (!toCfg.allowExtraBed) {
+    return { ok: false, outOfRange: false, reason: `${toRoom.roomTypeName} rooms don't support an extra bed.` };
+  }
+  const updated = rooms.map((r, i) => {
+    if (i === fromIndex) return stripExtraBed(r);
+    if (i === toIndex)   return repriceRoom(r, true, toCfg);
+    return r;
+  });
+  return { ok: true, rooms: updated };
+}
+
+export function applyRemoveRoom(rooms: AllocationRoom[], roomIndex: number): ApplyResult {
+  if (!inRange(rooms, roomIndex)) return { ok: false, outOfRange: true, reason: "" };
+  const removed = rooms[roomIndex]!;
+  return {
+    ok: true,
+    rooms: rooms.filter((_, i) => i !== roomIndex),
+    returnedGuests: { adults: removed.adults, children: removed.children },
+  };
 }
 
 // ── Formatting ────────────────────────────────────────────────────────────────
@@ -377,7 +476,29 @@ export type AdvancedRoomAllocationDeps = {
   safeMenu:       (hotelId: string) => Promise<string | null>;
   fetchRoomTypes: FetchRoomTypesFn;
   getCalendarData: GetCalendarDataFn;
+  // OPTIONAL — when provided, manual mode uses it as a fallback to interpret
+  // free-text edits that structured parsing can't. Absent → no AI fallback
+  // (manual mode behaves exactly as before).
+  interpretModification?: InterpretModificationFn;
 };
+
+/** Free-text → one structured allocation-edit op. Mirrors ai.service. */
+export type InterpretModificationFn = (
+  currentRooms: Array<{
+    index:        number;
+    roomTypeName: string;
+    adults:       number;
+    children:     number;
+    extraBed:     boolean;
+  }>,
+  guestMessage: string,
+) => Promise<{
+  operation: "add_extra_bed" | "remove_extra_bed" | "move_extra_bed" | "remove_room" | "unknown";
+  roomIndex?:     number;
+  fromRoomIndex?: number;
+  toRoomIndex?:   number;
+  confidence: "high" | "low";
+}>;
 
 // ── Config + flowVar parsing ──────────────────────────────────────────────────
 
@@ -580,6 +701,91 @@ async function finalizeAndAdvance(deps: AdvancedRoomAllocationDeps, allocated: A
   return advance(next);
 }
 
+// ── Manual-mode AI fallback ───────────────────────────────────────────────────
+
+const MODIFY_PROMPT = "Reply *DONE* to confirm, a room number to modify, or *MENU* to cancel.";
+
+/**
+ * Manual-mode fallback for free text that structured parsing couldn't match.
+ * Returns the reply string on a successful edit or a validation rejection, or
+ * `null` to signal "fall back to the structured re-prompt" (no AI dep, AI
+ * unsure/low-confidence, unsupported op, or an out-of-range index).
+ *
+ * The AI only chooses an operation + indices; this function validates the
+ * indices, applies the change deterministically (prices recomputed here, never
+ * by the AI), persists, and re-renders the updated allocation so the guest can
+ * keep editing or cancel. State stays only in flowVars["__araState__"].
+ */
+async function tryAiModification(
+  deps:       AdvancedRoomAllocationDeps,
+  state:      AraState,
+  roomInputs: AllocationRoomInput[],
+  input:      string,
+): Promise<string | null> {
+  if (!deps.interpretModification) return null;
+
+  const currentRooms = state.selectedRooms.map((r, index) => ({
+    index,
+    roomTypeName: r.roomTypeName,
+    adults:       r.adults,
+    children:     r.children,
+    extraBed:     r.extraBed,
+  }));
+
+  const ai = await deps.interpretModification(currentRooms, input);
+  // Never guess: unknown or low-confidence → structured re-prompt.
+  if (ai.operation === "unknown" || ai.confidence === "low") return null;
+
+  // Per-room config resolver from live inventory (DB overrides → node config).
+  const nodeConfig = resolveConfig((deps.node.data ?? {}) as AdvancedRoomAllocationNodeData);
+  const inputById  = new Map(roomInputs.map((ri) => [ri.roomTypeId, ri]));
+  const resolveCfg: RoomConfigResolver = (ar) => {
+    const ri = inputById.get(ar.roomTypeId);
+    return ri ? resolveRoomConfig(ri, nodeConfig) : nodeConfig;
+  };
+
+  let applied: ApplyResult;
+  switch (ai.operation) {
+    case "add_extra_bed":
+      applied = applyAddExtraBed(state.selectedRooms, ai.roomIndex ?? -1, resolveCfg);
+      break;
+    case "remove_extra_bed":
+      applied = applyRemoveExtraBed(state.selectedRooms, ai.roomIndex ?? -1);
+      break;
+    case "move_extra_bed":
+      applied = applyMoveExtraBed(state.selectedRooms, ai.fromRoomIndex ?? -1, ai.toRoomIndex ?? -1, resolveCfg);
+      break;
+    case "remove_room":
+      applied = applyRemoveRoom(state.selectedRooms, ai.roomIndex ?? -1);
+      break;
+    default:
+      return null;
+  }
+
+  if (!applied.ok) {
+    // Out-of-range index behaves like "unknown" → structured re-prompt.
+    if (applied.outOfRange) return null;
+    // Validation rejection (e.g. extra bed not allowed) → reason + unchanged allocation.
+    return `${applied.reason}\n\n${renderAllocationSummary(state.selectedRooms, { childrenAges: state.guests.childrenAges })}\n\n${MODIFY_PROMPT}`;
+  }
+
+  const updated: AraState = {
+    guests:        state.guests,
+    selectedRooms: applied.rooms,
+    remainingGuests: applied.returnedGuests
+      ? {
+          adults:   state.remainingGuests.adults   + applied.returnedGuests.adults,
+          children: state.remainingGuests.children + applied.returnedGuests.children,
+        }
+      : state.remainingGuests,
+    phase: "manual",
+  };
+  writeState(deps.flowData.flowVars, updated);
+  await persist(deps);
+
+  return `${renderAllocationSummary(updated.selectedRooms, { childrenAges: updated.guests.childrenAges })}\n\n${MODIFY_PROMPT}`;
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationDeps): Promise<string | null> {
@@ -669,7 +875,10 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
   // Room pick by number.
   const pick = parseInt(input.trim(), 10);
   if (!Number.isFinite(pick) || pick < 1 || pick > rooms.length) {
-    return `Please reply with a room number (1–${rooms.length}), *DONE* to finish, or *MENU* to cancel.`;
+    // Structured parsing failed → try the AI fallback (no-op when the dep is
+    // absent or the AI is unsure), then fall back to the structured re-prompt.
+    const aiReply = await tryAiModification(deps, state, rooms, input);
+    return aiReply ?? `Please reply with a room number (1–${rooms.length}), *DONE* to finish, or *MENU* to cancel.`;
   }
   const room = rooms[pick - 1]!;
 
@@ -692,12 +901,9 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     return `All your guests are already placed. Reply *DONE* to confirm or *MENU* to cancel.\n\n${renderAllocationSummary(state.selectedRooms, { childrenAges: state.guests.childrenAges })}`;
   }
 
-  const rc           = resolveRoomConfig(room, config);
-  const extraAdults  = Math.max(0, takeAdults - rc.baseAdults);
-  const extraBed     = takeAdults > rc.baseAdults;
-  const extraAdultCost = extraAdults * rc.extraAdultCharge;
-  const extraBedCost = rc.allowExtraBed && extraBed ? rc.extraBedCharge : 0;
-  const pricePerNight = room.basePrice + extraAdultCost + extraBedCost;
+  const rc       = resolveRoomConfig(room, config);
+  const extraBed = takeAdults > rc.baseAdults;
+  const p        = computeRoomPricing(room.basePrice, takeAdults, extraBed, nights, rc);
 
   const newRoom: AllocationRoom = {
     roomTypeId:    room.roomTypeId,
@@ -706,12 +912,12 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     children:      takeChildren,
     extraBed,
     basePrice:     room.basePrice,
-    extraAdultCost,
-    extraBedCost,
+    extraAdultCost: p.extraAdultCost,
+    extraBedCost:   p.extraBedCost,
     childAgeLimit: rc.childAgeLimit,
-    pricePerNight,
+    pricePerNight:  p.pricePerNight,
     nights,
-    totalPrice:    pricePerNight * nights,
+    totalPrice:     p.totalPrice,
   };
 
   const updated: AraState = {

@@ -540,3 +540,129 @@ export async function extractDateWithAI(input: string): Promise<Date | null> {
   const d = new Date(`${match[0]}T00:00:00Z`);
   return isNaN(d.getTime()) ? null : d;
 }
+
+// ── Allocation modification interpreter (internal utility) ───────────────────
+
+export type AllocationModificationResult = {
+  operation: "add_extra_bed" | "remove_extra_bed" | "move_extra_bed" | "remove_room" | "unknown";
+  roomIndex?:     number;
+  fromRoomIndex?: number;
+  toRoomIndex?:   number;
+  confidence: "high" | "low";
+};
+
+const ALLOC_OPS = new Set([
+  "add_extra_bed", "remove_extra_bed", "move_extra_bed", "remove_room", "unknown",
+]);
+
+/**
+ * Map a guest's free-text request to EXACTLY ONE structured allocation-edit
+ * operation. The model returns only an operation name + room index(es) — never
+ * prices, never invented rooms; all pricing and validation is done
+ * deterministically by the caller, so even a prompt-injection attempt ("set
+ * price to 0") can at most yield one of the fixed enum operations.
+ *
+ * Same cheap/safe shape as classifyBookingIntent: temperature 0, tiny
+ * max_tokens, 3 s timeout, never throws. On any error/timeout/parse failure →
+ * { operation: "unknown", confidence: "low" } (caller falls back to its
+ * structured re-prompt).
+ */
+export async function interpretAllocationModification(
+  currentRooms: Array<{
+    index:        number;
+    roomTypeName: string;
+    adults:       number;
+    children:     number;
+    extraBed:     boolean;
+  }>,
+  guestMessage: string,
+): Promise<AllocationModificationResult> {
+  const FALLBACK: AllocationModificationResult = { operation: "unknown", confidence: "low" };
+
+  const system =
+    `You map a hotel guest's free-text request to EXACTLY ONE structured operation ` +
+    `for editing their current multi-room allocation. Reply with ONLY a JSON object — ` +
+    `no prose, no markdown fences.\n` +
+    `Operations and params:\n` +
+    `- "add_extra_bed": { "roomIndex": number }\n` +
+    `- "remove_extra_bed": { "roomIndex": number }\n` +
+    `- "move_extra_bed": { "fromRoomIndex": number, "toRoomIndex": number }\n` +
+    `- "remove_room": { "roomIndex": number }\n` +
+    `- "unknown": {}\n` +
+    `Rules:\n` +
+    `- Indices are 0-based and MUST refer to a room in the provided allocation.\n` +
+    `- Resolve room references by roomTypeName (e.g. "deluxe" → that room's index).\n` +
+    `- Return "unknown" for anything else: changing dates or guest counts, adding rooms, ` +
+    `swapping/changing room types, or ANY request about price/money.\n` +
+    `- NEVER output prices, totals or money. NEVER invent rooms that are not listed.\n` +
+    `- "confidence" is "high" only when the operation and room(s) are unambiguous; else "low".\n` +
+    `Output: {"operation":"...","roomIndex"?:n,"fromRoomIndex"?:n,"toRoomIndex"?:n,"confidence":"high"|"low"}`;
+
+  const user =
+    `Current allocation:\n` +
+    currentRooms
+      .map((r) => `[${r.index}] ${r.roomTypeName} — ${r.adults} adults, ${r.children} children, extraBed=${r.extraBed}`)
+      .join("\n") +
+    `\n\nGuest message: "${guestMessage}"`;
+
+  const provider = activeProvider();
+  const timeout  = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000));
+
+  let raw: string | null = null;
+
+  try {
+    if (provider === "openai") {
+      const client = getOpenAIClient();
+      if (!client) return FALLBACK;
+      const call = client.chat.completions.create({
+        model:       OPENAI_MODEL,
+        max_tokens:  60,
+        temperature: 0,
+        messages:    [{ role: "system", content: system }, { role: "user", content: user }],
+      }).then((r) => r.choices[0]?.message?.content?.trim() ?? null);
+      raw = await Promise.race([call, timeout]);
+    } else {
+      const client = getAnthropicClient();
+      if (!client) return FALLBACK;
+      const call = client.messages.create({
+        model:      ANTHROPIC_MODEL,
+        max_tokens: 60,
+        system,
+        messages:   [{ role: "user", content: user }],
+      }).then((r) => (r.content[0]?.type === "text" ? r.content[0].text.trim() : null));
+      raw = await Promise.race([call, timeout]);
+    }
+  } catch (err) {
+    log.warn({ err }, "interpretAllocationModification: API call failed");
+    return FALLBACK;
+  }
+
+  if (!raw) return FALLBACK;
+
+  // Pull the first JSON object even if the model adds surrounding text/fences.
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) return FALLBACK;
+
+  try {
+    const parsed = JSON.parse(match[0]) as Record<string, unknown>;
+    const operation = parsed.operation;
+    if (typeof operation !== "string" || !ALLOC_OPS.has(operation)) return FALLBACK;
+
+    const idx = (v: unknown): number | undefined =>
+      typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : undefined;
+
+    const result: AllocationModificationResult = {
+      operation:  operation as AllocationModificationResult["operation"],
+      confidence: parsed.confidence === "high" ? "high" : "low",
+    };
+    const ri = idx(parsed.roomIndex);
+    const fi = idx(parsed.fromRoomIndex);
+    const ti = idx(parsed.toRoomIndex);
+    if (ri !== undefined) result.roomIndex     = ri;
+    if (fi !== undefined) result.fromRoomIndex = fi;
+    if (ti !== undefined) result.toRoomIndex   = ti;
+    return result;
+  } catch {
+    return FALLBACK;
+  }
+}

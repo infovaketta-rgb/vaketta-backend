@@ -12,6 +12,10 @@ import {
   renderAllocationSummary,
   parseChildrenAges,
   handleAdvancedRoomAllocation,
+  applyAddExtraBed,
+  applyRemoveExtraBed,
+  applyMoveExtraBed,
+  applyRemoveRoom,
   type AdvancedRoomAllocationDeps,
   type AllocationConfig,
   type AllocationRoom,
@@ -20,6 +24,7 @@ import {
   type Adjacency,
   type FetchRoomTypesFn,
   type GetCalendarDataFn,
+  type RoomConfigResolver,
 } from "./advancedRoomAllocation";
 import type { SerializedFlowNode } from "../flowTypes";
 import type { SessionData } from "../../services/session.service";
@@ -535,5 +540,196 @@ describe("guest count variables", () => {
     expect(state.guests.adults).toBe(3);
     expect(state.guests.children).toBe(0);
     expect(state.guests.childrenAges).toBeUndefined();
+  });
+});
+
+// ── AI-assisted manual modification ───────────────────────────────────────────
+describe("AI-assisted modification", () => {
+  function aRoom(over: Partial<AllocationRoom> = {}): AllocationRoom {
+    return {
+      roomTypeId: "rt_a", roomTypeName: "Standard",
+      adults: 2, children: 0, extraBed: false,
+      basePrice: 6000, extraAdultCost: 0, extraBedCost: 0, childAgeLimit: null,
+      pricePerNight: 6000, nights: 2, totalPrice: 12000,
+      ...over,
+    };
+  }
+  const allowCfg: RoomConfigResolver = () => ({ ...baseConfig, allowExtraBed: true, extraBedCharge: 500 });
+  const denyCfg:  RoomConfigResolver = () => ({ ...baseConfig, allowExtraBed: false, extraBedCharge: 500 });
+
+  function manualState(selectedRooms: AllocationRoom[], remaining = { adults: 0, children: 0 }): AraState {
+    return { guests: { adults: 4, children: 0 }, selectedRooms, remainingGuests: remaining, phase: "manual" };
+  }
+
+  // 1. add extra bed — price up by charge × nights; rejected when not allowed.
+  it("Case A1: applyAddExtraBed adds a bed and reprices; rejects when disallowed", () => {
+    const res = applyAddExtraBed([aRoom({})], 0, allowCfg);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.rooms[0]!.extraBed).toBe(true);
+      expect(res.rooms[0]!.extraBedCost).toBe(500);
+      expect(res.rooms[0]!.totalPrice).toBe(12000 + 500 * 2); // +charge × nights
+    }
+    const rej = applyAddExtraBed([aRoom({})], 0, denyCfg);
+    expect(rej.ok).toBe(false);
+    if (!rej.ok) {
+      expect(rej.outOfRange).toBe(false);
+      expect(rej.reason).toContain("don't support an extra bed");
+    }
+  });
+
+  // 2. remove extra bed — price drops by the bed charge.
+  it("Case A2: applyRemoveExtraBed removes a bed and reprices", () => {
+    const rooms = [aRoom({ extraBed: true, extraBedCost: 500, pricePerNight: 6500, totalPrice: 13000 })];
+    const res = applyRemoveExtraBed(rooms, 0);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.rooms[0]!.extraBed).toBe(false);
+      expect(res.rooms[0]!.extraBedCost).toBe(0);
+      expect(res.rooms[0]!.totalPrice).toBe(12000); // dropped by 500 × 2
+    }
+  });
+
+  // 3. move extra bed — both rooms repriced; rejected if target disallows.
+  it("Case A3: applyMoveExtraBed moves the bed and reprices both; rejects on disallowed target", () => {
+    const rooms = [
+      aRoom({ roomTypeId: "rt_a", roomTypeName: "Standard", extraBed: true,  extraBedCost: 500, pricePerNight: 6500, totalPrice: 13000, basePrice: 6000 }),
+      aRoom({ roomTypeId: "rt_b", roomTypeName: "Deluxe",   extraBed: false, extraBedCost: 0,   pricePerNight: 8000, totalPrice: 16000, basePrice: 8000 }),
+    ];
+    const res = applyMoveExtraBed(rooms, 0, 1, allowCfg);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.rooms[0]!.extraBed).toBe(false);
+      expect(res.rooms[0]!.totalPrice).toBe(12000);
+      expect(res.rooms[1]!.extraBed).toBe(true);
+      expect(res.rooms[1]!.extraBedCost).toBe(500);
+      expect(res.rooms[1]!.totalPrice).toBe(8000 * 2 + 500 * 2); // 17000
+    }
+    const rej = applyMoveExtraBed(rooms, 0, 1, denyCfg);
+    expect(rej.ok).toBe(false);
+    if (!rej.ok) {
+      expect(rej.outOfRange).toBe(false);
+      expect(rej.reason).toContain("Deluxe");
+    }
+  });
+
+  // 4. remove room — grand total recomputed, guests returned.
+  it("Case A4: applyRemoveRoom drops the room and returns its guests", () => {
+    const rooms = [
+      aRoom({ roomTypeId: "rt_a", adults: 2, children: 1, totalPrice: 12000 }),
+      aRoom({ roomTypeId: "rt_b", roomTypeName: "Deluxe", adults: 1, children: 0, totalPrice: 16000 }),
+    ];
+    const res = applyRemoveRoom(rooms, 0);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.rooms).toHaveLength(1);
+      expect(res.rooms[0]!.roomTypeId).toBe("rt_b");
+      expect(res.returnedGuests).toEqual({ adults: 2, children: 1 });
+      expect(res.rooms.reduce((s, r) => s + r.totalPrice, 0)).toBe(16000); // grand total
+    }
+  });
+
+  // 5. Out-of-range index → treated as unknown → structured re-prompt, no mutation.
+  it("Case A5: out-of-range index falls back to the structured re-prompt", async () => {
+    expect(applyAddExtraBed([aRoom({})], 9, allowCfg)).toMatchObject({ ok: false, outOfRange: true });
+
+    const state = manualState([aRoom({ roomTypeId: "rt_a" })]);
+    const deps = makeDeps({
+      waitingFor: "answer",
+      nodeData: { allowExtraBed: true, extraBedCharge: 500 },
+      flowVars: { __araState__: JSON.stringify(state) },
+      rooms: [room({ roomTypeId: "rt_a", name: "Standard", basePrice: 6000, availableCount: 5 })],
+      input: "add a bed to room 10",
+      interpretModification: vi.fn(async () => ({ operation: "add_extra_bed" as const, roomIndex: 9, confidence: "high" as const })),
+    });
+    const before = deps.flowData.flowVars["__araState__"];
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(result).toMatch(/room number/i);
+    expect(deps.flowData.flowVars["__araState__"]).toBe(before); // unchanged
+  });
+
+  // 6. move_extra_bed high confidence → applied + summary re-rendered.
+  it("Case A6: high-confidence move is applied and the summary re-rendered", async () => {
+    const state = manualState([
+      aRoom({ roomTypeId: "rt_a", roomTypeName: "Standard", extraBed: true,  extraBedCost: 500, pricePerNight: 6500, totalPrice: 13000, basePrice: 6000 }),
+      aRoom({ roomTypeId: "rt_b", roomTypeName: "Deluxe",   extraBed: false, extraBedCost: 0,   pricePerNight: 8000, totalPrice: 16000, basePrice: 8000 }),
+    ]);
+    const interp = vi.fn(async () => ({ operation: "move_extra_bed" as const, fromRoomIndex: 0, toRoomIndex: 1, confidence: "high" as const }));
+    const deps = makeDeps({
+      waitingFor: "answer",
+      nodeData: { allowExtraBed: true, extraBedCharge: 500 },
+      flowVars: { __araState__: JSON.stringify(state) },
+      rooms: [
+        room({ roomTypeId: "rt_a", name: "Standard", basePrice: 6000, availableCount: 5 }),
+        room({ roomTypeId: "rt_b", name: "Deluxe",   basePrice: 8000, availableCount: 5 }),
+      ],
+      input: "move the extra bed to the deluxe",
+      interpretModification: interp,
+    });
+    const result = await handleAdvancedRoomAllocation(deps);
+
+    expect(interp).toHaveBeenCalledTimes(1);
+    expect(result).toContain("Extra bed included");
+    expect(result).toMatch(/Reply \*DONE\* to confirm/);
+
+    const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(after.selectedRooms[0]!.extraBed).toBe(false);
+    expect(after.selectedRooms[1]!.extraBed).toBe(true);
+    expect(after.selectedRooms[1]!.totalPrice).toBe(17000);
+  });
+
+  // 7. unknown → structured re-prompt, araState unchanged.
+  it("Case A7: 'unknown' returns the structured re-prompt and does not mutate", async () => {
+    const state = manualState([aRoom({ roomTypeId: "rt_a" })]);
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(state) },
+      rooms: [room({ roomTypeId: "rt_a", name: "Standard", basePrice: 6000, availableCount: 5 })],
+      input: "what's the weather like",
+      interpretModification: vi.fn(async () => ({ operation: "unknown" as const, confidence: "high" as const })),
+    });
+    const before = deps.flowData.flowVars["__araState__"];
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(result).toMatch(/room number/i);
+    expect(deps.flowData.flowVars["__araState__"]).toBe(before);
+  });
+
+  // 8. low confidence → structured re-prompt, no mutation.
+  it("Case A8: low confidence never mutates — structured re-prompt", async () => {
+    const state = manualState([
+      aRoom({ roomTypeId: "rt_a", extraBed: true }),
+      aRoom({ roomTypeId: "rt_b", roomTypeName: "Deluxe" }),
+    ]);
+    const deps = makeDeps({
+      waitingFor: "answer",
+      nodeData: { allowExtraBed: true, extraBedCharge: 500 },
+      flowVars: { __araState__: JSON.stringify(state) },
+      rooms: [
+        room({ roomTypeId: "rt_a", name: "Standard", basePrice: 6000, availableCount: 5 }),
+        room({ roomTypeId: "rt_b", name: "Deluxe",   basePrice: 8000, availableCount: 5 }),
+      ],
+      input: "maybe move the bed somewhere",
+      interpretModification: vi.fn(async () => ({ operation: "move_extra_bed" as const, fromRoomIndex: 0, toRoomIndex: 1, confidence: "low" as const })),
+    });
+    const before = deps.flowData.flowVars["__araState__"];
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(result).toMatch(/room number/i);
+    expect(deps.flowData.flowVars["__araState__"]).toBe(before);
+  });
+
+  // 9. No interpreter dep → manual mode behaves exactly as before (back-compat).
+  it("Case A9: without the interpreter dep, free text gets the structured re-prompt", async () => {
+    const state = manualState([aRoom({ roomTypeId: "rt_a" })]);
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(state) },
+      rooms: [room({ roomTypeId: "rt_a", name: "Standard", basePrice: 6000, availableCount: 5 })],
+      input: "move the extra bed to deluxe",
+      // no interpretModification dep
+    });
+    const before = deps.flowData.flowVars["__araState__"];
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(result).toMatch(/room number/i);
+    expect(deps.flowData.flowVars["__araState__"]).toBe(before);
   });
 });

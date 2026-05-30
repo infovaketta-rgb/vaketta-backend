@@ -46,7 +46,7 @@ import { sendCarouselMessage, sendMediaMessage, sendListMessage, type CarouselCa
 import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
-import { extractDateWithAI, classifyBookingIntent } from "../services/ai.service";
+import { extractDateWithAI, classifyBookingIntent, interpretAllocationModification } from "../services/ai.service";
 import { handleAdvancedRoomAllocation } from "./nodes/advancedRoomAllocation";
 import { aggregateRoomQuantities } from "./bookingAllocation";
 import { randomUUID } from "crypto";
@@ -1159,6 +1159,7 @@ export async function executeFlowStep(
           safeMenu,
           fetchRoomTypes,
           getCalendarData,
+          interpretModification: interpretAllocationModification,
         });
       }
 
