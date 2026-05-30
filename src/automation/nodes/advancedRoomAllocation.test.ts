@@ -16,6 +16,7 @@ import {
   applyRemoveExtraBed,
   applyMoveExtraBed,
   applyRemoveRoom,
+  applyMoveGuest,
   type AdvancedRoomAllocationDeps,
   type AllocationConfig,
   type AllocationRoom,
@@ -151,24 +152,24 @@ describe("allocateRooms — pure algorithm", () => {
     });
   });
 
-  // ── 2. 4 adults, allowExtraBed=true — extra bed applied in single room ─────
-  it("Case 2: 4 adults, maxAdults=3 allowExtraBed=true — extra bed applied", () => {
+  // ── 2. 4 adults — base-first divides evenly into two base rooms, no beds ────
+  // strategy change: was 1 room of 4 (crammed, extra bed), now 2 rooms of 2 (base, no beds)
+  it("Case 2: 4 adults, base 2 — two base rooms, no extra beds", () => {
     const result = allocateRooms({
       adults: 4, children: 0,
-      rooms: [room({ roomTypeId: "rt_dlx", name: "Deluxe", basePrice: 8000, maxAdults: 5, maxChildren: 2 })],
+      rooms: [room({ roomTypeId: "rt_dlx", name: "Deluxe", basePrice: 8000, maxAdults: 5, maxChildren: 2, availableCount: 5 })],
       config: { ...baseConfig, allowExtraBed: true, extraAdultCharge: 500 },
       nights: 2,
     });
-    expect(result).toHaveLength(1);
-    expect(result![0]!.adults).toBe(4);
-    expect(result![0]!.extraBed).toBe(true);
-    // extraAdults = 4 - 2 (baseAdults) = 2 → pricePerNight = 8000 + 2 * 500 = 9000
-    expect(result![0]!.pricePerNight).toBe(9000);
-    expect(result![0]!.totalPrice).toBe(18000);
+    expect(result).toHaveLength(2);
+    expect(result!.map((r) => r.adults)).toEqual([2, 2]);
+    expect(result!.every((r) => !r.extraBed)).toBe(true);
+    expect(result!.every((r) => r.pricePerNight === 8000)).toBe(true); // base only
   });
 
-  // ── 3. 4 adults, allowExtraBed=false — falls back to a second room ──────────
-  it("Case 3: 4 adults, maxAdults=3 allowExtraBed=false — second room allocated", () => {
+  // ── 3. 4 adults — base-first two rooms of 2, regardless of allowExtraBed ────
+  // strategy change: was [3a+bed, 1a] (cram one, spill one), now [2a, 2a] (base, no beds)
+  it("Case 3: 4 adults, allowExtraBed=false — two base rooms, no beds", () => {
     const result = allocateRooms({
       adults: 4, children: 0,
       rooms: [room({ roomTypeId: "rt_std", name: "Standard", basePrice: 6000, maxAdults: 5, maxChildren: 2, availableCount: 5 })],
@@ -176,10 +177,8 @@ describe("allocateRooms — pure algorithm", () => {
       nights: 1,
     });
     expect(result).toHaveLength(2);
-    expect(result![0]!.adults).toBe(3); // effective cap = 3
-    expect(result![1]!.adults).toBe(1);
-    expect(result![0]!.extraBed).toBe(true);  // 3 > baseAdults(2)
-    expect(result![1]!.extraBed).toBe(false); // 1 not > 2
+    expect(result!.map((r) => r.adults)).toEqual([2, 2]);
+    expect(result!.every((r) => !r.extraBed)).toBe(true);
   });
 
   // ── 7. Multi-room — bookingRooms JSON valid, totalPrice sum ────────────────
@@ -203,8 +202,10 @@ describe("allocateRooms — pure algorithm", () => {
     expect(result.reduce((s, r) => s + r.children, 0)).toBe(2);
   });
 
-  // ── 9. Availability constraint — fall back to alternative room type ────────
-  it("Case 9: respects availableCount, falls back to alt room type", () => {
+  // ── 9. Cheapest type carries the group when it has the availability ────────
+  // strategy change: was deluxe×2 + standard (largest-capacity-first), now the
+  // cheaper Standard (avail 5 ≥ 4 rooms needed) carries everyone; Deluxe unused.
+  it("Case 9: fills the cheapest type first when it has the availability", () => {
     const result = allocateRooms({
       adults: 9, children: 0,
       rooms: [
@@ -214,11 +215,10 @@ describe("allocateRooms — pure algorithm", () => {
       config: { ...baseConfig, allowExtraBed: false, maxAdults: 4 },
       nights: 1,
     })!;
-    const deluxeCount = result.filter((r) => r.roomTypeId === "rt_dlx").length;
-    expect(deluxeCount).toBe(2); // capped by availableCount=2
-    // Remaining 1 adult goes into a Standard
-    const standardCount = result.filter((r) => r.roomTypeId === "rt_std").length;
-    expect(standardCount).toBeGreaterThanOrEqual(1);
+    // base 2 / max 4, 9 adults → base-first [3,2,2,2] = 4 rooms, all on the cheaper Standard.
+    expect(result.filter((r) => r.roomTypeId === "rt_dlx").length).toBe(0);
+    expect(result.filter((r) => r.roomTypeId === "rt_std").length).toBe(4);
+    expect(result.map((r) => r.adults)).toEqual([3, 2, 2, 2]);
     expect(result.reduce((s, r) => s + r.adults, 0)).toBe(9);
   });
 });
@@ -430,8 +430,10 @@ describe("pricing formula", () => {
       config: { ...baseConfig, baseAdults: 2, allowExtraBed: false, extraBedCharge: 500, extraAdultCharge: 1000 },
       nights: 2,
     })!;
-    expect(result[0]!.extraBed).toBe(true);  // 3 > baseAdults(2)
-    expect(result[0]!.extraBedCost).toBe(0); // but charge not applied
+    // invariant change: extraBed now requires allowExtraBed → false when disallowed
+    // (was true under the old "adults > baseAdults" flag); charge still not applied.
+    expect(result[0]!.extraBed).toBe(false);
+    expect(result[0]!.extraBedCost).toBe(0); // charge not applied
     expect(result[0]!.pricePerNight).toBe(6000 + 1000); // only the extra-adult charge
     expect(result[0]!.totalPrice).toBe((6000 + 1000) * 2);
   });
@@ -731,5 +733,357 @@ describe("AI-assisted modification", () => {
     const result = await handleAdvancedRoomAllocation(deps);
     expect(result).toMatch(/room number/i);
     expect(deps.flowData.flowVars["__araState__"]).toBe(before);
+  });
+});
+
+// ── move_guest + modify UX ────────────────────────────────────────────────────
+describe("move_guest and modify UX", () => {
+  function gRoom(over: Partial<AllocationRoom> = {}): AllocationRoom {
+    return {
+      roomTypeId: "rt_a", roomTypeName: "Standard",
+      adults: 2, children: 0, extraBed: false,
+      basePrice: 6000, extraAdultCost: 0, extraBedCost: 0, childAgeLimit: null,
+      pricePerNight: 6000, nights: 2, totalPrice: 12000,
+      ...over,
+    };
+  }
+  // Per-room config resolver keyed by roomTypeId (defaults to baseConfig).
+  const cfgFor = (map: Record<string, Partial<AllocationConfig>>): RoomConfigResolver =>
+    (r) => ({ ...baseConfig, ...(map[r.roomTypeId] ?? {}) });
+
+  function stateOf(phase: "confirm" | "manual", selectedRooms: AllocationRoom[]): AraState {
+    return { guests: { adults: 5, children: 0 }, selectedRooms, remainingGuests: { adults: 0, children: 0 }, phase };
+  }
+
+  // 1. Basic move — both rooms re-priced, counts correct, grand total recomputed.
+  it("Case MG1: moves a guest, reprices both rooms and the grand total", () => {
+    const resolver = cfgFor({ rt_a: { extraAdultCharge: 1000, maxAdults: 4 }, rt_b: { extraAdultCharge: 1000, maxAdults: 4 } });
+    const rooms = [
+      gRoom({ roomTypeId: "rt_a", adults: 3, extraAdultCost: 1000, pricePerNight: 7000, totalPrice: 14000 }),
+      gRoom({ roomTypeId: "rt_b", roomTypeName: "Deluxe", adults: 2, pricePerNight: 6000, totalPrice: 12000 }),
+    ];
+    const res = applyMoveGuest(rooms, 0, 1, 1, 0, resolver);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.rooms[0]!.adults).toBe(2);
+      expect(res.rooms[1]!.adults).toBe(3);
+      expect(res.rooms[0]!.pricePerNight).toBe(6000); // 2 adults → no extra
+      expect(res.rooms[1]!.pricePerNight).toBe(7000); // 3 adults → +1000
+      expect(res.rooms.reduce((s, r) => s + r.totalPrice, 0)).toBe(6000 * 2 + 7000 * 2);
+    }
+  });
+
+  // 2. Destination cap exceeded → reason, no mutation.
+  it("Case MG2: exceeding destination maxAdults is rejected with a reason", () => {
+    const rooms = [gRoom({ roomTypeId: "rt_a", adults: 2 }), gRoom({ roomTypeId: "rt_b", roomTypeName: "Deluxe", adults: 3 })];
+    const res = applyMoveGuest(rooms, 0, 1, 1, 0, cfgFor({ rt_b: { maxAdults: 3 } }));
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.outOfRange).toBe(false);
+      expect(res.reason).toContain("at most 3 adults");
+    }
+  });
+
+  // 3. Emptying the source → source room removed.
+  it("Case MG3: emptying the source room drops it from the allocation", () => {
+    const rooms = [gRoom({ roomTypeId: "rt_a", adults: 1 }), gRoom({ roomTypeId: "rt_b", roomTypeName: "Deluxe", adults: 2 })];
+    const res = applyMoveGuest(rooms, 0, 1, 1, 0, cfgFor({ rt_b: { maxAdults: 5 } }));
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.rooms).toHaveLength(1);
+      expect(res.rooms[0]!.roomTypeId).toBe("rt_b");
+      expect(res.rooms[0]!.adults).toBe(3);
+    }
+  });
+
+  // 4. Source lacks the guests → reason, no mutation.
+  it("Case MG4: moving more guests than the source has is rejected", () => {
+    const rooms = [gRoom({ roomTypeId: "rt_a", adults: 1 }), gRoom({ roomTypeId: "rt_b", roomTypeName: "Deluxe", adults: 2 })];
+    const res = applyMoveGuest(rooms, 0, 1, 2, 0, cfgFor({ rt_b: { maxAdults: 5 } }));
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.outOfRange).toBe(false);
+      expect(res.reason).toContain("only has 1 adult");
+    }
+  });
+
+  // 5. Out-of-range / same-room index → outOfRange; nothing-to-move → reason.
+  it("Case MG5: out-of-range or same-room indices are outOfRange", () => {
+    const rooms = [gRoom({ roomTypeId: "rt_a" }), gRoom({ roomTypeId: "rt_b" })];
+    const any = cfgFor({});
+    expect(applyMoveGuest(rooms, 0, 9, 1, 0, any)).toMatchObject({ ok: false, outOfRange: true });
+    expect(applyMoveGuest(rooms, 1, 1, 1, 0, any)).toMatchObject({ ok: false, outOfRange: true });
+    expect(applyMoveGuest(rooms, 0, 1, 0, 0, any)).toMatchObject({ ok: false, outOfRange: false }); // nothing to move
+  });
+
+  // Bed-out: moving an adult out below baseAdults auto-removes the extra bed.
+  it("Case MG-bed-out: moving an adult out drops the extra bed + both charges", () => {
+    const resolver = cfgFor({
+      rt_src: { baseAdults: 2, allowExtraBed: true, extraBedCharge: 500, extraAdultCharge: 1000, maxAdults: 4 },
+      rt_dst: { baseAdults: 2, allowExtraBed: false, extraAdultCharge: 1000, maxAdults: 5 },
+    });
+    const rooms = [
+      gRoom({ roomTypeId: "rt_src", roomTypeName: "Suite", adults: 3, extraBed: true, extraAdultCost: 1000, extraBedCost: 500, pricePerNight: 7500, totalPrice: 15000, basePrice: 6000 }),
+      gRoom({ roomTypeId: "rt_dst", roomTypeName: "Deluxe", adults: 2, basePrice: 8000, pricePerNight: 8000, totalPrice: 16000 }),
+    ];
+    const res = applyMoveGuest(rooms, 0, 1, 1, 0, resolver);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      const src = res.rooms[0]!;
+      expect(src.adults).toBe(2);
+      expect(src.extraBed).toBe(false);
+      expect(src.extraBedCost).toBe(0);
+      expect(src.extraAdultCost).toBe(0);
+      expect(src.pricePerNight).toBe(6000); // drops by 1000 (adult) + 500 (bed)
+      const dst = res.rooms[1]!;
+      expect(dst.adults).toBe(3);
+      expect(dst.extraBed).toBe(false);            // dst disallows beds
+      expect(dst.pricePerNight).toBe(8000 + 1000); // only extra-adult charge
+    }
+  });
+
+  // Bed-in (allowed): moving an adult in above baseAdults auto-adds the bed.
+  it("Case MG-bed-in-allowed: moving an adult in adds a bed when allowed", () => {
+    const resolver = cfgFor({
+      rt_src: { maxAdults: 5, extraAdultCharge: 1000 },
+      rt_dst: { baseAdults: 2, allowExtraBed: true, extraBedCharge: 500, extraAdultCharge: 1000, maxAdults: 4 },
+    });
+    const rooms = [
+      gRoom({ roomTypeId: "rt_src", adults: 3, basePrice: 6000 }),
+      gRoom({ roomTypeId: "rt_dst", roomTypeName: "Deluxe", adults: 2, basePrice: 8000, pricePerNight: 8000, totalPrice: 16000 }),
+    ];
+    const res = applyMoveGuest(rooms, 0, 1, 1, 0, resolver);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      const dst = res.rooms[1]!;
+      expect(dst.adults).toBe(3);
+      expect(dst.extraBed).toBe(true);
+      expect(dst.extraAdultCost).toBe(1000);
+      expect(dst.extraBedCost).toBe(500);
+      expect(dst.pricePerNight).toBe(8000 + 1000 + 500);
+    }
+  });
+
+  // Bed-in (not allowed): adults rise up to maxAdults with no bed, charge only.
+  it("Case MG-bed-in-noallow: moving an adult in adds no bed when disallowed", () => {
+    const resolver = cfgFor({
+      rt_src: { maxAdults: 5, extraAdultCharge: 1000 },
+      rt_dst: { baseAdults: 2, allowExtraBed: false, extraBedCharge: 500, extraAdultCharge: 1000, maxAdults: 4 },
+    });
+    const rooms = [
+      gRoom({ roomTypeId: "rt_src", adults: 3, basePrice: 6000 }),
+      gRoom({ roomTypeId: "rt_dst", roomTypeName: "Deluxe", adults: 2, basePrice: 8000, pricePerNight: 8000, totalPrice: 16000 }),
+    ];
+    const res = applyMoveGuest(rooms, 0, 1, 1, 0, resolver);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      const dst = res.rooms[1]!;
+      expect(dst.adults).toBe(3);
+      expect(dst.extraBed).toBe(false);
+      expect(dst.extraBedCost).toBe(0);
+      expect(dst.pricePerNight).toBe(8000 + 1000); // extra-adult charge only
+    }
+  });
+
+  // 6. Confirm phase + high-confidence move_guest → applied, phase stays confirm.
+  it("Case MG6: confirm-phase modification applies and stays in confirm phase", async () => {
+    const state = stateOf("confirm", [
+      gRoom({ roomTypeId: "rt_a", roomTypeName: "Standard", adults: 3, extraAdultCost: 1000, pricePerNight: 7000, totalPrice: 14000 }),
+      gRoom({ roomTypeId: "rt_b", roomTypeName: "Deluxe", adults: 2, basePrice: 8000, pricePerNight: 8000, totalPrice: 16000 }),
+    ]);
+    const interp = vi.fn(async () => ({ operation: "move_guest" as const, fromRoomIndex: 0, toRoomIndex: 1, adults: 1, children: 0, confidence: "high" as const }));
+    const deps = makeDeps({
+      waitingFor: "answer",
+      nodeData: { maxAdults: 4, extraAdultCharge: 1000 },
+      flowVars: { __araState__: JSON.stringify(state) },
+      rooms: [
+        room({ roomTypeId: "rt_a", name: "Standard", basePrice: 6000, maxAdults: 4, availableCount: 5 }),
+        room({ roomTypeId: "rt_b", name: "Deluxe",   basePrice: 8000, maxAdults: 4, availableCount: 5 }),
+      ],
+      input: "move one adult from room 1 to room 2",
+      interpretModification: interp,
+    });
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(interp).toHaveBeenCalledTimes(1);
+    expect(result).toContain("Suggested Allocation");
+    expect(result).toContain("Reply *1* to Confirm"); // confirm footer → still confirm phase
+    const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(after.phase).toBe("confirm");
+    expect(after.selectedRooms[0]!.adults).toBe(2);
+    expect(after.selectedRooms[1]!.adults).toBe(3);
+  });
+
+  // 7. Confirm phase + unknown → acknowledgement + confirm re-prompt, unchanged.
+  it("Case MG7: confirm-phase unknown acknowledges and keeps the confirm prompt", async () => {
+    const state = stateOf("confirm", [gRoom({ roomTypeId: "rt_a" }), gRoom({ roomTypeId: "rt_b", roomTypeName: "Deluxe" })]);
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(state) },
+      rooms: [
+        room({ roomTypeId: "rt_a", name: "Standard", basePrice: 6000, availableCount: 5 }),
+        room({ roomTypeId: "rt_b", name: "Deluxe",   basePrice: 8000, availableCount: 5 }),
+      ],
+      input: "do you have a swimming pool",
+      interpretModification: vi.fn(async () => ({ operation: "unknown" as const, confidence: "high" as const })),
+    });
+    const before = deps.flowData.flowVars["__araState__"];
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(result).toContain("I couldn't make that change automatically");
+    expect(result).toMatch(/reply \*1\* to confirm/i);
+    expect(deps.flowData.flowVars["__araState__"]).toBe(before);
+  });
+
+  // 8. Manual phase + unknown → acknowledgement + manual re-prompt, unchanged.
+  it("Case MG8: manual-phase unknown acknowledges and keeps the manual prompt", async () => {
+    const state = stateOf("manual", [gRoom({ roomTypeId: "rt_a" })]);
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(state) },
+      rooms: [room({ roomTypeId: "rt_a", name: "Standard", basePrice: 6000, availableCount: 5 })],
+      input: "tell me a joke",
+      interpretModification: vi.fn(async () => ({ operation: "unknown" as const, confidence: "high" as const })),
+    });
+    const before = deps.flowData.flowVars["__araState__"];
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(result).toContain("I couldn't make that change automatically");
+    expect(result).toMatch(/room number/i);
+    expect(deps.flowData.flowVars["__araState__"]).toBe(before);
+  });
+
+  // 9. Back-compat: confirm phase with no interpreter dep — "1" confirms, "2" → manual.
+  it("Case MG9: confirm phase without the dep still confirms on '1' and modifies on '2'", async () => {
+    const sel = [gRoom({ roomTypeId: "rt_a" }), gRoom({ roomTypeId: "rt_b", roomTypeName: "Deluxe" })];
+
+    const deps1 = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(stateOf("confirm", sel)) },
+      rooms: [room({ roomTypeId: "rt_a", name: "Standard", basePrice: 6000, availableCount: 5 })],
+      input: "1",
+    });
+    await handleAdvancedRoomAllocation(deps1);
+    expect(deps1.flowData.flowVars["bookingRooms"]).toBeTruthy();
+    expect(deps1.advance).toHaveBeenCalled();
+
+    const deps2 = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(stateOf("confirm", sel)) },
+      rooms: [room({ roomTypeId: "rt_a", name: "Standard", basePrice: 6000, availableCount: 5 })],
+      input: "2",
+    });
+    await handleAdvancedRoomAllocation(deps2);
+    const after2 = JSON.parse(deps2.flowData.flowVars["__araState__"]!) as AraState;
+    expect(after2.phase).toBe("manual");
+  });
+});
+
+// ── base-first / absorb-remainder strategy ────────────────────────────────────
+describe("base-first absorb-remainder", () => {
+  // base 2 / max 3, allowExtraBed so absorbed rooms get a bed; realistic charges.
+  const cfg: AllocationConfig = { ...baseConfig, allowExtraBed: true, extraAdultCharge: 1000, extraBedCharge: 500 };
+  const single = (avail = 20, basePrice = 5000): AllocationRoomInput[] =>
+    [room({ roomTypeId: "rt", name: "Deluxe", basePrice, availableCount: avail })];
+  const adultsOf = (r: AllocationRoom[]) => r.map((x) => x.adults).sort((a, b) => b - a);
+  const beds = (r: AllocationRoom[]) => r.filter((x) => x.extraBed).length;
+
+  it("10 adults → 5 base rooms, no beds", () => {
+    const r = allocateRooms({ adults: 10, children: 0, rooms: single(), config: cfg, nights: 1 })!;
+    expect(r).toHaveLength(5);
+    expect(adultsOf(r)).toEqual([2, 2, 2, 2, 2]);
+    expect(beds(r)).toBe(0);
+  });
+
+  it("5 adults → [3a+bed] + [2a] (absorb the remainder, one bed)", () => {
+    const r = allocateRooms({ adults: 5, children: 0, rooms: single(), config: cfg, nights: 1 })!;
+    expect(r).toHaveLength(2);
+    expect(adultsOf(r)).toEqual([3, 2]);
+    expect(beds(r)).toBe(1);
+    const three = r.find((x) => x.adults === 3)!;
+    expect(three.pricePerNight).toBe(5000 + 1000 + 500); // base + extra adult + bed
+    expect(r.find((x) => x.adults === 2)!.pricePerNight).toBe(5000);
+  });
+
+  it("7 adults → [3a+bed] + [2a] + [2a] (one bed)", () => {
+    const r = allocateRooms({ adults: 7, children: 0, rooms: single(), config: cfg, nights: 1 })!;
+    expect(r).toHaveLength(3);
+    expect(adultsOf(r)).toEqual([3, 2, 2]);
+    expect(beds(r)).toBe(1);
+  });
+
+  it("4 adults → 2 base rooms, no beds", () => {
+    const r = allocateRooms({ adults: 4, children: 0, rooms: single(), config: cfg, nights: 1 })!;
+    expect(adultsOf(r)).toEqual([2, 2]);
+    expect(beds(r)).toBe(0);
+  });
+
+  it("3 adults → single room [3a+bed]", () => {
+    const r = allocateRooms({ adults: 3, children: 0, rooms: single(), config: cfg, nights: 1 })!;
+    expect(r).toHaveLength(1);
+    expect(r[0]!.adults).toBe(3);
+    expect(r[0]!.extraBed).toBe(true);
+  });
+
+  it("1 adult → single room [1a], no bed (nothing to absorb into)", () => {
+    const r = allocateRooms({ adults: 1, children: 0, rooms: single(), config: cfg, nights: 1 })!;
+    expect(r).toHaveLength(1);
+    expect(r[0]!.adults).toBe(1);
+    expect(r[0]!.extraBed).toBe(false);
+  });
+
+  it("6 adults → 3 base rooms, no beds", () => {
+    const r = allocateRooms({ adults: 6, children: 0, rooms: single(), config: cfg, nights: 1 })!;
+    expect(adultsOf(r)).toEqual([2, 2, 2]);
+    expect(beds(r)).toBe(0);
+  });
+
+  it("5 adults + 2 children → [3a+1c+bed] + [2a+1c]", () => {
+    const r = allocateRooms({ adults: 5, children: 2, rooms: single(), config: cfg, nights: 1 })!;
+    expect(r).toHaveLength(2);
+    const three = r.find((x) => x.adults === 3)!;
+    const two   = r.find((x) => x.adults === 2)!;
+    expect(three.children).toBe(1);
+    expect(two.children).toBe(1);
+    expect(three.extraBed).toBe(true);
+    expect(two.extraBed).toBe(false);
+  });
+
+  it("availability spill: cheap deluxe (avail 1) carries the max, superior takes the rest", () => {
+    const rooms = [
+      room({ roomTypeId: "rt_dlx", name: "Deluxe",   basePrice: 5000, availableCount: 1 }),
+      room({ roomTypeId: "rt_sup", name: "Superior", basePrice: 6500, availableCount: 5 }),
+    ];
+    const r = allocateRooms({ adults: 5, children: 0, rooms, config: cfg, nights: 1 })!;
+    expect(r).toHaveLength(2);
+    const dlx = r.find((x) => x.roomTypeId === "rt_dlx")!;
+    const sup = r.find((x) => x.roomTypeId === "rt_sup")!;
+    expect(dlx.adults).toBe(3);
+    expect(dlx.extraBed).toBe(true);
+    expect(sup.adults).toBe(2);
+    expect(sup.extraBed).toBe(false);
+  });
+
+  it("remainder not absorbable → opens an under-filled base room, no beds (base 4 / max 5)", () => {
+    const r = allocateRooms({
+      adults: 6, children: 0,
+      rooms: single(),
+      config: { ...cfg, baseAdults: 4, maxAdults: 5 },
+      nights: 1,
+    })!;
+    expect(r).toHaveLength(2);
+    expect(adultsOf(r)).toEqual([4, 2]); // [4,2], not crammed to [5,1]
+    expect(beds(r)).toBe(0);
+  });
+
+  it("children overflow opens extra rooms (maxChildren 1)", () => {
+    // 2 adults + 3 children → [2a+1c] + [0a+1c] + [0a+1c]
+    const r = allocateRooms({ adults: 2, children: 3, rooms: single(), config: cfg, nights: 1 })!;
+    expect(r).toHaveLength(3);
+    expect(r.reduce((s, x) => s + x.children, 0)).toBe(3);
+    expect(r.reduce((s, x) => s + x.adults, 0)).toBe(2);
+    expect(r.every((x) => x.children <= 1)).toBe(true);
+  });
+
+  it("graceful failure when inventory cannot house the group", () => {
+    // 10 adults, single type, only 2 rooms (max 3 each = 6 < 10) → null.
+    expect(allocateRooms({ adults: 10, children: 0, rooms: single(2), config: cfg, nights: 1 })).toBeNull();
   });
 });

@@ -544,15 +544,17 @@ export async function extractDateWithAI(input: string): Promise<Date | null> {
 // ── Allocation modification interpreter (internal utility) ───────────────────
 
 export type AllocationModificationResult = {
-  operation: "add_extra_bed" | "remove_extra_bed" | "move_extra_bed" | "remove_room" | "unknown";
+  operation: "add_extra_bed" | "remove_extra_bed" | "move_extra_bed" | "remove_room" | "move_guest" | "unknown";
   roomIndex?:     number;
   fromRoomIndex?: number;
   toRoomIndex?:   number;
+  adults?:        number; // move_guest — adults to move (default 0)
+  children?:      number; // move_guest — children to move (default 0)
   confidence: "high" | "low";
 };
 
 const ALLOC_OPS = new Set([
-  "add_extra_bed", "remove_extra_bed", "move_extra_bed", "remove_room", "unknown",
+  "add_extra_bed", "remove_extra_bed", "move_extra_bed", "remove_room", "move_guest", "unknown",
 ]);
 
 /**
@@ -588,15 +590,20 @@ export async function interpretAllocationModification(
     `- "remove_extra_bed": { "roomIndex": number }\n` +
     `- "move_extra_bed": { "fromRoomIndex": number, "toRoomIndex": number }\n` +
     `- "remove_room": { "roomIndex": number }\n` +
+    `- "move_guest": { "fromRoomIndex": number, "toRoomIndex": number, "adults": number, "children": number }\n` +
     `- "unknown": {}\n` +
     `Rules:\n` +
     `- Indices are 0-based and MUST refer to a room in the provided allocation.\n` +
-    `- Resolve room references by roomTypeName (e.g. "deluxe" → that room's index).\n` +
-    `- Return "unknown" for anything else: changing dates or guest counts, adding rooms, ` +
+    `- Resolve room references by number AND by roomTypeName, using the provided ` +
+    `allocation context (e.g. "room 2" → index 1; "deluxe" → that room's index).\n` +
+    `- "move_guest": "move N adult(s)/child(ren) from room X to room Y" → set ` +
+    `fromRoomIndex, toRoomIndex and the counts (adults / children, default 0 each). ` +
+    `If the count or direction is ambiguous, use confidence "low".\n` +
+    `- Return "unknown" for anything else: changing dates or total guest counts, adding rooms, ` +
     `swapping/changing room types, or ANY request about price/money.\n` +
     `- NEVER output prices, totals or money. NEVER invent rooms that are not listed.\n` +
     `- "confidence" is "high" only when the operation and room(s) are unambiguous; else "low".\n` +
-    `Output: {"operation":"...","roomIndex"?:n,"fromRoomIndex"?:n,"toRoomIndex"?:n,"confidence":"high"|"low"}`;
+    `Output: {"operation":"...","roomIndex"?:n,"fromRoomIndex"?:n,"toRoomIndex"?:n,"adults"?:n,"children"?:n,"confidence":"high"|"low"}`;
 
   const user =
     `Current allocation:\n` +
@@ -658,9 +665,13 @@ export async function interpretAllocationModification(
     const ri = idx(parsed.roomIndex);
     const fi = idx(parsed.fromRoomIndex);
     const ti = idx(parsed.toRoomIndex);
+    const ad = idx(parsed.adults);
+    const ch = idx(parsed.children);
     if (ri !== undefined) result.roomIndex     = ri;
     if (fi !== undefined) result.fromRoomIndex = fi;
     if (ti !== undefined) result.toRoomIndex   = ti;
+    if (ad !== undefined) result.adults        = ad;
+    if (ch !== undefined) result.children      = ch;
     return result;
   } catch {
     return FALLBACK;

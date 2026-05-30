@@ -116,14 +116,63 @@ function computeRoomPricing(
 
 // ── Allocation engine (pure) ──────────────────────────────────────────────────
 
+const MAX_ROOMS = 50;
+
 /**
- * Greedy minimum-room allocator.
+ * Base-first room count for `units` with the absorb rule (unconstrained by
+ * availability): open `floor(units/base)` base rooms; if a leftover remains and
+ * the base rooms can absorb it toward `max`, keep that count, else open one more
+ * (under-filled) room.
+ */
+function baseFirstRoomCount(units: number, base: number, max: number): number {
+  if (units <= 0) return 0;
+  if (base <= 0) return Math.ceil(units / Math.max(1, max));
+  const nBase = Math.floor(units / base);
+  const r     = units % base;
+  if (r === 0) return nBase;
+  const spare = nBase * Math.max(0, max - base);
+  return r <= spare ? nBase : nBase + 1;
+}
+
+/**
+ * Distribute `units` into exactly `R` rooms, base-first: lay down `base` per
+ * room (never exceeding the remaining units), then absorb any surplus by bumping
+ * the FEWEST rooms toward `max`. Rooms may sit under `base` when units < R×base.
+ * Precondition: 0 <= units <= R×max.
+ */
+function distributeIntoRooms(units: number, R: number, base: number, max: number): number[] {
+  if (R <= 0) return [];
+  const baseEach = base > 0 ? base : max;
+  const per = new Array<number>(R).fill(0);
+  let remaining = units;
+  for (let i = 0; i < R; i++) {
+    const give = Math.min(baseEach, remaining);
+    per[i] = give;
+    remaining -= give;
+  }
+  const perRoomSpare = Math.max(0, max - baseEach);
+  for (let i = 0; i < R && remaining > 0 && perRoomSpare > 0; i++) {
+    const give = Math.min(perRoomSpare, remaining);
+    per[i] = (per[i] ?? 0) + give;
+    remaining -= give;
+  }
+  return per;
+}
+
+/**
+ * Base-first / absorb-the-remainder allocator.
  *
- * Strategy: sort by largest effective adult capacity (ties → cheaper first) so
- * we fill the smallest number of rooms; respect per-roomType availableCount as
- * a hard constraint by decrementing as we go.
+ * Default to BASE occupancy (no extra beds). Only push a room toward MAX (which
+ * adds an extra bed, per the invariant, when allowed) when doing so ELIMINATES an
+ * otherwise under-filled extra room; use as few max-occupancy rooms as possible.
+ * Children then fill the rooms (up to maxChildren), overflowing into extra rooms.
+ * Room types are filled cheapest-first so price is the natural tie-break;
+ * availability is a hard constraint (spill to the next type; graceful failure —
+ * null — if no combination houses everyone).
  *
- * Returns null if no allocation is possible given inventory.
+ * Invariant: a room has an extra bed iff adults > baseAdults && allowExtraBed.
+ * The allocation SHAPE uses the node-level config (base/max); per-type config
+ * only affects the price breakdown + the extra-bed flag (allowExtraBed).
  */
 export function allocateRooms(args: {
   adults:   number;
@@ -134,68 +183,80 @@ export function allocateRooms(args: {
 }): AllocationRoom[] | null {
   const { adults, children, rooms, config, nights } = args;
 
-  // Edge: no guests requested — nothing to allocate.
   if (adults <= 0 && children <= 0) return [];
   if (nights <= 0) return null;
 
-  const extraBedBonus = config.allowExtraBed ? 1 : 0;
+  const baseA = Math.max(1, config.baseAdults);
+  const maxA  = Math.max(baseA, config.maxAdults);
+  const baseC = Math.max(0, config.baseChildren);
+  const maxC  = Math.max(0, config.maxChildren);
 
-  // Effective per-room caps: config policy further constrained by the room's
-  // own DB capacity. Null DB caps mean "no DB-side limit" → fall back to policy.
-  const effMaxAdults = (r: AllocationRoomInput): number =>
-    Math.min(config.maxAdults + extraBedBonus, r.maxAdults ?? Infinity);
-  const effMaxChildren = (r: AllocationRoomInput): number =>
-    Math.min(config.maxChildren, r.maxChildren ?? Infinity);
+  const availTotal = rooms.reduce((s, r) => s + Math.max(0, r.availableCount), 0);
+  if (availTotal <= 0) return null;
 
-  const sorted = [...rooms].sort((a, b) => {
-    const ca = effMaxAdults(a);
-    const cb = effMaxAdults(b);
-    if (cb !== ca) return cb - ca;
-    return a.basePrice - b.basePrice; // tie-break: cheaper first
-  });
+  // ── Adults drive the room count (base-first, absorb the remainder) ──
+  let R = 0;
+  let adultCounts: number[] = [];
+  if (adults > 0) {
+    const rBase = baseFirstRoomCount(adults, baseA, maxA);
+    if (rBase <= availTotal) {
+      R = rBase;
+    } else {
+      R = availTotal;                       // availability-limited → cram available rooms
+      if (R * maxA < adults) return null;   // can't house everyone even at max occupancy
+    }
+    adultCounts = distributeIntoRooms(adults, R, baseA, maxA);
+  }
 
-  // Mutable copy of availability so we never exceed it.
-  const remainingAvail = new Map<string, number>();
-  for (const r of rooms) remainingAvail.set(r.roomTypeId, r.availableCount);
+  // ── Children fill the adult rooms (up to maxChildren), then overflow rooms ──
+  const childCounts = new Array<number>(R).fill(0);
+  let remC = children;
+  for (let i = 0; i < R && remC > 0 && maxC > 0; i++) {
+    const give = Math.min(maxC, remC);
+    childCounts[i] = give;
+    remC -= give;
+  }
+  let overflowChildRooms: number[] = [];
+  if (remC > 0) {
+    if (maxC <= 0) return null;             // rooms can't hold children at all
+    const cb = baseC > 0 ? baseC : maxC;
+    const Rc = baseFirstRoomCount(remC, cb, maxC);
+    overflowChildRooms = distributeIntoRooms(remC, Rc, cb, maxC);
+  }
+
+  const totalRooms = R + overflowChildRooms.length;
+  if (totalRooms === 0) return [];
+  if (totalRooms > availTotal || totalRooms > MAX_ROOMS) return null;
+
+  // Room shapes: adult(+child) rooms first, then any child-only overflow rooms.
+  const shapes: { adults: number; children: number }[] = [];
+  for (let i = 0; i < R; i++) shapes.push({ adults: adultCounts[i]!, children: childCounts[i]! });
+  for (const cc of overflowChildRooms) shapes.push({ adults: 0, children: cc });
+
+  // Assign shapes to type slots: cheapest types first (minimises base price),
+  // heaviest shapes onto the cheapest slots.
+  const typesByPrice = [...rooms].sort((a, b) => a.basePrice - b.basePrice);
+  const slots: AllocationRoomInput[] = [];
+  for (const t of typesByPrice) {
+    for (let i = 0; i < Math.max(0, t.availableCount); i++) slots.push(t);
+  }
+  const useSlots = slots.slice(0, totalRooms);
+  const sortedShapes = [...shapes].sort((a, b) => b.adults - a.adults || b.children - a.children);
 
   const allocated: AllocationRoom[] = [];
-  let remA = adults;
-  let remC = children;
-
-  // Guard against pathological inputs that would never terminate.
-  const MAX_ROOMS = 50;
-
-  while (remA > 0 || remC > 0) {
-    if (allocated.length >= MAX_ROOMS) return null;
-
-    let chosen: AllocationRoomInput | null = null;
-    let chosenAdults = 0;
-    let chosenChildren = 0;
-
-    for (const r of sorted) {
-      if ((remainingAvail.get(r.roomTypeId) ?? 0) <= 0) continue;
-      const a = Math.min(remA, effMaxAdults(r));
-      const c = Math.min(remC, effMaxChildren(r));
-      if (a + c === 0) continue; // room can hold nobody from the remaining pool
-      chosen = r;
-      chosenAdults = a;
-      chosenChildren = c;
-      break;
-    }
-
-    if (!chosen) return null; // out of available rooms
-
-    const rc       = resolveRoomConfig(chosen, config);
-    const extraBed = chosenAdults > rc.baseAdults;
-    const p        = computeRoomPricing(chosen.basePrice, chosenAdults, extraBed, nights, rc);
-
+  for (let i = 0; i < totalRooms; i++) {
+    const slot  = useSlots[i]!;
+    const shape = sortedShapes[i]!;
+    const rc    = resolveRoomConfig(slot, config);
+    const extraBed = shape.adults > rc.baseAdults && rc.allowExtraBed;
+    const p = computeRoomPricing(slot.basePrice, shape.adults, extraBed, nights, rc);
     allocated.push({
-      roomTypeId:    chosen.roomTypeId,
-      roomTypeName:  chosen.name,
-      adults:        chosenAdults,
-      children:      chosenChildren,
+      roomTypeId:    slot.roomTypeId,
+      roomTypeName:  slot.name,
+      adults:        shape.adults,
+      children:      shape.children,
       extraBed,
-      basePrice:     chosen.basePrice,
+      basePrice:     slot.basePrice,
       extraAdultCost: p.extraAdultCost,
       extraBedCost:   p.extraBedCost,
       childAgeLimit: rc.childAgeLimit,
@@ -203,12 +264,7 @@ export function allocateRooms(args: {
       nights,
       totalPrice:     p.totalPrice,
     });
-
-    remA -= chosenAdults;
-    remC -= chosenChildren;
-    remainingAvail.set(chosen.roomTypeId, (remainingAvail.get(chosen.roomTypeId) ?? 0) - 1);
   }
-
   return allocated;
 }
 
@@ -293,6 +349,87 @@ export function applyRemoveRoom(rooms: AllocationRoom[], roomIndex: number): App
     rooms: rooms.filter((_, i) => i !== roomIndex),
     returnedGuests: { adults: removed.adults, children: removed.children },
   };
+}
+
+/**
+ * Reprice a room after its occupancy changed via a guest move. Unlike the
+ * extra-bed ops (which are the guest's manual override), move_guest
+ * AUTO-recomputes the extra bed from the new occupancy: a bed is needed when
+ * adults exceed baseAdults AND the room type allows one. If extra beds are not
+ * allowed, adults may still rise (up to the maxAdults cap, checked by the
+ * caller) with no bed — only the extra-adult charge applies.
+ */
+function repriceForMove(room: AllocationRoom, adults: number, children: number, cfg: AllocationConfig): AllocationRoom {
+  const extraBed = adults > cfg.baseAdults && cfg.allowExtraBed;
+  const p = computeRoomPricing(room.basePrice, adults, extraBed, room.nights, cfg);
+  return {
+    ...room,
+    adults,
+    children,
+    extraBed,
+    extraAdultCost: p.extraAdultCost,
+    extraBedCost:   p.extraBedCost,
+    pricePerNight:  p.pricePerNight,
+    totalPrice:     p.totalPrice,
+  };
+}
+
+/**
+ * Move `adults`/`children` from one room to another. Validates indices, that the
+ * source holds the guests, and that the destination won't exceed its maxAdults /
+ * maxChildren caps. Both involved rooms have their extra bed re-derived from the
+ * new occupancy and are re-priced; uninvolved rooms are untouched. An emptied
+ * source room is dropped (consolidation). remainingGuests is unaffected — guests
+ * only move between existing rooms.
+ */
+export function applyMoveGuest(
+  rooms:      AllocationRoom[],
+  fromIndex:  number,
+  toIndex:    number,
+  adults:     number,
+  children:   number,
+  resolveCfg: RoomConfigResolver,
+): ApplyResult {
+  if (!inRange(rooms, fromIndex) || !inRange(rooms, toIndex) || fromIndex === toIndex) {
+    return { ok: false, outOfRange: true, reason: "" };
+  }
+  const a = Number.isFinite(adults)   ? Math.max(0, Math.trunc(adults))   : 0;
+  const c = Number.isFinite(children) ? Math.max(0, Math.trunc(children)) : 0;
+  if (a === 0 && c === 0) return { ok: false, outOfRange: false, reason: "Nothing to move." };
+
+  const from = rooms[fromIndex]!;
+  const to   = rooms[toIndex]!;
+
+  if (from.adults < a || from.children < c) {
+    return {
+      ok: false, outOfRange: false,
+      reason: `Room ${fromIndex + 1} only has ${from.adults} adult${from.adults === 1 ? "" : "s"} and ${from.children} child${from.children === 1 ? "" : "ren"}.`,
+    };
+  }
+
+  const toCfg         = resolveCfg(to);
+  const newToAdults   = to.adults + a;
+  const newToChildren = to.children + c;
+  if (newToAdults > toCfg.maxAdults) {
+    return { ok: false, outOfRange: false, reason: `${to.roomTypeName} rooms hold at most ${toCfg.maxAdults} adult${toCfg.maxAdults === 1 ? "" : "s"}.` };
+  }
+  if (newToChildren > toCfg.maxChildren) {
+    return { ok: false, outOfRange: false, reason: `${to.roomTypeName} rooms hold at most ${toCfg.maxChildren} child${toCfg.maxChildren === 1 ? "" : "ren"}.` };
+  }
+
+  const toPriced        = repriceForMove(to, newToAdults, newToChildren, toCfg);
+  const newFromAdults   = from.adults - a;
+  const newFromChildren = from.children - c;
+
+  let updated: AllocationRoom[];
+  if (newFromAdults === 0 && newFromChildren === 0) {
+    // Source emptied → drop it (consolidation).
+    updated = rooms.map((r, i) => (i === toIndex ? toPriced : r)).filter((_, i) => i !== fromIndex);
+  } else {
+    const fromPriced = repriceForMove(from, newFromAdults, newFromChildren, resolveCfg(from));
+    updated = rooms.map((r, i) => (i === fromIndex ? fromPriced : i === toIndex ? toPriced : r));
+  }
+  return { ok: true, rooms: updated };
 }
 
 // ── Formatting ────────────────────────────────────────────────────────────────
@@ -493,10 +630,12 @@ export type InterpretModificationFn = (
   }>,
   guestMessage: string,
 ) => Promise<{
-  operation: "add_extra_bed" | "remove_extra_bed" | "move_extra_bed" | "remove_room" | "unknown";
+  operation: "add_extra_bed" | "remove_extra_bed" | "move_extra_bed" | "remove_room" | "move_guest" | "unknown";
   roomIndex?:     number;
   fromRoomIndex?: number;
   toRoomIndex?:   number;
+  adults?:        number;
+  children?:      number;
   confidence: "high" | "low";
 }>;
 
@@ -704,23 +843,42 @@ async function finalizeAndAdvance(deps: AdvancedRoomAllocationDeps, allocated: A
 // ── Manual-mode AI fallback ───────────────────────────────────────────────────
 
 const MODIFY_PROMPT = "Reply *DONE* to confirm, a room number to modify, or *MENU* to cancel.";
+const MODIFY_FAILED = "I couldn't make that change automatically.";
+
+type ModifyPhase = "confirm" | "manual";
+
+/** Render the allocation followed by the prompt for the current phase. */
+function renderWithPrompt(phase: ModifyPhase, st: AraState): string {
+  if (phase === "confirm") {
+    return renderAllocationSummary(st.selectedRooms, { trailing: confirmPromptFooter(), childrenAges: st.guests.childrenAges });
+  }
+  return `${renderAllocationSummary(st.selectedRooms, { childrenAges: st.guests.childrenAges })}\n\n${MODIFY_PROMPT}`;
+}
+
+/** The phase's existing (no-change) re-prompt — what the guest sees when nothing was applied. */
+function existingReprompt(phase: ModifyPhase, st: AraState, roomInputs: AllocationRoomInput[]): string {
+  if (phase === "confirm") {
+    return `Please reply *1* to confirm, *2* to modify, or *MENU* to cancel.\n\n${renderAllocationSummary(st.selectedRooms, { childrenAges: st.guests.childrenAges })}`;
+  }
+  return `Please reply with a room number (1–${roomInputs.length}), *DONE* to finish, or *MENU* to cancel.`;
+}
 
 /**
- * Manual-mode fallback for free text that structured parsing couldn't match.
- * Returns the reply string on a successful edit or a validation rejection, or
- * `null` to signal "fall back to the structured re-prompt" (no AI dep, AI
- * unsure/low-confidence, unsupported op, or an out-of-range index).
- *
- * The AI only chooses an operation + indices; this function validates the
- * indices, applies the change deterministically (prices recomputed here, never
- * by the AI), persists, and re-renders the updated allocation so the guest can
- * keep editing or cancel. State stays only in flowVars["__araState__"].
+ * Phase-aware fallback for free text that structured parsing couldn't match.
+ * Runs in BOTH confirm and manual phases. Returns the reply string, or `null`
+ * ONLY when there is no interpreter dep (caller keeps its exact current
+ * behaviour). The AI only chooses an operation + indices + counts; this
+ * function validates everything, applies the change deterministically (prices
+ * recomputed here, never by the AI), persists with the SAME phase, and
+ * re-renders. On unknown / low-confidence / out-of-range it acknowledges the
+ * miss and re-prompts — it never silently guesses or applies.
  */
-async function tryAiModification(
+async function tryModify(
   deps:       AdvancedRoomAllocationDeps,
   state:      AraState,
   roomInputs: AllocationRoomInput[],
   input:      string,
+  phase:      ModifyPhase,
 ): Promise<string | null> {
   if (!deps.interpretModification) return null;
 
@@ -733,8 +891,12 @@ async function tryAiModification(
   }));
 
   const ai = await deps.interpretModification(currentRooms, input);
-  // Never guess: unknown or low-confidence → structured re-prompt.
-  if (ai.operation === "unknown" || ai.confidence === "low") return null;
+
+  // Acknowledge + re-prompt without changing anything (Fix A).
+  const ackReprompt = (): string => `${MODIFY_FAILED}\n\n${existingReprompt(phase, state, roomInputs)}`;
+
+  // Never guess.
+  if (ai.operation === "unknown" || ai.confidence === "low") return ackReprompt();
 
   // Per-room config resolver from live inventory (DB overrides → node config).
   const nodeConfig = resolveConfig((deps.node.data ?? {}) as AdvancedRoomAllocationNodeData);
@@ -758,15 +920,20 @@ async function tryAiModification(
     case "remove_room":
       applied = applyRemoveRoom(state.selectedRooms, ai.roomIndex ?? -1);
       break;
+    case "move_guest":
+      applied = applyMoveGuest(
+        state.selectedRooms, ai.fromRoomIndex ?? -1, ai.toRoomIndex ?? -1, ai.adults ?? 0, ai.children ?? 0, resolveCfg,
+      );
+      break;
     default:
-      return null;
+      return ackReprompt();
   }
 
   if (!applied.ok) {
-    // Out-of-range index behaves like "unknown" → structured re-prompt.
-    if (applied.outOfRange) return null;
-    // Validation rejection (e.g. extra bed not allowed) → reason + unchanged allocation.
-    return `${applied.reason}\n\n${renderAllocationSummary(state.selectedRooms, { childrenAges: state.guests.childrenAges })}\n\n${MODIFY_PROMPT}`;
+    // Out-of-range index behaves like "unknown" → acknowledge + re-prompt.
+    if (applied.outOfRange) return ackReprompt();
+    // Validation rejection (e.g. cap exceeded) → reason + unchanged allocation.
+    return `${applied.reason}\n\n${renderWithPrompt(phase, state)}`;
   }
 
   const updated: AraState = {
@@ -778,12 +945,12 @@ async function tryAiModification(
           children: state.remainingGuests.children + applied.returnedGuests.children,
         }
       : state.remainingGuests,
-    phase: "manual",
+    phase, // KEEP the current phase — confirm stays confirm, manual stays manual.
   };
   writeState(deps.flowData.flowVars, updated);
   await persist(deps);
 
-  return `${renderAllocationSummary(updated.selectedRooms, { childrenAges: updated.guests.childrenAges })}\n\n${MODIFY_PROMPT}`;
+  return renderWithPrompt(phase, updated);
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -851,6 +1018,17 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
       const rooms = await buildInventoryRooms(hotelId, checkIn, checkOut, deps.fetchRoomTypes, deps.getCalendarData);
       return buildManualRoomList(rooms, next.remainingGuests);
     }
+    // Free text at the confirm step → AI modification, staying in confirm phase
+    // (Fix B). No interpreter dep → unchanged behaviour (no AI call, no fetch).
+    if (deps.interpretModification) {
+      const ci = vars["bookingCheckIn"];
+      const co = vars["bookingCheckOut"];
+      const roomInputs = ci && co
+        ? await buildInventoryRooms(hotelId, ci, co, deps.fetchRoomTypes, deps.getCalendarData)
+        : [];
+      const aiReply = await tryModify(deps, state, roomInputs, input, "confirm");
+      if (aiReply !== null) return aiReply;
+    }
     return `Please reply *1* to confirm, *2* to modify, or *MENU* to cancel.\n\n${renderAllocationSummary(state.selectedRooms, { childrenAges: state.guests.childrenAges })}`;
   }
 
@@ -875,9 +1053,9 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
   // Room pick by number.
   const pick = parseInt(input.trim(), 10);
   if (!Number.isFinite(pick) || pick < 1 || pick > rooms.length) {
-    // Structured parsing failed → try the AI fallback (no-op when the dep is
-    // absent or the AI is unsure), then fall back to the structured re-prompt.
-    const aiReply = await tryAiModification(deps, state, rooms, input);
+    // Structured parsing failed → try the AI fallback (returns null only when the
+    // interpreter dep is absent → keep the exact structured re-prompt, no ack).
+    const aiReply = await tryModify(deps, state, rooms, input, "manual");
     return aiReply ?? `Please reply with a room number (1–${rooms.length}), *DONE* to finish, or *MENU* to cancel.`;
   }
   const room = rooms[pick - 1]!;
