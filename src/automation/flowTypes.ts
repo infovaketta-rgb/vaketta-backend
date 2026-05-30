@@ -270,6 +270,11 @@ export interface AdvancedRoomAllocationNodeData {
   allowExtraBed?:     boolean; // default false — when true, maxAdults gains +1 via extra bed
   extraBedCharge?:    number;  // default 0  — per night charge for the extra bed
   childAgeLimit?:     number;  // informational only — surfaced in the summary text
+  // Guest-count input variables (flowVars the node reads). All optional —
+  // unset falls back to bookingAdults / bookingChildren (and no ages).
+  adultsVar?:         string;  // flowVar holding number of adults
+  childrenVar?:       string;  // flowVar holding number of children
+  childrenAgesVar?:   string;  // flowVar holding children ages (CSV/text)
   label?:             string;
 }
 

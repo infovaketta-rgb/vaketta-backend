@@ -40,7 +40,7 @@ export type AllocationRoom = {
 };
 
 export type AraState = {
-  guests:          { adults: number; children: number };
+  guests:          { adults: number; children: number; childrenAges?: number[] };
   selectedRooms:   AllocationRoom[];
   remainingGuests: { adults: number; children: number };
   phase:           "confirm" | "manual";
@@ -204,12 +204,41 @@ function inr(n: number): string {
   return `₹${Math.round(n).toLocaleString("en-IN")}`;
 }
 
-export function renderAllocationSummary(allocated: AllocationRoom[], opts?: { trailing?: string }): string {
+/**
+ * Extract children's ages from free-form guest text. Pulls every integer
+ * sequence and keeps those in the child range 0–17, preserving order.
+ * Pure + exported for unit testing. Examples:
+ *   "6, 9" → [6, 9]   "6 and 9 years" → [6, 9]   "20, 5" → [5]   "no kids" → []
+ */
+export function parseChildrenAges(raw: string): number[] {
+  const matches = raw.match(/\d+/g);
+  if (!matches) return [];
+  return matches
+    .map((m) => parseInt(m, 10))
+    .filter((n) => Number.isFinite(n) && n >= 0 && n <= 17);
+}
+
+/** Join ages for display: [6,9] → "6 & 9", [4,7,12] → "4, 7 & 12". */
+function formatAges(ages: number[]): string {
+  if (ages.length <= 1) return ages.join("");
+  return `${ages.slice(0, -1).join(", ")} & ${ages[ages.length - 1]}`;
+}
+
+export function renderAllocationSummary(
+  allocated: AllocationRoom[],
+  opts?: { trailing?: string; childrenAges?: number[] | undefined },
+): string {
+  const childrenAges = opts?.childrenAges ?? [];
   let text = `🛏 *Suggested Allocation*\n${DIVIDER}\n`;
   allocated.forEach((r, i) => {
-    const childPart = r.children > 0
-      ? `, ${r.children} child${r.children > 1 ? "ren" : ""}`
-      : "";
+    // Show ages only when this room's children count matches the ages provided
+    // (unambiguous — e.g. a single room holding all the children).
+    let childPart = "";
+    if (r.children > 0) {
+      childPart = childrenAges.length > 0 && r.children === childrenAges.length
+        ? `, children aged ${formatAges(childrenAges)}`
+        : `, ${r.children} child${r.children > 1 ? "ren" : ""}`;
+    }
     text += `*Room ${i + 1}: ${r.roomTypeName}*\n`;
     text += `👥 ${r.adults} adult${r.adults > 1 ? "s" : ""}${childPart}\n`;
     if (r.extraBed) text += `🛏 Extra bed included\n`;
@@ -365,13 +394,6 @@ function resolveConfig(data: AdvancedRoomAllocationNodeData): AllocationConfig {
   };
 }
 
-function parseNonNegativeInt(raw: string | undefined, fallback: number): number {
-  if (raw === undefined || raw === null || raw === "") return fallback;
-  const n = parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 0) return fallback;
-  return n;
-}
-
 // ── Inventory-aware room list builder ────────────────────────────────────────
 
 async function buildInventoryRooms(
@@ -463,7 +485,7 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
   if (existing) {
     flowData.waitingFor = "answer";
     await persist(deps);
-    return renderAllocationSummary(existing.selectedRooms, { trailing: confirmPromptFooter() });
+    return renderAllocationSummary(existing.selectedRooms, { trailing: confirmPromptFooter(), childrenAges: existing.guests.childrenAges });
   }
 
   // Date inputs are mandatory; let an earlier date question collect them.
@@ -480,8 +502,19 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
     return "Check-out must be after check-in. Please start over from the main menu.";
   }
 
-  const adults   = parseNonNegativeInt(vars["bookingAdults"],   2);
-  const children = parseNonNegativeInt(vars["bookingChildren"], 0);
+  // Guest counts come from configurable flowVars (set on the node), falling back
+  // to the historical bookingAdults / bookingChildren names + "2" / "0" defaults.
+  const adultsVarName   = data.adultsVar   || "bookingAdults";
+  const childrenVarName = data.childrenVar || "bookingChildren";
+
+  const adults   = parseInt(vars[adultsVarName]   ?? "2", 10) || 2;
+  const children = parseInt(vars[childrenVarName] ?? "0", 10) || 0;
+
+  let childrenAges: number[] = [];
+  const agesVarName = data.childrenAgesVar || "";
+  if (agesVarName && vars[agesVarName]) {
+    childrenAges = parseChildrenAges(vars[agesVarName]);
+  }
 
   if (adults + children === 0) {
     await resetSession(guestId, hotelId);
@@ -498,7 +531,7 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
   }
 
   const newState: AraState = {
-    guests:          { adults, children },
+    guests:          { adults, children, ...(childrenAges.length > 0 ? { childrenAges } : {}) },
     selectedRooms:   allocated,
     remainingGuests: { adults: 0, children: 0 },
     phase:           "confirm",
@@ -508,7 +541,7 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
   flowData.waitingFor = "answer";
   await persist(deps);
 
-  return renderAllocationSummary(allocated, { trailing: confirmPromptFooter() });
+  return renderAllocationSummary(allocated, { trailing: confirmPromptFooter(), childrenAges });
 }
 
 // ── Phase 2 helpers ───────────────────────────────────────────────────────────
@@ -612,7 +645,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
       const rooms = await buildInventoryRooms(hotelId, checkIn, checkOut, deps.fetchRoomTypes, deps.getCalendarData);
       return buildManualRoomList(rooms, next.remainingGuests);
     }
-    return `Please reply *1* to confirm, *2* to modify, or *MENU* to cancel.\n\n${renderAllocationSummary(state.selectedRooms)}`;
+    return `Please reply *1* to confirm, *2* to modify, or *MENU* to cancel.\n\n${renderAllocationSummary(state.selectedRooms, { childrenAges: state.guests.childrenAges })}`;
   }
 
   // ── Manual sub-phase ───────────────────────────────────────────────────────
@@ -656,7 +689,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
   const takeChildren   = Math.min(state.remainingGuests.children, effMaxChildren);
 
   if (takeAdults + takeChildren === 0) {
-    return `All your guests are already placed. Reply *DONE* to confirm or *MENU* to cancel.\n\n${renderAllocationSummary(state.selectedRooms)}`;
+    return `All your guests are already placed. Reply *DONE* to confirm or *MENU* to cancel.\n\n${renderAllocationSummary(state.selectedRooms, { childrenAges: state.guests.childrenAges })}`;
   }
 
   const rc           = resolveRoomConfig(room, config);
@@ -693,7 +726,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
   writeState(vars, updated);
   await persist(deps);
 
-  const summary = renderAllocationSummary(updated.selectedRooms);
+  const summary = renderAllocationSummary(updated.selectedRooms, { childrenAges: updated.guests.childrenAges });
   if (updated.remainingGuests.adults + updated.remainingGuests.children === 0) {
     return `${summary}\n\nAll guests placed. Reply *DONE* to confirm or *MENU* to cancel.`;
   }

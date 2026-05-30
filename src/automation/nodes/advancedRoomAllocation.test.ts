@@ -10,6 +10,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   allocateRooms,
   renderAllocationSummary,
+  parseChildrenAges,
   handleAdvancedRoomAllocation,
   type AdvancedRoomAllocationDeps,
   type AllocationConfig,
@@ -457,5 +458,82 @@ describe("pricing formula", () => {
     expect(summary).not.toContain("extra bed");
     // No age-limit note when childAgeLimit is null.
     expect(summary).not.toContain("charged as adults");
+  });
+});
+
+// ── Guest count variables (configurable adultsVar / childrenVar / childrenAgesVar) ──
+describe("guest count variables", () => {
+  // 1. parseChildrenAges — pure parsing + child-range filter.
+  it("Case G1: parseChildrenAges extracts in-range integers in order", () => {
+    expect(parseChildrenAges("6, 9")).toEqual([6, 9]);
+    expect(parseChildrenAges("6 and 9 years")).toEqual([6, 9]);
+    expect(parseChildrenAges("ages: 4,7,12")).toEqual([4, 7, 12]);
+    expect(parseChildrenAges("")).toEqual([]);
+    expect(parseChildrenAges("20, 5")).toEqual([5]);   // 20 out of child range
+    expect(parseChildrenAges("no kids")).toEqual([]);
+  });
+
+  // 2. Adults read from a custom adultsVar.
+  it("Case G2: reads adults from configured adultsVar", async () => {
+    const deps = makeDeps({
+      nodeData: { adultsVar: "partyAdults" },
+      flowVars: { partyAdults: "4", bookingChildren: "0" },
+      rooms: [room({ roomTypeId: "rt_std", name: "Standard", maxAdults: 5, availableCount: 5 })],
+    });
+    await handleAdvancedRoomAllocation(deps);
+    const state = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(state.guests.adults).toBe(4);
+  });
+
+  // 3. Children read from a custom childrenVar.
+  it("Case G3: reads children from configured childrenVar", async () => {
+    const deps = makeDeps({
+      nodeData: { childrenVar: "partyKids" },
+      flowVars: { bookingAdults: "2", partyKids: "1" },
+      rooms: [room({ roomTypeId: "rt_std", name: "Standard", maxAdults: 3, maxChildren: 2, availableCount: 5 })],
+    });
+    await handleAdvancedRoomAllocation(deps);
+    const state = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(state.guests.children).toBe(1);
+  });
+
+  // 4. Ages count matches children → stored + shown on the child line.
+  it("Case G4: ages stored and shown when count matches children", async () => {
+    const deps = makeDeps({
+      nodeData: { childrenAgesVar: "kidAges", maxChildren: 2 },
+      flowVars: { bookingAdults: "2", bookingChildren: "2", kidAges: "6, 9" },
+      rooms: [room({ roomTypeId: "rt_fam", name: "Family", maxAdults: 3, maxChildren: 2, availableCount: 5 })],
+    });
+    const result = await handleAdvancedRoomAllocation(deps);
+    const state = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(state.guests.childrenAges).toEqual([6, 9]);
+    expect(result).toContain("aged 6 & 9");
+  });
+
+  // 5. Ages count mismatch → still stored, summary falls back to generic line.
+  it("Case G5: ages stored but summary generic when count mismatches", async () => {
+    const deps = makeDeps({
+      nodeData: { childrenAgesVar: "kidAges" },
+      flowVars: { bookingAdults: "2", bookingChildren: "1", kidAges: "6, 9" }, // 2 ages, 1 child
+      rooms: [room({ roomTypeId: "rt_std", name: "Standard", maxAdults: 3, maxChildren: 2, availableCount: 5 })],
+    });
+    const result = await handleAdvancedRoomAllocation(deps);
+    const state = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(state.guests.childrenAges).toEqual([6, 9]);
+    expect(result).toContain("1 child");
+    expect(result).not.toContain("aged");
+  });
+
+  // 6. Back-compat — no vars set → bookingAdults / bookingChildren defaults.
+  it("Case G6: falls back to bookingAdults/bookingChildren when no vars set", async () => {
+    const deps = makeDeps({
+      flowVars: { bookingAdults: "3", bookingChildren: "0" },
+      rooms: [room({ roomTypeId: "rt_std", name: "Standard", maxAdults: 5, availableCount: 5 })],
+    });
+    await handleAdvancedRoomAllocation(deps);
+    const state = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(state.guests.adults).toBe(3);
+    expect(state.guests.children).toBe(0);
+    expect(state.guests.childrenAges).toBeUndefined();
   });
 });
