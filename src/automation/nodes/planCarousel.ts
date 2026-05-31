@@ -12,7 +12,7 @@
  */
 
 import prisma from "../../db/connect";
-import { sendCarouselMessage, type CarouselCard } from "../../services/whatsapp.send.service";
+import { sendCarouselMessage, sendTextMessage, type CarouselCard } from "../../services/whatsapp.send.service";
 import { decryptWhatsAppToken } from "../../utils/encryption.utils";
 import { MessageChannel, MessageStatus } from "@prisma/client";
 import { logger } from "../../utils/logger";
@@ -52,9 +52,39 @@ export function buildPlanDescription(plan: AllocationPlan): string {
 }
 
 /**
- * Send the plan options as a WhatsApp carousel (one card per plan).
- * Returns true on success (caller returns "ALREADY_SENT"); false on any failure
- * or missing credentials (caller falls back to a text list). Never throws.
+ * Detailed plan-comparison text, sent immediately BEFORE the carousel so the
+ * guest can read the full per-room breakdown, then tap a card to choose. Pure —
+ * no side effects, no external imports. All ₹ amounts use the Indian locale.
+ */
+export function buildPlanDetailText(plans: AllocationPlan[]): string {
+  const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
+
+  const blocks = plans.map((p, i) => {
+    const beds = p.rooms.some((r) => r.extraBed) ? "extra beds included" : "no extra beds";
+    let block = `*Plan ${i + 1} — ${inr(p.totalPrice)}* _(${p.label})_\n`;
+    block += `${p.roomCount} room${p.roomCount === 1 ? "" : "s"} · ${beds}`;
+    p.rooms.forEach((r, j) => {
+      const occ: string[] = [`${r.adults} adult${r.adults === 1 ? "" : "s"}`];
+      if (r.children > 0) occ.push(`${r.children} child${r.children === 1 ? "" : "ren"}`);
+      let line = `\n• Room ${j + 1}: ${r.roomTypeName} — ${occ.join(", ")}`;
+      if (r.extraBed) line += " + bed";
+      block += line;
+      block += `\n  ${inr(r.pricePerNight)}/night × ${r.nights} night${r.nights === 1 ? "" : "s"} = ${inr(r.totalPrice)}`;
+    });
+    return block;
+  });
+
+  return `🏨 *Your Room Options*\n\n${blocks.join("\n\n")}\n\n_Swipe the cards below to choose_ 👇`;
+}
+
+/**
+ * Send the plan options as a WhatsApp carousel (one card per plan), preceded by
+ * a detailed text breakdown (sent first; its failure is non-fatal). Returns true
+ * on carousel success (caller returns "ALREADY_SENT"); false on any failure or
+ * missing credentials (caller falls back to a text list). Never throws.
+ *
+ * `args.bodyText` is intentionally ignored — the detailed content now lives in
+ * the pre-text, so the carousel body is a short tap CTA.
  */
 export async function trySendPlanCarousel(args: {
   hotelId:  string;
@@ -62,7 +92,7 @@ export async function trySendPlanCarousel(args: {
   plans:    AllocationPlan[];
   bodyText: string;
 }): Promise<boolean> {
-  const { hotelId, guestId, plans, bodyText } = args;
+  const { hotelId, guestId, plans } = args;
   if (plans.length < 2) return false;                          // Meta requires ≥2 cards
   if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
 
@@ -78,6 +108,34 @@ export async function trySendPlanCarousel(args: {
     const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
     if (!phoneNumberId || !encryptedTok) return false;
     const accessToken = decryptWhatsAppToken(encryptedTok);
+
+    // Detailed breakdown FIRST (supplementary — its failure is non-fatal; the
+    // carousel is the required action). Sent as a plain text message.
+    try {
+      const detailText = buildPlanDetailText(plans);
+      const textResp = await sendTextMessage({
+        toPhone: guest.phone, fromPhone: hotel.phone, hotelId, guestId, text: detailText,
+      });
+      const textWamid = (textResp as { messages?: { id?: string }[] } | null)?.messages?.[0]?.id ?? null;
+      const textMsg = await prisma.message.create({
+        data: {
+          direction:   "OUT",
+          fromPhone:   hotel.phone,
+          toPhone:     guest.phone,
+          body:        detailText,
+          messageType: "text",
+          hotelId,
+          guestId,
+          channel:     MessageChannel.WHATSAPP,
+          status:      MessageStatus.SENT,
+          wamid:       textWamid,
+        },
+      });
+      const { emitToHotel } = await import("../../realtime/emit");
+      emitToHotel(hotelId, "message:new", { message: textMsg });
+    } catch (err) {
+      log.warn({ err, hotelId, guestId }, "plan detail text send failed — continuing to carousel");
+    }
 
     // Lead photo per plan's primary room type (isMain first, then lowest order).
     const typeIds = [...new Set(plans.map((p) => p.primaryRoomTypeId).filter(Boolean))];
@@ -100,7 +158,7 @@ export async function trySendPlanCarousel(args: {
       buttonLabel: `Choose Plan ${i + 1}`,
     }));
 
-    const wamid = await sendCarouselMessage(guest.phone, phoneNumberId, accessToken, bodyText, cards);
+    const wamid = await sendCarouselMessage(guest.phone, phoneNumberId, accessToken, "Tap a plan below to select 👇", cards);
 
     const saved = await prisma.message.create({
       data: {
