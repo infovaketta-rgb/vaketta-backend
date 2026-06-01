@@ -43,7 +43,7 @@ export type AraState = {
   guests:          { adults: number; children: number; childrenAges?: number[] };
   selectedRooms:   AllocationRoom[];
   remainingGuests: { adults: number; children: number };
-  phase:           "confirm" | "manual" | "room_menu" | "move_from_count" | "move_to_room" | "plan_selection";
+  phase:           "confirm" | "manual" | "room_menu" | "move_from_count" | "move_to_room" | "change_type_select" | "plan_selection";
   // Structured-modify navigation (all optional — older state shapes stay valid):
   selectedRoomIndex?: number; // which room the guest is editing (room_menu / move_*)
   pendingMove?: { fromRoomIndex: number; adults: number; children: number };
@@ -532,6 +532,58 @@ export function applyMoveGuest(
   return { ok: true, rooms: updated };
 }
 
+/**
+ * Switch a room to a different room TYPE in one step (no remove + re-add). Keeps
+ * the room's occupancy; validates the target type has availability and can hold
+ * the guests, then re-prices and re-derives the extra bed on the new type (a
+ * structural change — like move_guest; the explicit *_extra_bed ops are the
+ * manual override). Rejects (never throws) on a bad index, the same type,
+ * no availability, or an over-cap occupancy.
+ */
+export function applyChangeRoomType(
+  rooms:      AllocationRoom[],
+  roomIndex:  number,
+  target:     AllocationRoomInput,
+  resolveCfg: RoomConfigResolver,
+): ApplyResult {
+  if (!inRange(rooms, roomIndex)) return { ok: false, outOfRange: true, reason: "" };
+  const room = rooms[roomIndex]!;
+  if (target.roomTypeId === room.roomTypeId) return { ok: false, outOfRange: true, reason: "" }; // no-op
+
+  // Availability for the target type (don't count the room being converted).
+  const usedOfTarget = rooms.filter((r, i) => i !== roomIndex && r.roomTypeId === target.roomTypeId).length;
+  if (target.availableCount - usedOfTarget <= 0) {
+    return { ok: false, outOfRange: false, reason: `Sorry, no ${target.name} rooms are available for those dates.` };
+  }
+
+  // Resolve the target type's config (caps + bed/price rules) by probing with
+  // the target type id, then validate the current occupancy fits.
+  const probe: AllocationRoom = { ...room, roomTypeId: target.roomTypeId, roomTypeName: target.name, basePrice: target.basePrice };
+  const cfg = resolveCfg(probe);
+  if (room.adults > cfg.maxAdults) {
+    return { ok: false, outOfRange: false, reason: `${target.name} rooms hold at most ${cfg.maxAdults} adult${cfg.maxAdults === 1 ? "" : "s"}.` };
+  }
+  if (room.children > cfg.maxChildren) {
+    return { ok: false, outOfRange: false, reason: `${target.name} rooms hold at most ${cfg.maxChildren} child${cfg.maxChildren === 1 ? "" : "ren"}.` };
+  }
+
+  const extraBed = room.adults > cfg.baseAdults && cfg.allowExtraBed;
+  const p = computeRoomPricing(target.basePrice, room.adults, extraBed, room.nights, cfg);
+  const changed: AllocationRoom = {
+    ...room,
+    roomTypeId:    target.roomTypeId,
+    roomTypeName:  target.name,
+    basePrice:     target.basePrice,
+    extraBed,
+    extraAdultCost: p.extraAdultCost,
+    extraBedCost:   p.extraBedCost,
+    childAgeLimit:  cfg.childAgeLimit,
+    pricePerNight:  p.pricePerNight,
+    totalPrice:     p.totalPrice,
+  };
+  return { ok: true, rooms: rooms.map((r, i) => (i === roomIndex ? changed : r)) };
+}
+
 // ── Formatting ────────────────────────────────────────────────────────────────
 
 const DIVIDER = "━━━━━━━━━━━━━━━━";
@@ -651,18 +703,21 @@ function occupancyPhrase(room: AllocationRoom): string {
 
 // ── Structured-modify menu (deterministic, AI-free) ──────────────────────────
 
-export type RoomAction = "add_bed" | "remove_bed" | "move_guest" | "remove_room";
+export type RoomAction = "add_bed" | "remove_bed" | "move_guest" | "change_type" | "remove_room";
 
 /**
  * The actions offered for a room, in fixed order. Pure function of the room +
  * its config, so render and handler derive the SAME numbered list without
- * storing the mapping in state.
+ * storing the mapping in state. `change_type` is offered unconditionally (kept
+ * stable across turns — whether other types are actually available is checked
+ * when the guest enters the change-type picker, not here).
  */
 export function roomMenuOptions(room: AllocationRoom, cfg: AllocationConfig): RoomAction[] {
   const opts: RoomAction[] = [];
   if (cfg.allowExtraBed && !room.extraBed) opts.push("add_bed");
   if (room.extraBed)                       opts.push("remove_bed");
   if (room.adults > 0 || room.children > 0) opts.push("move_guest");
+  opts.push("change_type");
   opts.push("remove_room");
   return opts;
 }
@@ -671,6 +726,7 @@ const ROOM_ACTION_LABELS: Record<RoomAction, string> = {
   add_bed:     "Add extra bed",
   remove_bed:  "Remove extra bed",
   move_guest:  "Move a guest out",
+  change_type: "Change room type",
   remove_room: "Remove this room",
 };
 
@@ -733,6 +789,22 @@ export function renderMoveToRoom(
     n++;
     const cfg = resolveCfg(r);
     text += `*${n}.* ${r.roomTypeName} — currently ${r.adults} adults, ${r.children} child (max ${cfg.maxAdults} adults, ${cfg.maxChildren} child)\n`;
+  });
+  text += `${DIVIDER}\nReply *0* to go back · *MENU* to cancel.`;
+  return text;
+}
+
+/** Room types the room can switch to: every type except its current one. Catalog-
+ *  based (stable ordering across turns); availability is validated on apply. */
+function changeTypeCandidates(rooms: AllocationRoomInput[], current: AllocationRoom): AllocationRoomInput[] {
+  return rooms.filter((r) => r.roomTypeId !== current.roomTypeId);
+}
+
+/** New-room-type picker (change_type_select phase). */
+export function renderChangeTypeSelect(room: AllocationRoom, candidates: AllocationRoomInput[], roomIndex: number): string {
+  let text = `Change *Room ${roomIndex + 1}: ${room.roomTypeName}* (currently ${occupancyPhrase(room)}) to which type?\n${DIVIDER}\n`;
+  candidates.forEach((r, i) => {
+    text += `*${i + 1}.* ${r.name}${capHint(r)} _(${r.availableCount} avail)_ — ${inr(r.basePrice)}/night\n`;
   });
   text += `${DIVIDER}\nReply *0* to go back · *MENU* to cancel.`;
   return text;
@@ -1406,6 +1478,19 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
       await persist(deps);
       return renderMoveFromCount(targetRoom, idx);
     }
+    if (action === "change_type") {
+      const candidates = changeTypeCandidates(rooms, targetRoom);
+      if (candidates.length === 0) {
+        return `Sorry, there are no other room types to switch to.\n\n${renderRoomMenu(targetRoom, options, idx)}`;
+      }
+      const ct: AraState = {
+        guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
+        phase: "change_type_select", selectedRoomIndex: idx,
+      };
+      writeState(vars, ct);
+      await persist(deps);
+      return renderChangeTypeSelect(targetRoom, candidates, idx);
+    }
     const res: ApplyResult =
       action === "add_bed"    ? applyAddExtraBed(state.selectedRooms, idx, resolveCfg)
       : action === "remove_bed" ? applyRemoveExtraBed(state.selectedRooms, idx)
@@ -1471,6 +1556,33 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     if (res.ok) return toManual(res.rooms);
     if (res.outOfRange) return renderMoveToRoom(state, pm, fromIdx, resolveCfg);
     return `${res.reason}\n\n${renderMoveToRoom(state, pm, fromIdx, resolveCfg)}`;
+  }
+
+  // ── change_type_select — pick the new room type ────────────────────────────
+  if (state.phase === "change_type_select") {
+    const idx = state.selectedRoomIndex ?? -1;
+    if (!inRange(state.selectedRooms, idx)) return toManual(state.selectedRooms);
+    const targetRoom = state.selectedRooms[idx]!;
+    const candidates = changeTypeCandidates(rooms, targetRoom);
+    const t = input.trim();
+    if (t === "0") {
+      const rm: AraState = {
+        guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
+        phase: "room_menu", selectedRoomIndex: idx,
+      };
+      writeState(vars, rm);
+      await persist(deps);
+      return renderRoomMenu(targetRoom, roomMenuOptions(targetRoom, resolveCfg(targetRoom)), idx);
+    }
+    const sel = parseInt(t, 10);
+    if (!Number.isFinite(sel) || sel < 1 || sel > candidates.length) {
+      return renderChangeTypeSelect(targetRoom, candidates, idx);
+    }
+    const target = candidates[sel - 1]!;
+    const res = applyChangeRoomType(state.selectedRooms, idx, target, resolveCfg);
+    if (res.ok) return toManual(res.rooms);
+    if (res.outOfRange) return renderChangeTypeSelect(targetRoom, candidates, idx);
+    return `${res.reason}\n\n${renderChangeTypeSelect(targetRoom, candidates, idx)}`;
   }
 
   // ── phase "manual" ─────────────────────────────────────────────────────────

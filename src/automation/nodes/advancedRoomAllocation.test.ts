@@ -17,6 +17,8 @@ import {
   applyMoveExtraBed,
   applyRemoveRoom,
   applyMoveGuest,
+  applyChangeRoomType,
+  roomMenuOptions,
   generatePlans,
   renderPlanTextFallback,
   type AdvancedRoomAllocationDeps,
@@ -1307,8 +1309,9 @@ describe("structured modify menu", () => {
 
   // 7. Remove room from the menu → applyRemoveRoom, back to manual.
   it("Case S7: remove room from the menu", async () => {
-    // allowExtraBed=false, has guests → options [move_guest, remove_room] → "2" = remove room.
-    const deps = mk(st("room_menu", [sRoom({}), sRoom({})], { selectedRoomIndex: 0 }), "2", oneType(), { allowExtraBed: false });
+    // option order change: allowExtraBed=false, has guests → [move_guest, change_type, remove_room]
+    // → remove room is now "3" (was "2" before the Change-room-type option was added).
+    const deps = mk(st("room_menu", [sRoom({}), sRoom({})], { selectedRoomIndex: 0 }), "3", oneType(), { allowExtraBed: false });
     await handleAdvancedRoomAllocation(deps);
     const after = readAra(deps);
     expect(after.phase).toBe("manual");
@@ -1621,5 +1624,135 @@ describe("multiple plans carousel", () => {
     expect(result).toMatch(/Choose your room plan/i);
     expect(after.phase).toBe("plan_selection");
     expect(after.plans!.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ── Change room type (one-step, no remove + re-add) ───────────────────────────
+describe("change room type", () => {
+  function cRoom(over: Partial<AllocationRoom> = {}): AllocationRoom {
+    return {
+      roomTypeId: "rt_dlx", roomTypeName: "Deluxe",
+      adults: 2, children: 0, extraBed: false,
+      basePrice: 5000, extraAdultCost: 0, extraBedCost: 0, childAgeLimit: null,
+      pricePerNight: 5000, nights: 2, totalPrice: 10000,
+      ...over,
+    };
+  }
+  const cfgFor = (map: Record<string, Partial<AllocationConfig>>): RoomConfigResolver =>
+    (ar) => ({ ...baseConfig, ...(map[ar.roomTypeId] ?? {}) });
+  function st(phase: AraState["phase"], selectedRooms: AllocationRoom[], extra: Partial<AraState> = {}): AraState {
+    return { guests: { adults: 5, children: 0 }, selectedRooms, remainingGuests: { adults: 0, children: 0 }, phase, ...extra };
+  }
+  const twoTypes = () => [
+    room({ roomTypeId: "rt_dlx", name: "Deluxe",   basePrice: 5000, maxAdults: 3, maxChildren: 1, availableCount: 5 }),
+    room({ roomTypeId: "rt_sup", name: "Superior", basePrice: 6500, maxAdults: 3, maxChildren: 1, availableCount: 5 }),
+  ];
+  const mk = (state: AraState, input: string, rooms = twoTypes(), nodeData: Record<string, unknown> = {}) =>
+    makeDeps({ waitingFor: "answer", nodeData, flowVars: { __araState__: JSON.stringify(state) }, rooms, input });
+  const readAra = (deps: AdvancedRoomAllocationDeps) => JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+
+  // 1. The room menu now offers "Change room type".
+  it("Case CT1: roomMenuOptions includes change_type", () => {
+    expect(roomMenuOptions(cRoom({ adults: 2 }), baseConfig)).toContain("change_type");
+  });
+
+  // 2. Switch Deluxe → Superior: type/name/price change, occupancy kept, re-priced.
+  it("Case CT2: applyChangeRoomType switches the type and reprices", () => {
+    const rooms = [cRoom({ roomTypeId: "rt_dlx", roomTypeName: "Deluxe", adults: 2, basePrice: 5000, pricePerNight: 5000, totalPrice: 10000 })];
+    const target = room({ roomTypeId: "rt_sup", name: "Superior", basePrice: 6500, maxAdults: 3, maxChildren: 1, availableCount: 5 });
+    const res = applyChangeRoomType(rooms, 0, target, cfgFor({ rt_sup: { maxAdults: 3, maxChildren: 1 } }));
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      const r = res.rooms[0]!;
+      expect(r.roomTypeId).toBe("rt_sup");
+      expect(r.roomTypeName).toBe("Superior");
+      expect(r.basePrice).toBe(6500);
+      expect(r.adults).toBe(2);          // occupancy preserved
+      expect(r.extraBed).toBe(false);    // 2 = base → no bed
+      expect(r.pricePerNight).toBe(6500);
+      expect(r.totalPrice).toBe(13000);  // × 2 nights
+    }
+  });
+
+  // 3. Target type can't hold the occupancy → reason, no mutation.
+  it("Case CT3: over-cap target is rejected with a reason", () => {
+    const rooms = [cRoom({ roomTypeId: "rt_dlx", adults: 3 })];
+    const target = room({ roomTypeId: "rt_sup", name: "Superior", maxAdults: 2, availableCount: 5 });
+    const res = applyChangeRoomType(rooms, 0, target, cfgFor({ rt_sup: { maxAdults: 2 } }));
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.outOfRange).toBe(false);
+      expect(res.reason).toContain("at most 2 adults");
+    }
+  });
+
+  // 4. Target type has no availability → reason.
+  it("Case CT4: unavailable target is rejected", () => {
+    const rooms = [cRoom({ roomTypeId: "rt_dlx" })];
+    const target = room({ roomTypeId: "rt_sup", name: "Superior", availableCount: 0 });
+    const res = applyChangeRoomType(rooms, 0, target, cfgFor({}));
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.outOfRange).toBe(false);
+      expect(res.reason).toContain("no Superior rooms");
+    }
+  });
+
+  // 5. Same type → outOfRange (no-op; never offered).
+  it("Case CT5: switching to the same type is outOfRange", () => {
+    const rooms = [cRoom({ roomTypeId: "rt_dlx", roomTypeName: "Deluxe" })];
+    const target = room({ roomTypeId: "rt_dlx", name: "Deluxe", availableCount: 5 });
+    expect(applyChangeRoomType(rooms, 0, target, cfgFor({}))).toMatchObject({ ok: false, outOfRange: true });
+  });
+
+  // 6. room_menu → "Change room type" enters the type picker.
+  it("Case CT6: picking change_type enters change_type_select", async () => {
+    // allowExtraBed off, has guests → options [move_guest, change_type, remove_room] → "2" = change_type.
+    const deps = mk(st("room_menu", [cRoom({ roomTypeId: "rt_dlx", roomTypeName: "Deluxe", adults: 2 })], { selectedRoomIndex: 0 }), "2");
+    const result = await handleAdvancedRoomAllocation(deps);
+    const after = readAra(deps);
+    expect(after.phase).toBe("change_type_select");
+    expect(after.selectedRoomIndex).toBe(0);
+    expect(result).toContain("Superior");      // the other type is offered
+    expect(result).toMatch(/to which type/i);
+  });
+
+  // 7. change_type_select pick → applied, back to manual.
+  it("Case CT7: picking a type switches the room and returns to manual", async () => {
+    const deps = mk(st("change_type_select", [cRoom({ roomTypeId: "rt_dlx", roomTypeName: "Deluxe", adults: 2 })], { selectedRoomIndex: 0 }), "1");
+    await handleAdvancedRoomAllocation(deps);
+    const after = readAra(deps);
+    expect(after.phase).toBe("manual");
+    expect(after.selectedRooms[0]!.roomTypeId).toBe("rt_sup"); // only candidate (Deluxe excluded)
+    expect(after.selectedRooms[0]!.roomTypeName).toBe("Superior");
+    expect(after.selectedRooms[0]!.basePrice).toBe(6500);
+    expect(after.selectedRooms[0]!.adults).toBe(2);            // occupancy preserved
+  });
+
+  // 8. "0" in change_type_select → back to room_menu.
+  it("Case CT8: '0' returns to the room menu", async () => {
+    const deps = mk(st("change_type_select", [cRoom({ roomTypeId: "rt_dlx" })], { selectedRoomIndex: 0 }), "0");
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(readAra(deps).phase).toBe("room_menu");
+    expect(result).toMatch(/What would you like to do/i);
+  });
+
+  // 9. Invalid number → re-show the type picker, no mutation.
+  it("Case CT9: invalid selection re-shows the picker", async () => {
+    const deps = mk(st("change_type_select", [cRoom({ roomTypeId: "rt_dlx" })], { selectedRoomIndex: 0 }), "9");
+    const before = deps.flowData.flowVars["__araState__"];
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(result).toMatch(/to which type/i);
+    expect(deps.flowData.flowVars["__araState__"]).toBe(before); // unchanged
+  });
+
+  // 10. Single-type hotel → change_type dead-ends gracefully, stays in room_menu.
+  it("Case CT10: with only one type, change_type says none available", async () => {
+    const oneType = [room({ roomTypeId: "rt_dlx", name: "Deluxe", basePrice: 5000, availableCount: 5 })];
+    // options [move_guest, change_type, remove_room] → "2" = change_type.
+    const deps = mk(st("room_menu", [cRoom({ roomTypeId: "rt_dlx", roomTypeName: "Deluxe", adults: 2 })], { selectedRoomIndex: 0 }), "2", oneType);
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(result).toMatch(/no other room types/i);
+    expect(readAra(deps).phase).toBe("room_menu"); // unchanged — no dead phase
   });
 });
