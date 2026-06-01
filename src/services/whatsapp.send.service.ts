@@ -6,18 +6,42 @@ const log = logger.child({ service: "whatsapp-send" });
 
 // ── Credentials ───────────────────────────────────────────────────────────────
 
+// Resolving credentials used to hit the DB (hotelConfig.findUnique) + decrypt the
+// token on EVERY outbound message. Credentials change rarely, so we cache the
+// DB-derived part per hotel with a short TTL — saving a query + a decrypt on the
+// hot reply path. Mutations call invalidateCredentialsCache() so a rotated token
+// takes effect immediately; otherwise it self-heals within CRED_TTL_MS.
+const CRED_TTL_MS = 60_000;
+type CachedCreds = { phoneNumberId: string; accessToken: string; expiresAt: number };
+const credCache = new Map<string, CachedCreds>();
+
+/** Drop cached WhatsApp credentials so the next send re-reads them from the DB.
+ *  Call after persisting new metaPhoneNumberId / metaAccessTokenEncrypted. */
+export function invalidateCredentialsCache(hotelId?: string): void {
+  if (hotelId) credCache.delete(hotelId);
+  else credCache.clear();
+}
+
 async function resolveCredentials(hotelId: string): Promise<{
   phoneNumberId: string;
   accessToken:   string;
   mockMode:      boolean;
 }> {
-  // All four credentials come exclusively from the hotel's WhatsApp integration form
-  const config = await prisma.hotelConfig.findUnique({ where: { hotelId } });
+  let cached = credCache.get(hotelId);
+  if (!cached || cached.expiresAt <= Date.now()) {
+    // Credentials come exclusively from the hotel's WhatsApp integration form.
+    const config = await prisma.hotelConfig.findUnique({
+      where:  { hotelId },
+      select: { metaPhoneNumberId: true, metaAccessTokenEncrypted: true },
+    });
+    const phoneNumberId = config?.metaPhoneNumberId ?? "";
+    const encrypted     = config?.metaAccessTokenEncrypted ?? "";
+    const accessToken   = encrypted ? decryptWhatsAppToken(encrypted) : "";
+    cached = { phoneNumberId, accessToken, expiresAt: Date.now() + CRED_TTL_MS };
+    credCache.set(hotelId, cached);
+  }
 
-  const phoneNumberId = config?.metaPhoneNumberId ?? "";
-  const encrypted     = config?.metaAccessTokenEncrypted ?? "";
-  const accessToken   = encrypted ? decryptWhatsAppToken(encrypted) : "";
-
+  const { phoneNumberId, accessToken } = cached;
   const forceMock = process.env.MOCK_WHATSAPP_SEND === "true";
 
   if (forceMock) {

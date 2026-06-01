@@ -66,6 +66,12 @@ export async function logIncomingMessage(
 ): Promise<IncomingMessageResult> {
   const { fromPhone, toPhone, body, messageType, mediaUrl, mimeType, fileName, wamid ,channel = MessageChannel.WHATSAPP} = input;
 
+  // Per-stage timing — surfaced in one structured log line on the full reply path
+  // so slow messages are diagnosable (DB setup vs bot vs Meta send) without guessing.
+  const startedAt = Date.now();
+  let botMs  = 0;
+  let sendMs = 0;
+
   // ── 1. Find hotel ────────────────────────────────────────────────────────────
   const hotel = await resolveHotelByChannel(channel, toPhone);
   if (!hotel) throw new Error(`Hotel not found for channel ${channel}, recipient ${toPhone}`);
@@ -133,16 +139,21 @@ try {
   // ── 4. Usage — count only new 24-hour conversation windows ─────────────────
   // A "new conversation" = first ever message OR last message was >24 h ago.
   // We exclude the message we just created so we're looking at prior history.
+  // These two reads are independent — run them together (a real win once the DB
+  // connection_limit is raised; harmless when it's 1).
   const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const lastMessage = await prisma.message.findFirst({
-    where: {
-      guestId: guest.id,
-      hotelId: hotel.id,
-      id:      { not: inMessage.id },
-    },
-    orderBy: { timestamp: "desc" },
-    select:  { timestamp: true },
-  });
+  const [lastMessage, overQuota] = await Promise.all([
+    prisma.message.findFirst({
+      where: {
+        guestId: guest.id,
+        hotelId: hotel.id,
+        id:      { not: inMessage.id },
+      },
+      orderBy: { timestamp: "desc" },
+      select:  { timestamp: true },
+    }),
+    isConversationOverQuota(hotel.id),
+  ]);
   if (!lastMessage || lastMessage.timestamp < twentyFourHoursAgo) {
     incrementConversationUsage(hotel.id).catch((err) => log.error({ err, hotelId: hotel.id }, "incrementConversationUsage failed"));
   }
@@ -152,7 +163,7 @@ try {
     return { hotelId: hotel.id, guestId: guest.id, autoReply: false, autoReplyMessage: null };
   }
 
-  if (await isConversationOverQuota(hotel.id)) {
+  if (overQuota) {
     log.warn({ hotelId: hotel.id }, "conversation quota exceeded — bot silenced");
     return { hotelId: hotel.id, guestId: guest.id, autoReply: false, autoReplyMessage: null };
   }
@@ -177,12 +188,16 @@ try {
   const BOT_ALREADY_SENT = "ALREADY_SENT";
 
   if (autoReplyMode === "DAY") {
+    const tBot = Date.now();
     const botReply = await botProcess(hotel.id, guest.id, body ?? null);
+    botMs = Date.now() - tBot;
     sentReplyText = botReply === BOT_ALREADY_SENT ? null : botReply;
   }
 
   if (autoReplyMode === "NIGHT") {
+    const tBot = Date.now();
     const botReply = await botProcess(hotel.id, guest.id, body ?? null);
+    botMs = Date.now() - tBot;
     if (botReply === BOT_ALREADY_SENT) {
       // Bot already dispatched its own reply (carousel) — suppress nightMsg too.
       sentReplyText = null;
@@ -208,6 +223,7 @@ try {
     let wamid: string | undefined;
     let finalStatus: MessageStatus = MessageStatus.FAILED;
 
+    const tSend = Date.now();
     try {
       const result = await sendChannelMessage({
         channel,
@@ -222,6 +238,7 @@ try {
     } catch (err) {
       log.error({ err, hotelId: hotel.id, guestId: guest.id }, "bot sendTextMessage failed");
     }
+    sendMs = Date.now() - tSend;
 
     const outMessage = await prisma.message.create({
       data: {
@@ -240,6 +257,19 @@ try {
 
     emitToHotel(hotel.id, "message:new", { message: outMessage });
   }
+
+  log.info(
+    {
+      hotelId: hotel.id,
+      channel,
+      mode:    autoReplyMode,
+      replied: !!sentReplyText,
+      botMs,
+      sendMs,
+      totalMs: Date.now() - startedAt,
+    },
+    "inbound processed",
+  );
 
   return {
     hotelId:          hotel.id,

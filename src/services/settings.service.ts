@@ -5,6 +5,7 @@ import {
   encryptWhatsAppToken,
   decryptWhatsAppToken,
 } from "../utils/encryption.utils";
+import { invalidateCredentialsCache } from "./whatsapp.send.service";
 
 export async function getHotelSettings(hotelId: string) {
   const hotel = await prisma.hotel.findUnique({
@@ -198,6 +199,7 @@ export async function updateWhatsAppConfig(
     update: patch,
     create: { hotelId, ...patch },
   });
+  invalidateCredentialsCache(hotelId); // creds may have changed → drop send-path cache
 
   return getWhatsAppConfig(hotelId);
 }
@@ -275,6 +277,7 @@ export async function connectWhatsAppEmbeddedSignup(
       metaTokenUpdatedAt:       new Date(),
     },
   });
+  invalidateCredentialsCache(hotelId); // creds just rotated → drop send-path cache
   console.log("[embedded-signup] Credentials saved for hotel:", hotelId);
 
   // 4. Trigger history sync — wrapped in its own try/catch that ALWAYS logs
