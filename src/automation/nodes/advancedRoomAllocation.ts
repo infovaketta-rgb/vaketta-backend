@@ -926,17 +926,16 @@ export type AdvancedRoomAllocationDeps = {
   // free-text edits that structured parsing can't. Absent → no AI fallback
   // (manual mode behaves exactly as before).
   interpretModification?: InterpretModificationFn;
-  // OPTIONAL — sends the Phase-1 multi-plan carousel. Absent → Phase 1 falls
-  // back to the text plan list even when multiple plans exist.
-  sendPlanCarousel?: SendPlanCarouselFn;
+  // OPTIONAL — sends the Phase-1 multi-plan interactive list. Absent → Phase 1
+  // falls back to the text plan list even when multiple plans exist.
+  sendPlanList?: SendPlanListFn;
 };
 
-/** Sends the multi-plan carousel; returns true if sent (→ "ALREADY_SENT"). */
-export type SendPlanCarouselFn = (args: {
-  hotelId:  string;
-  guestId:  string;
-  plans:    AllocationPlan[];
-  bodyText: string;
+/** Sends the multi-plan interactive list; returns true if sent (→ "ALREADY_SENT"). */
+export type SendPlanListFn = (args: {
+  hotelId: string;
+  guestId: string;
+  plans:   AllocationPlan[];
 }) => Promise<boolean>;
 
 /** Free-text → one structured allocation-edit op. Mirrors ai.service. */
@@ -1132,7 +1131,7 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
     return renderAllocationSummary(only.rooms, { trailing: confirmPromptFooter(), childrenAges });
   }
 
-  // 2–3 plans → plan_selection: store plans, offer a carousel (fall back to text).
+  // 2–3 plans → plan_selection: store plans, offer an interactive list (fall back to text).
   const planState: AraState = {
     guests:          guestsField,
     selectedRooms:   [],
@@ -1144,9 +1143,8 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
   flowData.waitingFor = "answer";
   await persist(deps);
 
-  const bodyText = "Here are your room options:";
-  if (deps.sendPlanCarousel) {
-    const sent = await deps.sendPlanCarousel({ hotelId, guestId, plans, bodyText });
+  if (deps.sendPlanList) {
+    const sent = await deps.sendPlanList({ hotelId, guestId, plans });
     if (sent) return "ALREADY_SENT";
   }
   return renderPlanTextFallback(plans);

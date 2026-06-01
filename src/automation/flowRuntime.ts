@@ -48,7 +48,7 @@ import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
 import { extractDateWithAI, classifyBookingIntent, interpretAllocationModification } from "../services/ai.service";
 import { handleAdvancedRoomAllocation } from "./nodes/advancedRoomAllocation";
-import { trySendPlanCarousel } from "./nodes/planCarousel";
+import { trySendPlanList } from "./nodes/planList";
 import { aggregateRoomQuantities } from "./bookingAllocation";
 import { randomUUID } from "crypto";
 
@@ -1161,7 +1161,7 @@ export async function executeFlowStep(
           fetchRoomTypes,
           getCalendarData,
           interpretModification: interpretAllocationModification,
-          sendPlanCarousel: trySendPlanCarousel,
+          sendPlanList: trySendPlanList,
         });
       }
 

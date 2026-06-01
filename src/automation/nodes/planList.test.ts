@@ -1,29 +1,26 @@
 /**
- * Tests for planCarousel.ts. The pure buildPlanDetailText cases need no DB/API;
- * the trySendPlanCarousel cases mock prisma + the WhatsApp senders + emit so we
- * can assert ordering (text BEFORE carousel) and the non-fatal text failure.
+ * Tests for planList.ts. The pure buildPlanDetailText cases need no DB/API; the
+ * trySendPlanList cases mock prisma + sendListMessage + emit so we can assert the
+ * single interactive-list send (plan_N rows, messageType "list") and the body
+ * truncation edge case.
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../../db/connect", () => ({
   default: {
-    hotel:     { findUnique: vi.fn() },
-    guest:     { findUnique: vi.fn() },
-    roomPhoto: { findMany:   vi.fn() },
-    message:   { create:     vi.fn() },
+    hotel:   { findUnique: vi.fn() },
+    guest:   { findUnique: vi.fn() },
+    message: { create:     vi.fn() },
   },
 }));
-vi.mock("../../services/whatsapp.send.service", () => ({
-  sendCarouselMessage: vi.fn(),
-  sendTextMessage:     vi.fn(),
-}));
+vi.mock("../../services/whatsapp.send.service", () => ({ sendListMessage: vi.fn() }));
 vi.mock("../../utils/encryption.utils", () => ({ decryptWhatsAppToken: vi.fn(() => "tok") }));
 vi.mock("../../realtime/emit", () => ({ emitToHotel: vi.fn() }));
 
 import prisma from "../../db/connect";
-import { sendCarouselMessage, sendTextMessage } from "../../services/whatsapp.send.service";
-import { buildPlanDetailText, trySendPlanCarousel } from "./planCarousel";
+import { sendListMessage } from "../../services/whatsapp.send.service";
+import { buildPlanDetailText, buildPlanDescription, trySendPlanList } from "./planList";
 import type { AllocationPlan, AllocationRoom } from "./advancedRoomAllocation";
 
 // ── Builders ──────────────────────────────────────────────────────────────────
@@ -49,8 +46,11 @@ function pl(over: Partial<AllocationPlan> = {}): AllocationPlan {
   };
 }
 
+type ListOpts = { bodyText: string; buttonLabel: string; sections: { title: string; rows: { id: string; title: string; description: string }[] }[] };
+const lastListOpts = (): ListOpts => vi.mocked(sendListMessage).mock.calls[0]![3] as ListOpts;
+
 describe("plan detail text", () => {
-  // ── buildPlanDetailText ──────────────────────────────────────────────────────
+  // ── buildPlanDetailText (unchanged) ──────────────────────────────────────────
   // 1. Two plans, no extra beds.
   it("Case PD1: two plans show totals, types, counts, per-night price, 'no extra beds'", () => {
     const plans = [
@@ -92,10 +92,10 @@ describe("plan detail text", () => {
     expect(text).not.toContain("₹60000");
   });
 
-  // 5. Trailing swipe line.
-  it("Case PD5: ends with the swipe CTA", () => {
+  // 5. Trailing CTA line.
+  it("Case PD5: ends with the tap CTA", () => {
     const text = buildPlanDetailText([pl({}), pl({})]);
-    expect(text).toContain("Swipe the cards below to choose");
+    expect(text).toContain("Tap *View Plans* to choose");
     expect(text.trimEnd().endsWith("👇")).toBe(true);
   });
 
@@ -105,7 +105,7 @@ describe("plan detail text", () => {
     expect(buildPlanDetailText(plans)).toBe(buildPlanDetailText(plans));
   });
 
-  // ── trySendPlanCarousel ──────────────────────────────────────────────────────
+  // ── trySendPlanList ──────────────────────────────────────────────────────────
   beforeEach(() => {
     vi.clearAllMocks();
     process.env["MOCK_WHATSAPP_SEND"] = "";
@@ -113,37 +113,48 @@ describe("plan detail text", () => {
       id: "h1", phone: "H", config: { metaPhoneNumberId: "PN", metaAccessTokenEncrypted: "enc" },
     } as never);
     vi.mocked(prisma.guest.findUnique).mockResolvedValue({ phone: "G" } as never);
-    vi.mocked(prisma.roomPhoto.findMany).mockResolvedValue([] as never);
     vi.mocked(prisma.message.create).mockImplementation((async (arg: { data: unknown }) => ({ id: "m", ...(arg.data as object) })) as never);
-    vi.mocked(sendTextMessage).mockResolvedValue({ messages: [{ id: "txt-wamid" }] } as never);
-    vi.mocked(sendCarouselMessage).mockResolvedValue("car-wamid");
+    vi.mocked(sendListMessage).mockResolvedValue("list-wamid");
   });
 
   const twoPlans = (): AllocationPlan[] => [pl({ label: "A" }), pl({ label: "B", rooms: [pr({ adults: 3 }), pr({ adults: 2 })] })];
 
-  // 7. Text persisted BEFORE the carousel.
-  it("Case PD7: detail text is sent + persisted before the carousel", async () => {
-    const ok = await trySendPlanCarousel({ hotelId: "h1", guestId: "g1", plans: twoPlans(), bodyText: "ignored" });
+  // 7. One interactive list, plan_N rows, persisted as messageType "list".
+  it("Case PD7: sends one list with plan_N rows and persists a single 'list' message", async () => {
+    const plans = twoPlans();
+    const ok = await trySendPlanList({ hotelId: "h1", guestId: "g1", plans });
     expect(ok).toBe(true);
+    expect(sendListMessage).toHaveBeenCalledTimes(1);
 
-    const types = vi.mocked(prisma.message.create).mock.calls.map((c) => (c[0] as { data: { messageType: string } }).data.messageType);
-    expect(types[0]).toBe("text");      // text persisted first
-    expect(types[1]).toBe("carousel");  // carousel second
+    const opts = lastListOpts();
+    expect(opts.buttonLabel).toBe("View Plans");
+    expect(opts.sections[0]!.title).toBe("Choose a Plan");
+    const rows = opts.sections[0]!.rows;
+    expect(rows.map((r) => r.id)).toEqual(["plan_0", "plan_1"]);
+    expect(rows[0]!.title.startsWith("Plan 1")).toBe(true);
+    expect(rows[0]!.title.length).toBeLessThanOrEqual(24);
+    expect(rows[1]!.description).toBe(buildPlanDescription(plans[1]!));
+    expect(opts.bodyText).toContain("Your Room Options"); // full breakdown is the body
 
-    // And the text was actually SENT before the carousel.
-    expect(vi.mocked(sendTextMessage).mock.invocationCallOrder[0]!)
-      .toBeLessThan(vi.mocked(sendCarouselMessage).mock.invocationCallOrder[0]!);
+    const calls = vi.mocked(prisma.message.create).mock.calls;
+    expect(calls).toHaveLength(1); // single message, no pre-text
+    expect((calls[0]![0] as { data: { messageType: string } }).data.messageType).toBe("list");
   });
 
-  // 8. Text send failure is non-fatal → carousel still sent, returns true.
-  it("Case PD8: text-send failure still sends the carousel and returns true", async () => {
-    vi.mocked(sendTextMessage).mockRejectedValue(new Error("text boom"));
-    const ok = await trySendPlanCarousel({ hotelId: "h1", guestId: "g1", plans: twoPlans(), bodyText: "ignored" });
-    expect(ok).toBe(true);
-    expect(sendCarouselMessage).toHaveBeenCalledTimes(1);
+  // 8. Body is truncated to ≤1024 chars for very large plans.
+  it("Case PD8: list body truncated to ≤1024 chars", async () => {
+    const manyRooms = Array.from({ length: 40 }, (_, k) => pr({ roomTypeName: `Room Type ${k}`, adults: 3, extraBed: true }));
+    await trySendPlanList({ hotelId: "h1", guestId: "g1", plans: [pl({ label: "Big", rooms: manyRooms }), pl({ label: "B" })] });
+    const { bodyText } = lastListOpts();
+    expect(bodyText.length).toBeLessThanOrEqual(1024);
+    expect(bodyText.endsWith("…")).toBe(true);
+  });
 
-    const types = vi.mocked(prisma.message.create).mock.calls.map((c) => (c[0] as { data: { messageType: string } }).data.messageType);
-    expect(types).toContain("carousel");
-    expect(types).not.toContain("text"); // text persist skipped (send threw first)
+  // 9. Missing credentials → returns false (no send).
+  it("Case PD9: returns false when the hotel has no Meta credentials", async () => {
+    vi.mocked(prisma.hotel.findUnique).mockResolvedValue({ id: "h1", phone: "H", config: {} } as never);
+    const ok = await trySendPlanList({ hotelId: "h1", guestId: "g1", plans: twoPlans() });
+    expect(ok).toBe(false);
+    expect(sendListMessage).not.toHaveBeenCalled();
   });
 });

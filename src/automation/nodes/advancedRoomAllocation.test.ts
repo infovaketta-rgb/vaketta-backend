@@ -32,7 +32,7 @@ import {
   type GetCalendarDataFn,
   type RoomConfigResolver,
 } from "./advancedRoomAllocation";
-import { buildPlanDescription } from "./planCarousel";
+import { buildPlanDescription } from "./planList";
 import type { SerializedFlowNode } from "../flowTypes";
 import type { SessionData } from "../../services/session.service";
 
@@ -1583,38 +1583,38 @@ describe("multiple plans carousel", () => {
   });
 
   // 15. Single-plan path: Phase 1 with one plan → single summary, no plan_selection.
-  it("Case PC15: single plan goes straight to confirm, carousel not triggered", async () => {
-    const sendPlanCarousel = vi.fn(async () => true);
+  it("Case PC15: single plan goes straight to confirm, list not triggered", async () => {
+    const sendPlanList = vi.fn(async () => true);
     const deps = makeDeps({
       flowVars: { bookingAdults: "4", bookingChildren: "0" },
       rooms: [room({ roomTypeId: "rt_a", name: "Standard", basePrice: 5000, availableCount: 5 })],
-      sendPlanCarousel,
+      sendPlanList,
     });
     const result = await handleAdvancedRoomAllocation(deps);
     const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
     expect(after.phase).toBe("confirm");
     expect(result).toMatch(/Suggested Allocation/);
-    expect(sendPlanCarousel).not.toHaveBeenCalled();
+    expect(sendPlanList).not.toHaveBeenCalled();
   });
 
-  // 16. Multi-plan + carousel dep → sends carousel, returns ALREADY_SENT, stores plans.
-  it("Case PC16: multi-plan sends the carousel and returns ALREADY_SENT", async () => {
-    const sendPlanCarousel = vi.fn(async () => true);
+  // 16. Multi-plan + list dep → sends the list, returns ALREADY_SENT, stores plans.
+  it("Case PC16: multi-plan sends the list and returns ALREADY_SENT", async () => {
+    const sendPlanList = vi.fn(async () => true);
     const deps = makeDeps({
       flowVars: { bookingAdults: "6", bookingChildren: "0" },
       rooms: twoTypes(),
-      sendPlanCarousel,
+      sendPlanList,
     });
     const result = await handleAdvancedRoomAllocation(deps);
     const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
     expect(result).toBe("ALREADY_SENT");
-    expect(sendPlanCarousel).toHaveBeenCalledTimes(1);
+    expect(sendPlanList).toHaveBeenCalledTimes(1);
     expect(after.phase).toBe("plan_selection");
     expect(after.plans!.length).toBeGreaterThanOrEqual(2);
   });
 
-  // 17. Multi-plan, no carousel dep → text fallback returned, plans stored.
-  it("Case PC17: multi-plan without carousel dep falls back to text", async () => {
+  // 17. Multi-plan, no list dep → text fallback returned, plans stored.
+  it("Case PC17: multi-plan without list dep falls back to text", async () => {
     const deps = makeDeps({
       flowVars: { bookingAdults: "6", bookingChildren: "0" },
       rooms: twoTypes(),
