@@ -16,6 +16,7 @@
 import prisma from "../db/connect";
 import { buildMenuMessage, buildMenuListPayload } from "./buildMenuResponse";
 import { getOrCreateSession, updateSession, resetSession, SessionData } from "../services/session.service";
+import { getHotelConfigCached } from "../services/settings.service";
 import { executeFlowStep } from "./flowRuntime";
 import { getAIReply } from "../services/ai.service";
 import { incrementAIUsage } from "../services/usage.service";
@@ -84,7 +85,7 @@ async function showMenu(
   sessionData: SessionData,
   input: string
 ): Promise<string | null> {
-  const cfg = await prisma.hotelConfig.findUnique({ where: { hotelId } });
+  const cfg = await getHotelConfigCached(hotelId);
   const menuFlowId = (cfg as any)?.menuFlowId as string | null | undefined;
 
   if (menuFlowId) {
@@ -168,7 +169,7 @@ async function handleSelection(
     }
 
     // Unknown input — try AI fallback if enabled
-    const cfg = await prisma.hotelConfig.findUnique({ where: { hotelId } });
+    const cfg = await getHotelConfigCached(hotelId);
     if ((cfg as any)?.aiEnabled) {
       const aiResult = await getAIReply(hotelId, guestId, input);
       if (aiResult) {
@@ -206,7 +207,7 @@ async function handleSelection(
     // Prefer the item's own flowId; fall back to hotel-wide bookingFlowId
     let flowId = item.flowId ?? null;
     if (!flowId) {
-      const config = await prisma.hotelConfig.findUnique({ where: { hotelId }, select: { bookingFlowId: true } });
+      const config = await getHotelConfigCached(hotelId);
       flowId = config?.bookingFlowId ?? null;
     }
 

@@ -20,6 +20,7 @@ import {
   unsubscribeIgWebhook,
   getPlatformSettings,
   updatePlatformSettings,
+  invalidateHotelConfigCache,
 } from "../services/settings.service";
 import { invalidatePromptCache } from "../services/ai.service";
 import prisma from "../db/connect";
@@ -66,6 +67,7 @@ export async function patchSettings(req: Request, res: Response) {
       ...(aiInstructions       !== undefined && { aiInstructions: aiInstructions || null }),
     });
 
+    invalidateHotelConfigCache(hotelId(req));
     invalidatePromptCache(hotelId(req));
     res.json(config);
   } catch (err: any) {
@@ -138,6 +140,7 @@ export async function patchBotMessages(req: Request, res: Response) {
   try {
     const messages = req.body as Record<string, string>;
     const config = await updateBotMessages(hotelId(req), messages);
+    invalidateHotelConfigCache(hotelId(req));
     res.json(config);
   } catch (err: any) {
     res.status(500).json({ error: err.message });

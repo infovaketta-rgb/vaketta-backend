@@ -46,6 +46,7 @@ import { sendCarouselMessage, sendMediaMessage, sendListMessage, type CarouselCa
 import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
+import { getHotelConfigCached } from "../services/settings.service";
 import { extractDateWithAI, classifyBookingIntent, interpretAllocationModification } from "../services/ai.service";
 import { handleAdvancedRoomAllocation } from "./nodes/advancedRoomAllocation";
 import { trySendPlanList } from "./nodes/planList";
@@ -485,16 +486,7 @@ export async function executeFlowStep(
 
   // Fetch hotel config once — used for both system-var injection (timezone) and
   // the business-hours gate inside advance().
-  const hotelCfg = await prisma.hotelConfig.findUnique({
-    where:  { hotelId },
-    select: {
-      autoReplyEnabled:  true,
-      businessStartHour: true,
-      businessEndHour:   true,
-      timezone:          true,
-      allDay:            true,
-    },
-  });
+  const hotelCfg = await getHotelConfigCached(hotelId);
 
   // ── Inject system variables (available in every flow, every node) ────────────
   // These are read-only runtime values. They're injected once per execution so

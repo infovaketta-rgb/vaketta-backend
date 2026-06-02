@@ -1,5 +1,12 @@
 import prisma from "../db/connect";
+import { redis } from "../queue/redis";
+import { logger } from "../utils/logger";
 import { SerializedFlowNode, SerializedFlowEdge } from "../automation/flowTypes";
+
+const log = logger.child({ service: "flow-service" });
+
+const FLOW_TTL = 300; // 5 minutes
+const flowKey  = (flowId: string) => `flow:published:${flowId}`;
 
 // ── DTOs ──────────────────────────────────────────────────────────────────────
 
@@ -279,21 +286,50 @@ export async function listVersions(id: string, hotelId: string) {
 export async function getPublishedNodes(
   flowId: string
 ): Promise<{ nodes: SerializedFlowNode[]; edges: SerializedFlowEdge[] } | null> {
-  const flow = await prisma.flowDefinition.findUnique({ where: { id: flowId } });
-  if (!flow || !flow.isActive) return null;
-
-  if (flow.publishedVersionId) {
-    const version = await prisma.flowVersion.findUnique({ where: { id: flow.publishedVersionId } });
-    if (version) {
-      return {
-        nodes: Array.isArray(version.nodes) ? (version.nodes as unknown as SerializedFlowNode[]) : [],
-        edges: Array.isArray(version.edges) ? (version.edges as unknown as SerializedFlowEdge[]) : [],
-      };
+  // Redis read-through cache — avoids a Postgres round-trip on every hop
+  try {
+    const cached = await redis.get(flowKey(flowId));
+    if (cached !== null) {
+      return JSON.parse(cached) as { nodes: SerializedFlowNode[]; edges: SerializedFlowEdge[] } | null;
     }
+  } catch (err) {
+    log.warn({ err, flowId }, "flow cache GET failed — falling back to Postgres");
   }
 
-  return {
-    nodes: Array.isArray(flow.nodes) ? (flow.nodes as unknown as SerializedFlowNode[]) : [],
-    edges: Array.isArray(flow.edges) ? (flow.edges as unknown as SerializedFlowEdge[]) : [],
-  };
+  const flow = await prisma.flowDefinition.findUnique({ where: { id: flowId } });
+
+  let final: { nodes: SerializedFlowNode[]; edges: SerializedFlowEdge[] } | null;
+  if (!flow || !flow.isActive) {
+    final = null;
+  } else if (flow.publishedVersionId) {
+    const version = await prisma.flowVersion.findUnique({ where: { id: flow.publishedVersionId } });
+    final = version
+      ? {
+          nodes: Array.isArray(version.nodes) ? (version.nodes as unknown as SerializedFlowNode[]) : [],
+          edges: Array.isArray(version.edges) ? (version.edges as unknown as SerializedFlowEdge[]) : [],
+        }
+      : {
+          nodes: Array.isArray(flow.nodes) ? (flow.nodes as unknown as SerializedFlowNode[]) : [],
+          edges: Array.isArray(flow.edges) ? (flow.edges as unknown as SerializedFlowEdge[]) : [],
+        };
+  } else {
+    final = {
+      nodes: Array.isArray(flow.nodes) ? (flow.nodes as unknown as SerializedFlowNode[]) : [],
+      edges: Array.isArray(flow.edges) ? (flow.edges as unknown as SerializedFlowEdge[]) : [],
+    };
+  }
+
+  // Backfill cache (null result also cached to avoid thundering-herd on inactive flows)
+  redis.set(flowKey(flowId), JSON.stringify(final), "EX", FLOW_TTL).catch((err) =>
+    log.warn({ err, flowId }, "flow cache SET failed")
+  );
+
+  return final;
+}
+
+/** Call after any write that changes what getPublishedNodes returns for a flow. */
+export function invalidateFlowCache(flowId: string): void {
+  redis.del(flowKey(flowId)).catch((err) =>
+    log.warn({ err, flowId }, "flow cache DEL failed")
+  );
 }

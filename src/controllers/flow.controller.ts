@@ -3,6 +3,7 @@ import {
   getHotelFlows, getHotelFlow, createHotelFlow, updateHotelFlow, deleteHotelFlow,
   getAllFlows, getAdminFlow, createAdminFlow, updateAdminFlow, deleteAdminFlow,
   saveDraft, publishDraft, rollbackToVersion, listVersions,
+  invalidateFlowCache,
 } from "../services/flow.service";
 
 // ── Hotel-facing handlers ─────────────────────────────────────────────────────
@@ -45,6 +46,7 @@ export async function updateHotelFlowHandler(req: Request, res: Response) {
     const hotelId = (req as any).user.hotelId as string;
     const { name, description, nodes, edges, isActive } = req.body;
     const flow = await updateHotelFlow(req.params["id"]!, hotelId, { name, description, nodes, edges, isActive });
+    invalidateFlowCache(req.params["id"]!);
     res.json(flow);
   } catch (err: any) {
     const status = err.message.includes("access denied") ? 403 : 500;
@@ -71,6 +73,7 @@ export async function saveDraftHandler(req: Request, res: Response) {
     const userName = (req as any).user.name   as string | undefined;
     const { name, nodes, edges } = req.body;
     const flow = await saveDraft(req.params["id"]!, hotelId, { name, nodes, edges, ...(userName && { userName }) });
+    invalidateFlowCache(req.params["id"]!);
     res.json(flow);
   } catch (err: any) {
     const status = err.message.includes("access denied") ? 403 : 500;
@@ -82,6 +85,7 @@ export async function publishDraftHandler(req: Request, res: Response) {
   try {
     const hotelId = (req as any).user.hotelId as string;
     const flow = await publishDraft(req.params["id"]!, hotelId);
+    invalidateFlowCache(req.params["id"]!);
     res.json(flow);
   } catch (err: any) {
     const status = err.message.includes("access denied") ? 403
@@ -163,6 +167,7 @@ export async function adminUpdateFlowHandler(req: Request, res: Response) {
       name, description, nodes, edges, isActive, isTemplate,
       ...(hotelId !== undefined && { hotelId: hotelId === null ? null : hotelId }),
     });
+    invalidateFlowCache(req.params["id"]!);
     res.json(flow);
   } catch (err: any) {
     res.status(500).json({ error: err.message });

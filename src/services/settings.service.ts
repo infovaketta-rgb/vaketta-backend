@@ -1,4 +1,6 @@
 import prisma from "../db/connect";
+import { redis } from "../queue/redis";
+import { logger } from "../utils/logger";
 import {
   encryptInstagramToken,
   decryptInstagramToken,
@@ -6,6 +8,37 @@ import {
   decryptWhatsAppToken,
 } from "../utils/encryption.utils";
 import { invalidateCredentialsCache } from "./whatsapp.send.service";
+
+const log = logger.child({ service: "settings-service" });
+
+const CONFIG_TTL   = 300; // 5 minutes
+const configKey    = (hotelId: string) => `hotelConfig:${hotelId}`;
+
+type HotelConfigRow = Awaited<ReturnType<typeof prisma.hotelConfig.findUnique>>;
+
+/** Read-through cache for hotelConfig. Returns null when no config row exists. */
+export async function getHotelConfigCached(hotelId: string): Promise<HotelConfigRow> {
+  try {
+    const raw = await redis.get(configKey(hotelId));
+    if (raw !== null) return JSON.parse(raw) as HotelConfigRow;
+  } catch (err) {
+    log.warn({ err, hotelId }, "hotelConfig cache GET failed — falling back to Postgres");
+  }
+
+  const record = await prisma.hotelConfig.findUnique({ where: { hotelId } });
+
+  redis.set(configKey(hotelId), JSON.stringify(record), "EX", CONFIG_TTL).catch((err) =>
+    log.warn({ err, hotelId }, "hotelConfig cache SET failed")
+  );
+  return record;
+}
+
+/** Call after any write that changes hotelConfig. */
+export function invalidateHotelConfigCache(hotelId: string): void {
+  redis.del(configKey(hotelId)).catch((err) =>
+    log.warn({ err, hotelId }, "hotelConfig cache DEL failed")
+  );
+}
 
 export async function getHotelSettings(hotelId: string) {
   const hotel = await prisma.hotel.findUnique({
