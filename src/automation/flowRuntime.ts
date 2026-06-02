@@ -21,7 +21,7 @@ import prisma from "../db/connect";
 import { logger } from "../utils/logger";
 
 const log = logger.child({ service: "flow-runtime" });
-import { updateSession, resetSession, SessionData } from "../services/session.service";
+import { updateSession as updateSessionDb, resetSession as resetSessionDb, SessionData } from "../services/session.service";
 import { buildMenuMessage } from "./buildMenuResponse";
 import { checkRoomAvailability, getCalendarData } from "../services/availability.service";
 import {
@@ -457,7 +457,7 @@ export async function executeFlowStep(
 
   const flowContent = await getPublishedNodes(flowId);
   if (!flowContent) {
-    await resetSession(guestId, hotelId);
+    await resetSessionDb(guestId, hotelId);
     return safeMenu(hotelId);
   }
 
@@ -525,7 +525,37 @@ export async function executeFlowStep(
     };
   }
 
-  return advance(nodeId);
+  // ── Session-write batching ──────────────────────────────────────────────────
+  // A single flow turn can hop through many auto-advancing nodes, each of which
+  // used to persist the session to Postgres (connection_limit=1 → these writes
+  // serialise and dominate reply latency). Defer every per-node write and flush
+  // ONCE at the end of the turn. The final persisted state is identical to the
+  // old per-node behaviour — last write wins, and nothing re-reads the session
+  // mid-turn (all live state is the in-memory `flowData`). These local
+  // updateSession/resetSession SHADOW the DB writers, so every existing call site
+  // inside advance() — and the deps handed to handleAdvancedRoomAllocation —
+  // stages instead of writing. resetSession wins over a staged write (a flow
+  // reset must not be resurrected by a buffered FLOW state).
+  let pendingSession: { state: string; data: SessionData } | null = null;
+  let sessionWasReset = false;
+  const updateSession = async (_g: string, _h: string, st: string, dt: SessionData): Promise<void> => {
+    pendingSession  = { state: st, data: dt };
+    sessionWasReset = false;
+  };
+  const resetSession = async (_g: string, _h: string): Promise<void> => {
+    pendingSession  = null;
+    sessionWasReset = true;
+  };
+
+  const reply = await advance(nodeId);
+
+  const flush = pendingSession as { state: string; data: SessionData } | null;
+  if (sessionWasReset) {
+    await resetSessionDb(guestId, hotelId);
+  } else if (flush) {
+    await updateSessionDb(guestId, hotelId, flush.state, flush.data);
+  }
+  return reply;
 
   async function advance(currentNodeId: string): Promise<string | null> {
     if (++hops > MAX_HOPS) {
