@@ -76,34 +76,42 @@ export async function logIncomingMessage(
   const hotel = await resolveHotelByChannel(channel, toPhone);
   if (!hotel) throw new Error(`Hotel not found for channel ${channel}, recipient ${toPhone}`);
 
-  // ── Deduplication: Meta re-delivers webhooks on timeout — skip if already seen ─
-  if (wamid) {
-    const existing = await prisma.message.findFirst({ where: { wamid, hotelId: hotel.id } });
-    if (existing) {
-      return { hotelId: hotel.id, guestId: existing.guestId!, autoReply: false, autoReplyMessage: null };
+  // ── 2+dedup. Guest upsert + dedup check in parallel ─────────────────────────
+  // Dedup only needs (wamid, hotelId) — independent of the guest record.
+  // guest.upsert only needs (fromPhone, hotelId) — independent of dedup.
+  // Both depend on hotel.id, so they run together after resolveHotelByChannel.
+  let guestRaw: Awaited<ReturnType<typeof prisma.guest.upsert>> | null = null;
+  let existing: Awaited<ReturnType<typeof prisma.message.findFirst>> | undefined;
+
+  try {
+    [guestRaw, existing] = await Promise.all([
+      prisma.guest.upsert({
+        where:  { phone_hotelId: { phone: fromPhone, hotelId: hotel.id } },
+        update: {},
+        create: { phone: fromPhone, hotelId: hotel.id },
+      }),
+      wamid
+        ? prisma.message.findFirst({ where: { wamid, hotelId: hotel.id } })
+        : Promise.resolve(undefined),
+    ]);
+  } catch (err: any) {
+    if (err?.code === "P2002") {
+      // Race condition on upsert — fetch the guest that beat us to it
+      guestRaw = await prisma.guest.findUnique({
+        where: { phone_hotelId: { phone: fromPhone, hotelId: hotel.id } },
+      });
+      if (!guestRaw) throw err;
+    } else {
+      throw err;
     }
   }
 
-  // ── 2. Find or create guest (per-hotel scope) ────────────────────────────────
-  // Replace the guest upsert with this retry-safe version
-let guest;
-try {
-  guest = await prisma.guest.upsert({
-    where:  { phone_hotelId: { phone: fromPhone, hotelId: hotel.id } },
-    update: {},
-    create: { phone: fromPhone, hotelId: hotel.id },
-  });
-} catch (err: any) {
-  if (err?.code === "P2002") {
-    // Race condition — another job created the guest, just fetch it
-    guest = await prisma.guest.findUnique({
-      where: { phone_hotelId: { phone: fromPhone, hotelId: hotel.id } },
-    });
-    if (!guest) throw err;
-  } else {
-    throw err;
+  // Deduplication early-exit (preserved from before)
+  if (existing) {
+    return { hotelId: hotel.id, guestId: existing.guestId!, autoReply: false, autoReplyMessage: null };
   }
-}
+
+  const guest = guestRaw!;
 
   // Skip saving if message has no content at all
   if (!body && !mediaUrl) {
