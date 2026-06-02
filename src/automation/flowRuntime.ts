@@ -549,11 +549,13 @@ export async function executeFlowStep(
 
   const reply = await advance(nodeId);
 
+  // Postgres backup write — session.service already wrote Redis on the critical
+  // path; this keeps Postgres in sync without blocking the reply.
   const flush = pendingSession as { state: string; data: SessionData } | null;
   if (sessionWasReset) {
-    await resetSessionDb(guestId, hotelId);
+    resetSessionDb(guestId, hotelId).catch((err) => log.error({ err, guestId, hotelId }, "session reset backup failed"));
   } else if (flush) {
-    await updateSessionDb(guestId, hotelId, flush.state, flush.data);
+    updateSessionDb(guestId, hotelId, flush.state, flush.data).catch((err) => log.error({ err, guestId, hotelId }, "session update backup failed"));
   }
   return reply;
 
