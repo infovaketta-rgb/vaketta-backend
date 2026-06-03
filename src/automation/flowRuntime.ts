@@ -392,7 +392,7 @@ const trySendRoomTypeCarousel: SendRoomCarouselFn = async ({ hotelId, guestId, r
       roomTypes: roomInputs.map((r) => ({ id: r.roomTypeId, maxAdults: r.maxAdults })),
     }, "carousel: entered");
 
-    const eligible = roomInputs.filter((r) => r.maxAdults == null || r.maxAdults >= adults);
+    const eligible = roomInputs.filter((r) => r.availableCount > 0);
     log.info({ eligibleCount: eligible.length, adults }, "carousel: after filter");
     if (eligible.length === 0) return false;
 
