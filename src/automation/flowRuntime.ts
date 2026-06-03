@@ -386,7 +386,14 @@ const trySendRoomTypeCarousel: SendRoomCarouselFn = async ({ hotelId, guestId, r
   if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
 
   try {
+    log.info({
+      adults,
+      roomInputsCount: roomInputs.length,
+      roomTypes: roomInputs.map((r) => ({ id: r.roomTypeId, maxAdults: r.maxAdults })),
+    }, "carousel: entered");
+
     const eligible = roomInputs.filter((r) => r.maxAdults == null || r.maxAdults >= adults);
+    log.info({ eligibleCount: eligible.length, adults }, "carousel: after filter");
     if (eligible.length === 0) return false;
 
     const [hotel, guest] = await Promise.all([
@@ -428,6 +435,8 @@ const trySendRoomTypeCarousel: SendRoomCarouselFn = async ({ hotelId, guestId, r
         buttonLabel: "View Plans",
       };
     });
+
+    log.info({ cardsCount: cards.length }, "carousel: cards built");
 
     const wamid = await sendCarouselMessage(
       guest.phone, phoneNumberId, accessToken,
