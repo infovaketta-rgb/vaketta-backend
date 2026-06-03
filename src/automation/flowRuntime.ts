@@ -386,7 +386,7 @@ const trySendRoomTypeCarousel: SendRoomCarouselFn = async ({ hotelId, guestId, r
   if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
 
   try {
-    const eligible = roomInputs.filter((r) => (r.maxAdults ?? 0) >= adults);
+    const eligible = roomInputs.filter((r) => r.maxAdults == null || r.maxAdults >= adults);
     if (eligible.length === 0) return false;
 
     const [hotel, guest] = await Promise.all([

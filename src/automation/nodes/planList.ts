@@ -174,7 +174,7 @@ export async function trySendPlanList(args: {
 
     // Section 2 — individual room types (one row per eligible type)
     const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
-    const roomRows = (eligibleRoomInputs ?? []).map((r) => ({
+    const roomRows = (eligibleRoomInputs ?? []).filter((r) => r.availableCount > 0).map((r) => ({
       id:          `room_TYPE:${r.roomTypeId}`,
       title:       r.name.slice(0, 24),
       description: `${inr(r.basePrice)}/night`,

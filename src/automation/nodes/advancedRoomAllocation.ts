@@ -1160,7 +1160,7 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
 
   // Message 1 — room type carousel (fire-and-forget on failure; plan list still follows)
   if (deps.sendRoomCarousel) {
-    await deps.sendRoomCarousel({ hotelId, guestId, roomInputs, adults }).catch(() => {});
+    await deps.sendRoomCarousel({ hotelId, guestId, roomInputs, adults });
   }
 
   // Message 2 — plan list
@@ -1397,8 +1397,11 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
           await persist(deps);
           return renderAllocationSummary(singlePlan, { trailing: confirmPromptFooter(), childrenAges: state.guests.childrenAges });
         }
+        // allocateRooms returned null — that room type can't house the guests on those dates
+        const typeName = single[0]?.name ?? "That room type";
+        return `Sorry, *${typeName}* is not available for your selected dates. Please choose another option.\n\n${renderPlanTextFallback(plans)}`;
       }
-      // Room type not found or can't house guests → fall through to re-show the list
+      // Room type id not found in state — re-show the list
       return renderPlanTextFallback(plans);
     }
 
