@@ -48,7 +48,7 @@ import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
 import { getHotelConfigCached } from "../services/settings.service";
 import { extractDateWithAI, classifyBookingIntent, interpretAllocationModification } from "../services/ai.service";
-import { handleAdvancedRoomAllocation } from "./nodes/advancedRoomAllocation";
+import { handleAdvancedRoomAllocation, type AllocationRoomInput, type SendRoomCarouselFn } from "./nodes/advancedRoomAllocation";
 import { trySendPlanList } from "./nodes/planList";
 import { aggregateRoomQuantities } from "./bookingAllocation";
 import { randomUUID } from "crypto";
@@ -376,6 +376,89 @@ async function trySendOptionsList(args: {
     return false;
   }
 }
+
+// ── ARA room-type carousel sender ─────────────────────────────────────────────
+// Sent as Message 1 before the plan list. One card per eligible room type
+// (maxAdults >= adults). Button id uses "room_TYPE:{roomTypeId}" so the
+// plan_selection handler can distinguish it from the show_rooms "room_{id}" buttons.
+
+const trySendRoomTypeCarousel: SendRoomCarouselFn = async ({ hotelId, guestId, roomInputs, adults }) => {
+  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
+
+  try {
+    const eligible = roomInputs.filter((r) => (r.maxAdults ?? 0) >= adults);
+    if (eligible.length === 0) return false;
+
+    const [hotel, guest] = await Promise.all([
+      prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
+      prisma.guest.findUnique({ where: { id: guestId } }),
+    ]);
+    if (!hotel || !guest) return false;
+
+    const cfg = hotel.config;
+    const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
+    const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
+    if (!phoneNumberId || !encryptedTok) return false;
+    const accessToken = decryptWhatsAppToken(encryptedTok);
+
+    // Lead photo per room type (isMain first, then lowest order)
+    const photos = await prisma.roomPhoto.findMany({
+      where:   { roomTypeId: { in: eligible.map((r) => r.roomTypeId) } },
+      orderBy: [{ isMain: "desc" }, { order: "asc" }],
+      select:  { roomTypeId: true, url: true },
+    });
+    const photoByType = new Map<string, string>();
+    for (const p of photos) {
+      if (!photoByType.has(p.roomTypeId)) photoByType.set(p.roomTypeId, p.url);
+    }
+
+    const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
+    const cards: CarouselCard[] = eligible.slice(0, 10).map((r) => {
+      const baseA = r.baseAdults  ?? 2;
+      const maxA  = r.maxAdults   ?? baseA;
+      const maxC  = r.maxChildren ?? 0;
+      const cap   = maxC > 0 ? `Up to ${maxA} adults, ${maxC} children` : `Up to ${maxA} adults`;
+      const desc  = `${cap} · ${inr(r.basePrice)}/night`;
+      return {
+        imageUrl:    photoByType.get(r.roomTypeId) ?? CAROUSEL_FALLBACK_IMAGE,
+        title:       r.name,
+        price:       r.basePrice,
+        description: desc.slice(0, 60),
+        buttonId:    `room_TYPE:${r.roomTypeId}`,
+        buttonLabel: "View Plans",
+      };
+    });
+
+    const wamid = await sendCarouselMessage(
+      guest.phone, phoneNumberId, accessToken,
+      "🏨 *Choose a room type:*",
+      cards,
+    );
+
+    const saved = await prisma.message.create({
+      data: {
+        direction:   "OUT",
+        fromPhone:   hotel.phone,
+        toPhone:     guest.phone,
+        body:        JSON.stringify({ cards }),
+        messageType: "carousel",
+        hotelId,
+        guestId,
+        channel:     MessageChannel.WHATSAPP,
+        status:      MessageStatus.SENT,
+        wamid,
+      },
+    });
+
+    const { emitToHotel } = await import("../realtime/emit");
+    emitToHotel(hotelId, "message:new", { message: saved });
+
+    return true;
+  } catch (err) {
+    log.warn({ err, hotelId, guestId }, "ARA room carousel send failed — skipping");
+    return false;
+  }
+};
 
 // ── Room type fetcher ──────────────────────────────────────────────────────────
 
@@ -1185,7 +1268,8 @@ export async function executeFlowStep(
           fetchRoomTypes,
           getCalendarData,
           interpretModification: interpretAllocationModification,
-          sendPlanList: trySendPlanList,
+          sendPlanList:     trySendPlanList,
+          sendRoomCarousel: trySendRoomTypeCarousel,
         });
       }
 

@@ -14,7 +14,7 @@ vi.mock("../../db/connect", () => ({
     message: { create:     vi.fn() },
   },
 }));
-vi.mock("../../services/whatsapp.send.service", () => ({ sendListMessage: vi.fn() }));
+vi.mock("../../services/whatsapp.send.service", () => ({ sendListMessage: vi.fn(), sendTextMessage: vi.fn() }));
 vi.mock("../../utils/encryption.utils", () => ({ decryptWhatsAppToken: vi.fn(() => "tok") }));
 vi.mock("../../realtime/emit", () => ({ emitToHotel: vi.fn() }));
 
@@ -141,13 +141,40 @@ describe("plan detail text", () => {
     expect((calls[0]![0] as { data: { messageType: string } }).data.messageType).toBe("list");
   });
 
-  // 8. Body is truncated to ≤1024 chars for very large plans.
-  it("Case PD8: list body truncated to ≤1024 chars", async () => {
-    const manyRooms = Array.from({ length: 40 }, (_, k) => pr({ roomTypeName: `Room Type ${k}`, adults: 3, extraBed: true }));
-    await trySendPlanList({ hotelId: "h1", guestId: "g1", plans: [pl({ label: "Big", rooms: manyRooms }), pl({ label: "B" })] });
+  // 8. Large plans are chunked — list button on last chunk, details not truncated with "…".
+  it("Case PD8: large plans chunked — list button on last chunk, no truncation", async () => {
+    // Use 3 plans each with enough rooms that the combined body exceeds 1024 chars.
+    const bigRooms = Array.from({ length: 6 }, (_, k) => pr({ roomTypeName: `Type ${k}`, adults: 3, extraBed: true }));
+    const plans = [
+      pl({ label: "A", rooms: bigRooms }),
+      pl({ label: "B", rooms: bigRooms }),
+      pl({ label: "C", rooms: bigRooms }),
+    ];
+    await trySendPlanList({ hotelId: "h1", guestId: "g1", plans });
+
+    // sendListMessage called exactly once (for the final chunk)
+    expect(sendListMessage).toHaveBeenCalledTimes(1);
+
+    // Final chunk bodyText ≤1024 and does NOT end with "…" (no truncation)
     const { bodyText } = lastListOpts();
     expect(bodyText.length).toBeLessThanOrEqual(1024);
-    expect(bodyText.endsWith("…")).toBe(true);
+    expect(bodyText.endsWith("…")).toBe(false);
+
+    // At least one plain-text message was sent before the list
+    const creates = vi.mocked(prisma.message.create).mock.calls;
+    const textChunks = creates.filter(
+      (c) => (c[0] as { data: { messageType: string } }).data.messageType === "text"
+    );
+    expect(textChunks.length).toBeGreaterThan(0);
+
+    // All plan labels appear somewhere across all sent content
+    const allText = [
+      ...textChunks.map((c) => (c[0] as { data: { body: string } }).data.body),
+      bodyText,
+    ].join("\n");
+    for (const p of plans) {
+      expect(allText).toContain(p.label);
+    }
   });
 
   // 9. Missing credentials → returns false (no send).

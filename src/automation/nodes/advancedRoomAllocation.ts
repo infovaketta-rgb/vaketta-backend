@@ -48,8 +48,9 @@ export type AraState = {
   selectedRoomIndex?: number; // which room the guest is editing (room_menu / move_*)
   pendingMove?: { fromRoomIndex: number; adults: number; children: number };
   // Multi-plan selection (Phase 1 carousel):
-  plans?:             AllocationPlan[]; // candidate plans offered to the guest
-  selectedPlanIndex?: number;           // which plan the guest chose
+  plans?:               AllocationPlan[];      // candidate plans offered to the guest
+  selectedPlanIndex?:   number;                // which plan the guest chose
+  eligibleRoomInputs?:  AllocationRoomInput[]; // room types used to build plans (for single-type selection)
 };
 
 /** One candidate allocation plan offered in the Phase-1 carousel. */
@@ -929,13 +930,25 @@ export type AdvancedRoomAllocationDeps = {
   // OPTIONAL — sends the Phase-1 multi-plan interactive list. Absent → Phase 1
   // falls back to the text plan list even when multiple plans exist.
   sendPlanList?: SendPlanListFn;
+  // OPTIONAL — sends the room-type carousel that precedes the plan list.
+  // Absent → carousel step is skipped silently.
+  sendRoomCarousel?: SendRoomCarouselFn;
 };
 
 /** Sends the multi-plan interactive list; returns true if sent (→ "ALREADY_SENT"). */
 export type SendPlanListFn = (args: {
-  hotelId: string;
-  guestId: string;
-  plans:   AllocationPlan[];
+  hotelId:             string;
+  guestId:             string;
+  plans:               AllocationPlan[];
+  eligibleRoomInputs?: AllocationRoomInput[];
+}) => Promise<boolean>;
+
+/** Sends the room-type carousel that precedes the plan list. Returns true if sent. */
+export type SendRoomCarouselFn = (args: {
+  hotelId:    string;
+  guestId:    string;
+  roomInputs: AllocationRoomInput[];
+  adults:     number;
 }) => Promise<boolean>;
 
 /** Free-text → one structured allocation-edit op. Mirrors ai.service. */
@@ -1131,20 +1144,28 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
     return renderAllocationSummary(only.rooms, { trailing: confirmPromptFooter(), childrenAges });
   }
 
-  // 2–3 plans → plan_selection: store plans, offer an interactive list (fall back to text).
+  // 2–3 plans → plan_selection: store plans + eligible room types, offer carousel
+  // then plan list (fall back to text when deps absent).
   const planState: AraState = {
     guests:          guestsField,
     selectedRooms:   [],
     remainingGuests: { adults: 0, children: 0 },
     phase:           "plan_selection",
     plans,
+    eligibleRoomInputs: roomInputs,
   };
   writeState(vars, planState);
   flowData.waitingFor = "answer";
   await persist(deps);
 
+  // Message 1 — room type carousel (fire-and-forget on failure; plan list still follows)
+  if (deps.sendRoomCarousel) {
+    await deps.sendRoomCarousel({ hotelId, guestId, roomInputs, adults }).catch(() => {});
+  }
+
+  // Message 2 — plan list
   if (deps.sendPlanList) {
-    const sent = await deps.sendPlanList({ hotelId, guestId, plans });
+    const sent = await deps.sendPlanList({ hotelId, guestId, plans, eligibleRoomInputs: roomInputs });
     if (sent) return "ALREADY_SENT";
   }
   return renderPlanTextFallback(plans);
@@ -1351,9 +1372,38 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
       return safeMenu(hotelId);
     }
 
-    // Accept either a carousel button reply ("plan_N", 0-based) or a text reply ("1".."N").
-    let idx = -1;
     const t = input.trim();
+
+    // ── Single room-type selection: carousel button ("room_{id}") or list row ("ROOM_TYPE:{id}") ──
+    // When a guest taps a carousel card or picks from Section 2 of the plan list, we
+    // run allocateRooms restricted to that single type and jump straight to confirm.
+    const roomTypeIdFromButton = t.match(/^room_TYPE:(.+)$/i)?.[1]    // list row id
+                              ?? t.match(/^ROOM_TYPE:(.+)$/i)?.[1];   // text fallback
+    if (roomTypeIdFromButton) {
+      const eligible = state.eligibleRoomInputs ?? [];
+      const single   = eligible.filter((r) => r.roomTypeId === roomTypeIdFromButton);
+      if (single.length > 0) {
+        const nodeConfig = resolveConfig((deps.node.data ?? {}) as AdvancedRoomAllocationNodeData);
+        const nights     = countNights(deps.flowData.flowVars["bookingCheckIn"] ?? "", deps.flowData.flowVars["bookingCheckOut"] ?? "");
+        const singlePlan = allocateRooms({ adults: state.guests.adults, children: state.guests.children, rooms: single, config: nodeConfig, nights });
+        if (singlePlan && singlePlan.length > 0) {
+          const confirmState: AraState = {
+            guests:          state.guests,
+            selectedRooms:   singlePlan,
+            remainingGuests: { adults: 0, children: 0 },
+            phase:           "confirm",
+          };
+          writeState(vars, confirmState);
+          await persist(deps);
+          return renderAllocationSummary(singlePlan, { trailing: confirmPromptFooter(), childrenAges: state.guests.childrenAges });
+        }
+      }
+      // Room type not found or can't house guests → fall through to re-show the list
+      return renderPlanTextFallback(plans);
+    }
+
+    // ── Recommended-plan selection: "plan_N" (0-based) or text "1".."N" ──
+    let idx = -1;
     const m = t.match(/^plan_(\d+)$/i);
     if (m) {
       idx = parseInt(m[1]!, 10);
