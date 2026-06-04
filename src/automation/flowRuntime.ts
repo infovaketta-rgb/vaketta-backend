@@ -51,7 +51,7 @@ import { extractDateWithAI, classifyBookingIntent, interpretAllocationModificati
 import { handleAdvancedRoomAllocation, type AllocationRoomInput, type SendRoomCarouselFn } from "./nodes/advancedRoomAllocation";
 import { trySendPlanList } from "./nodes/planList";
 import { aggregateRoomQuantities } from "./bookingAllocation";
-import { randomUUID } from "crypto";
+// randomUUID removed — no longer needed after multi-room booking refactor
 
 // Generic placeholder served when a room has no photos. Reliable HTTPS host —
 // Meta requires a publicly fetchable URL for interactive image headers.
@@ -1381,31 +1381,40 @@ export async function executeFlowStep(
               }
             }
 
-            // 6. Create one row per room in a single transaction (reuse advisory lock).
-            const bookingGroupId = randomUUID();
-            const lockKey = `${hotelId}:${new Date().getFullYear()}`;
-            let createdRows: Awaited<ReturnType<typeof prisma.booking.create>>[];
+            // 6. One Booking + N BookingRoom child rows in a single transaction.
+            const grandTotal = allocRooms.reduce((s: number, r: any) => s + (Number(r.totalPrice) || 0), 0);
+            const firstRoom  = allocRooms[0];
+            const lockKey    = `${hotelId}:${new Date().getFullYear()}`;
+            let booking: Awaited<ReturnType<typeof prisma.booking.create>>;
             try {
-              createdRows = await withActionTimeout(prisma.$transaction(async (tx) => {
+              booking = await withActionTimeout(prisma.$transaction(async (tx) => {
                 await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
-                const rows: Awaited<ReturnType<typeof prisma.booking.create>>[] = [];
-                for (const room of allocRooms) {
-                  const referenceNumber = await generateReferenceNumber(tx);
-                  const row = await tx.booking.create({
-                    data: {
-                      hotelId, guestId,
-                      roomTypeId: room.roomTypeId, guestName,
-                      checkIn: checkInDate, checkOut: checkOutDate,
-                      status: BookingStatus.PENDING,
-                      pricePerNight: Number(room.pricePerNight) || 0,
-                      totalPrice:    Number(room.totalPrice)    || 0,
-                      advancePaid:   0,   // group advance handling is out of scope
-                      referenceNumber, bookingGroupId,
+                const referenceNumber = await generateReferenceNumber(tx);
+                const b = await tx.booking.create({
+                  data: {
+                    hotelId, guestId, guestName,
+                    // Primary room type on the Booking row (back-compat for dashboard queries).
+                    roomTypeId:   firstRoom?.roomTypeId ?? allocRooms[0]?.roomTypeId,
+                    checkIn:      checkInDate,
+                    checkOut:     checkOutDate,
+                    status:       BookingStatus.PENDING,
+                    pricePerNight: Number(firstRoom?.pricePerNight) || 0,
+                    totalPrice:   grandTotal,
+                    advancePaid:  0,
+                    referenceNumber,
+                    rooms: {
+                      create: allocRooms.map((r: any) => ({
+                        roomTypeId:   r.roomTypeId,
+                        adults:       Number(r.adults)   || 0,
+                        children:     Number(r.children) || 0,
+                        extraBed:     Boolean(r.extraBed),
+                        pricePerNight: Number(r.pricePerNight) || 0,
+                        totalPrice:   Number(r.totalPrice)    || 0,
+                      })),
                     },
-                  });
-                  rows.push(row);
-                }
-                return rows;
+                  },
+                });
+                return b;
               }));
             } catch (err: any) {
               if (err.message === "Action timeout") {
@@ -1418,25 +1427,20 @@ export async function executeFlowStep(
               return finishMulti("⚠️ Something went wrong while creating your booking. Please try again or contact us directly.");
             }
 
-            // 7. Flow vars — additive; keep single-room keys for back-compat.
-            const firstRow = createdRows[0]!;
-            const groupRef = firstRow.referenceNumber ?? firstRow.id.slice(0, 8).toUpperCase();
+            // 7. Flow vars — single reference number for the whole group.
+            const groupRef = booking.referenceNumber ?? booking.id.slice(0, 8).toUpperCase();
             if (!flowData.flowVars["bookingGroupId"]) {
               flowData.flowVars = {
                 ...flowData.flowVars,
-                bookingGroupId,
                 bookingRef:    groupRef,
-                bookingId:     firstRow.id,
+                bookingId:     booking.id,
                 bookingStatus: BookingStatus.PENDING,
-                bookingRefs:   JSON.stringify(createdRows.map((b) => b.referenceNumber ?? b.id.slice(0, 8).toUpperCase())),
-                bookingIds:    JSON.stringify(createdRows.map((b) => b.id)),
               };
             }
 
             // 8. Confirmation — one reservation, rooms listed underneath.
             const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
             const fmtDate = (dt: Date) => `${dt.getUTCDate()} ${MON[dt.getUTCMonth()]}`;
-            const grandTotal = allocRooms.reduce((s, r) => s + (Number(r.totalPrice) || 0), 0);
             const roomLines = allocRooms
               .map((r) => `• ${r.roomTypeName ?? "Room"} — ${fmtDate(checkInDate)} → ${fmtDate(checkOutDate)}`)
               .join("\n");

@@ -148,7 +148,11 @@ export async function getBookingById(req: Request, res: Response) {
 
     const booking = await prisma.booking.findFirst({
       where:   { id: bookingId, hotelId },
-      include: { guest: true, roomType: true },
+      include: {
+        guest:    true,
+        roomType: true,
+        rooms:    { include: { roomType: { select: { name: true } } } },
+      },
     });
 
     if (!booking) return res.status(404).json({ error: "Booking not found" });
