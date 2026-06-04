@@ -264,6 +264,9 @@ model Booking {
   guest Guest @relation(fields: [guestId], references: [id])
   roomType RoomType @relation(fields: [roomTypeId], references: [id])
 
+  // Per-room detail for multi-room group bookings. Empty for legacy single-room rows.
+  rooms BookingRoom[]
+
   createdAt DateTime @default(now())
 
   @@index([hotelId, status])      // dashboard + booking list queries
@@ -271,6 +274,22 @@ model Booking {
   @@index([guestId])              // guest booking history
   @@index([checkIn, checkOut])    // availability overlap queries
   @@index([bookingGroupId])       // pull all rooms in a group together
+}
+
+model BookingRoom {
+  id           String  @id @default(uuid())
+  bookingId    String
+  roomTypeId   String
+  adults       Int     @default(0)
+  children     Int     @default(0)
+  extraBed     Boolean @default(false)
+  pricePerNight Float
+  totalPrice    Float
+
+  booking  Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  roomType RoomType @relation(fields: [roomTypeId], references: [id])
+
+  @@index([bookingId])
 }
 
 
@@ -303,9 +322,10 @@ model RoomType {
   hotelId     String
 
   hotel     Hotel          @relation(fields: [hotelId], references: [id])
-  bookings  Booking[]
-  photos    RoomPhoto[]
-  inventory RoomInventory[]
+  bookings     Booking[]
+  bookingRooms BookingRoom[]
+  photos       RoomPhoto[]
+  inventory    RoomInventory[]
 
   createdAt DateTime @default(now())
 
