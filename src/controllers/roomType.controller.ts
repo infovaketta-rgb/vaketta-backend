@@ -19,7 +19,6 @@ type OccupancyPricing = {
   extraAdultCharge?: number;
   allowExtraBed?:    boolean;
   extraBedCharge?:   number;
-  childAgeLimit?:    number;
 };
 
 function isBlank(v: unknown): boolean {
@@ -40,7 +39,6 @@ function parseOccupancyPricing(
   const intSpecs: Array<[keyof OccupancyPricing, number, number?]> = [
     ["baseAdults", 1],
     ["baseChildren", 0],
-    ["childAgeLimit", 0, 17],
   ];
   for (const [key, min, max] of intSpecs) {
     if (isBlank(body[key])) continue;

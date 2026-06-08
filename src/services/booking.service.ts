@@ -15,6 +15,7 @@ export async function updateBookingService({
   checkOut,
   pricePerNight,
   advancePaid,
+  rooms,
 }: {
   id: string;
   hotelId: string;
@@ -24,25 +25,27 @@ export async function updateBookingService({
   checkOut?: string;
   pricePerNight?: number;
   advancePaid?: number;
+  /** Per-room updates for group bookings. Each entry updates one BookingRoom child. */
+  rooms?: Array<{ id: string; roomTypeId?: string; pricePerNight?: number }>;
 }) {
-  const booking = await prisma.booking.findFirst({ where: { id, hotelId } });
+  const booking = await prisma.booking.findFirst({
+    where:   { id, hotelId },
+    include: { rooms: true },
+  });
   if (!booking) throw new Error("Booking not found");
 
-  const finalCheckIn  = checkIn  ? new Date(checkIn)  : booking.checkIn;
-  const finalCheckOut = checkOut ? new Date(checkOut) : booking.checkOut;
+  const finalCheckIn    = checkIn  ? new Date(checkIn)  : booking.checkIn;
+  const finalCheckOut   = checkOut ? new Date(checkOut) : booking.checkOut;
   const finalRoomTypeId = roomTypeId ?? booking.roomTypeId;
 
-  const MS_PER_DAY   = 24 * 60 * 60 * 1000;
-  const checkInDay   = Math.floor(finalCheckIn.getTime()  / MS_PER_DAY) * MS_PER_DAY;
-  const checkOutDay  = Math.floor(finalCheckOut.getTime() / MS_PER_DAY) * MS_PER_DAY;
-  const nights       = Math.floor((checkOutDay - checkInDay) / MS_PER_DAY);
+  const MS_PER_DAY  = 24 * 60 * 60 * 1000;
+  const checkInDay  = Math.floor(finalCheckIn.getTime()  / MS_PER_DAY) * MS_PER_DAY;
+  const checkOutDay = Math.floor(finalCheckOut.getTime() / MS_PER_DAY) * MS_PER_DAY;
+  const nights      = Math.floor((checkOutDay - checkInDay) / MS_PER_DAY);
 
   if (nights < 1) throw new Error("Check-out must be at least 1 day after check-in");
 
-  const finalPrice = pricePerNight ?? booking.pricePerNight;
-  const totalPrice = nights * finalPrice;
-
-  // Availability check when dates or room type changed — exclude the current booking from count
+  // Availability check when dates or room type changed
   const datesOrRoomChanged = checkIn || checkOut || roomTypeId;
   if (datesOrRoomChanged) {
     const config = await prisma.hotelConfig.findUnique({
@@ -51,13 +54,61 @@ export async function updateBookingService({
     });
     if (config?.availabilityEnabled) {
       const { availableCount } = await checkRoomAvailability(hotelId, finalRoomTypeId, finalCheckIn, finalCheckOut);
-      // Count must be > 0 because the current booking is still occupying a slot
-      // (it hasn't been cancelled yet, so we need at least 1 for itself)
       if (availableCount < 1) {
         throw new Error("Room is not available for the selected dates");
       }
     }
   }
+
+  // ── Group booking: apply per-room updates then recompute total from children ──
+  if (booking.rooms.length > 0 && rooms && rooms.length > 0) {
+    const roomUpdatesById = new Map(rooms.map((r) => [r.id, r]));
+
+    // Update each selected BookingRoom, recomputing its totalPrice with new nights
+    for (const child of booking.rooms) {
+      const upd = roomUpdatesById.get(child.id);
+      if (!upd) continue;
+      const newPrice    = upd.pricePerNight  ?? child.pricePerNight;
+      const newRoomType = upd.roomTypeId     ?? child.roomTypeId;
+      await prisma.bookingRoom.update({
+        where: { id: child.id },
+        data: {
+          pricePerNight: newPrice,
+          totalPrice:    newPrice * nights,
+          roomTypeId:    newRoomType,
+        },
+      });
+    }
+
+    // Recompute grand total from all children (including untouched ones)
+    const updatedChildren = await prisma.bookingRoom.findMany({ where: { bookingId: id } });
+    const grandTotal = updatedChildren.reduce((s, r) => s + r.totalPrice, 0);
+
+    // Primary roomTypeId on Booking = first child's type (keeps dashboard queries working)
+    const firstChildRoomTypeId = updatedChildren[0]?.roomTypeId ?? finalRoomTypeId;
+
+    return prisma.booking.update({
+      where: { id },
+      data: {
+        ...(guestName ? { guestName } : {}),
+        roomTypeId:    firstChildRoomTypeId,
+        checkIn:       finalCheckIn,
+        checkOut:      finalCheckOut,
+        pricePerNight: updatedChildren[0]?.pricePerNight ?? booking.pricePerNight,
+        totalPrice:    grandTotal,
+        ...(advancePaid !== undefined ? { advancePaid } : {}),
+      },
+      include: {
+        guest:    true,
+        roomType: true,
+        rooms:    { include: { roomType: { select: { name: true } } } },
+      },
+    });
+  }
+
+  // ── Single-room booking: existing path unchanged ──
+  const finalPrice = pricePerNight ?? booking.pricePerNight;
+  const totalPrice = nights * finalPrice;
 
   return prisma.booking.update({
     where: { id },
@@ -70,7 +121,11 @@ export async function updateBookingService({
       totalPrice,
       ...(advancePaid !== undefined ? { advancePaid } : {}),
     },
-    include: { guest: true, roomType: true },
+    include: {
+      guest:    true,
+      roomType: true,
+      rooms:    { include: { roomType: { select: { name: true } } } },
+    },
   });
 }
 

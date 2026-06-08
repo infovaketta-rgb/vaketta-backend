@@ -21,6 +21,12 @@ import {
   roomMenuOptions,
   generatePlans,
   renderPlanTextFallback,
+  extractAgesRegex,
+  needsAiAgeParse,
+  accumulateAges,
+  reclassifyGuests,
+  buildOccupancyNotice,
+  MAX_AGE_ROUNDS,
   type AdvancedRoomAllocationDeps,
   type AllocationConfig,
   type AllocationRoom,
@@ -1754,5 +1760,228 @@ describe("change room type", () => {
     const result = await handleAdvancedRoomAllocation(deps);
     expect(result).toMatch(/no other room types/i);
     expect(readAra(deps).phase).toBe("room_menu"); // unchanged — no dead phase
+  });
+});
+
+// ── Task 1: pure age-parsing helpers ──────────────────────────────────────────
+describe("children-age parsing helpers", () => {
+  it("AP1: extractAgesRegex pulls integers, drops out-of-range", () => {
+    expect(extractAgesRegex("8, 12 and 5")).toEqual([8, 12, 5]);
+    expect(extractAgesRegex("6 and 9 years")).toEqual([6, 9]);
+    expect(extractAgesRegex("no kids")).toEqual([]);
+  });
+
+  it("AP2: needsAiAgeParse — false for plain digits, true for empty or relative words", () => {
+    expect(needsAiAgeParse("8, 12 and 5")).toBe(false);     // regex handles it
+    expect(needsAiAgeParse("no idea")).toBe(true);          // no digits
+    expect(needsAiAgeParse("the twins are 8")).toBe(true);  // relative word
+    expect(needsAiAgeParse("both are 6")).toBe(true);
+    expect(needsAiAgeParse("eldest is 12")).toBe(true);
+    expect(needsAiAgeParse("they are the same age, 7")).toBe(true);
+  });
+
+  it("AP3: accumulateAges — complete / partial / over", () => {
+    expect(accumulateAges([], [8, 12, 5], 3)).toEqual({ ages: [8, 12, 5], status: "complete" });
+    expect(accumulateAges([13], [], 3)).toEqual({ ages: [13], status: "partial" });
+    expect(accumulateAges([13], [8], 3)).toEqual({ ages: [13, 8], status: "partial" });
+    expect(accumulateAges([8, 12], [5, 7], 3)).toEqual({ ages: [8, 12, 5], status: "over" });
+  });
+});
+
+// ── Task 3: reclassification math ─────────────────────────────────────────────
+describe("reclassifyGuests", () => {
+  it("RC1: ages [5,9,14], limit 12 → promoted=1, +1 adult / -1 child", () => {
+    const r = reclassifyGuests(2, 3, [5, 9, 14], 12);
+    expect(r.promotedToAdult).toBe(1);
+    expect(r.effectiveAdults).toBe(3);
+    expect(r.effectiveChildren).toBe(2);
+    expect(r.effectiveChildrenAges).toEqual([5, 9]);
+  });
+
+  it("RC2: ages [5,6], limit 12 → promoted=0, counts unchanged", () => {
+    const r = reclassifyGuests(2, 2, [5, 6], 12);
+    expect(r.promotedToAdult).toBe(0);
+    expect(r.effectiveAdults).toBe(2);
+    expect(r.effectiveChildren).toBe(2);
+    expect(r.effectiveChildrenAges).toEqual([5, 6]);
+  });
+
+  it("RC3: ages [13,14,15], limit 12 → promoted=3, effectiveChildren=0", () => {
+    const r = reclassifyGuests(2, 3, [13, 14, 15], 12);
+    expect(r.promotedToAdult).toBe(3);
+    expect(r.effectiveAdults).toBe(5);
+    expect(r.effectiveChildren).toBe(0);
+    expect(r.effectiveChildrenAges).toEqual([]);
+  });
+
+  it("RC4: null limit → no reclassification", () => {
+    const r = reclassifyGuests(2, 2, [14, 15], null);
+    expect(r.promotedToAdult).toBe(0);
+    expect(r.effectiveAdults).toBe(2);
+    expect(r.effectiveChildren).toBe(2);
+  });
+});
+
+// ── Task 4: occupancy-notice wording ──────────────────────────────────────────
+describe("buildOccupancyNotice", () => {
+  it("ON1: singular wording when one child promoted", () => {
+    const msg = buildOccupancyNotice(3, 2, 1, 12);
+    expect(msg).toContain("*Occupancy Summary*");
+    expect(msg).toContain("Adults: *3*");
+    expect(msg).toContain("Children: *2*");
+    expect(msg).toContain("One of your children is");
+    expect(msg).toContain("counted as an adult");
+    expect(msg).toContain("above 12 years");
+  });
+
+  it("ON2: plural wording when two children promoted", () => {
+    const msg = buildOccupancyNotice(4, 0, 2, 12);
+    expect(msg).toContain("2 of your children are");
+    expect(msg).toContain("counted as adults");
+  });
+
+  it("ON3: WhatsApp-safe — no box-drawing or markdown headers", () => {
+    const msg = buildOccupancyNotice(3, 2, 1, 12);
+    expect(msg).not.toMatch(/[─│┌┐└┘├┤]/);
+    expect(msg).not.toMatch(/^#/m);
+  });
+});
+
+// ── Task 1 + 3 + 4: collecting_ages handler (end-to-end) ──────────────────────
+describe("collecting_ages handler", () => {
+  const readAra = (deps: AdvancedRoomAllocationDeps) => JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+
+  // Seed a collecting_ages araState as if phase1 just entered it.
+  function collectState(adults: number, children: number, collectedAges: number[] = [], rounds = 0): AraState {
+    return {
+      guests:          { adults, children },
+      selectedRooms:   [],
+      remainingGuests: { adults: 0, children: 0 },
+      phase:           "collecting_ages",
+      ageCollection:   { adults, children, childrenCount: children, collectedAges, rounds },
+    };
+  }
+  const famRoom = () => [room({ roomTypeId: "rt_fam", name: "Family", basePrice: 6000, maxAdults: 4, maxChildren: 3, availableCount: 5 })];
+
+  it("CA1: '8, 12 and 5' for 3 children → complete in one round, no AI call", async () => {
+    const extractChildrenAges = vi.fn(async () => null);
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(collectState(2, 3)) },
+      rooms: famRoom(),
+      input: "8, 12 and 5",
+      childAgeLimit: 12,
+      extractChildrenAges,
+    });
+    await handleAdvancedRoomAllocation(deps);
+    expect(extractChildrenAges).not.toHaveBeenCalled();   // regex sufficed
+    // 12 is not > 12, so none promoted; effective vars written.
+    expect(deps.flowData.flowVars["effectiveAdults"]).toBe("2");
+    expect(deps.flowData.flowVars["effectiveChildren"]).toBe("3");
+    expect(deps.flowData.flowVars["promotedToAdult"]).toBe("0");
+    expect(readAra(deps).phase).not.toBe("collecting_ages"); // advanced
+  });
+
+  it("CA2: '13' for 3 children → partial, accumulates, stays in phase", async () => {
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(collectState(2, 3)) },
+      rooms: famRoom(),
+      input: "13",
+      childAgeLimit: 12,
+    });
+    const result = await handleAdvancedRoomAllocation(deps);
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("collecting_ages");
+    expect(ara.ageCollection!.collectedAges).toEqual([13]);
+    expect(ara.ageCollection!.rounds).toBe(1);
+    expect(result).toMatch(/other 2 children/i);
+  });
+
+  it("CA3: 'twins are 8' triggers AI fallback", async () => {
+    const extractChildrenAges = vi.fn(async () => [8, 8]);
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(collectState(2, 2)) },
+      rooms: famRoom(),
+      input: "the twins are 8",
+      childAgeLimit: 12,
+      extractChildrenAges,
+    });
+    await handleAdvancedRoomAllocation(deps);
+    expect(extractChildrenAges).toHaveBeenCalledTimes(1);  // ambiguous → AI
+    expect(deps.flowData.flowVars["effectiveChildren"]).toBe("2");
+    expect(readAra(deps).phase).not.toBe("collecting_ages");
+  });
+
+  it("CA4: 3 rounds with only 2 ages for 3 children → fills remaining with 0", async () => {
+    // Two ages already collected over 2 rounds; this 3rd reply adds nothing parseable
+    // but we still have a partial — round limit forces a fill.
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(collectState(2, 3, [8, 9], MAX_AGE_ROUNDS - 1)) },
+      rooms: famRoom(),
+      input: "not sure about the last one",
+      childAgeLimit: 12,
+      extractChildrenAges: vi.fn(async () => null), // AI can't help either
+    });
+    await handleAdvancedRoomAllocation(deps);
+    const ara = readAra(deps);
+    expect(ara.phase).not.toBe("collecting_ages"); // proceeded
+    // [8, 9, 0] — filled; none over 12 so all stay children.
+    expect(JSON.parse(deps.flowData.flowVars["effectiveChildrenAges"]!)).toEqual([8, 9, 0]);
+    expect(deps.flowData.flowVars["effectiveChildren"]).toBe("3");
+  });
+
+  it("CA5: non-age message → re-prompt, no advance, stays in phase", async () => {
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(collectState(2, 2)) },
+      rooms: famRoom(),
+      input: "what time is check in?",
+      childAgeLimit: 12,
+      extractChildrenAges: vi.fn(async () => null),
+    });
+    const result = await handleAdvancedRoomAllocation(deps);
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("collecting_ages");                 // no advance
+    expect(ara.ageCollection!.collectedAges).toEqual([]);      // nothing stored
+    expect(ara.ageCollection!.rounds).toBe(1);                 // counts as a round
+    expect(result).toMatch(/just need the ages/i);
+    expect(deps.flowData.flowVars["effectiveAdults"]).toBeUndefined(); // didn't proceed
+  });
+
+  it("CA6: ages with one over the limit → promotion + occupancy notice sent", async () => {
+    let sentText = "";
+    const sendOccupancyNotice = vi.fn(async (a: { hotelId: string; guestId: string; text: string }) => { sentText = a.text; });
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(collectState(2, 3)) },
+      rooms: famRoom(),
+      input: "5, 9 and 14",
+      childAgeLimit: 12,
+      sendOccupancyNotice,
+    });
+    await handleAdvancedRoomAllocation(deps);
+    expect(sendOccupancyNotice).toHaveBeenCalledTimes(1);
+    expect(sentText).toContain("One of your children is");
+    expect(deps.flowData.flowVars["promotedToAdult"]).toBe("1");
+    expect(deps.flowData.flowVars["effectiveAdults"]).toBe("3");
+    expect(deps.flowData.flowVars["effectiveChildren"]).toBe("2");
+  });
+
+  it("CA7: no promotion → occupancy notice NOT sent", async () => {
+    const sendOccupancyNotice = vi.fn(async () => undefined);
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(collectState(2, 2)) },
+      rooms: famRoom(),
+      input: "5, 6",
+      childAgeLimit: 12,
+      sendOccupancyNotice,
+    });
+    await handleAdvancedRoomAllocation(deps);
+    expect(sendOccupancyNotice).not.toHaveBeenCalled();
+    expect(deps.flowData.flowVars["promotedToAdult"]).toBe("0");
   });
 });

@@ -17,7 +17,6 @@ export async function createRoomType({
   extraAdultCharge,
   allowExtraBed,
   extraBedCharge,
-  childAgeLimit,
 }: {
   hotelId:              string;
   name:                 string;
@@ -32,7 +31,6 @@ export async function createRoomType({
   extraAdultCharge?:    number;
   allowExtraBed?:       boolean;
   extraBedCharge?:      number;
-  childAgeLimit?:       number;
 }) {
   return prisma.roomType.create({
     data: {
@@ -48,7 +46,6 @@ export async function createRoomType({
       extraAdultCharge: extraAdultCharge ?? null,
       allowExtraBed:    allowExtraBed    ?? false,
       extraBedCharge:   extraBedCharge   ?? null,
-      childAgeLimit:    childAgeLimit    ?? null,
       ...(carouselButtonLabel !== undefined && { carouselButtonLabel }),
     },
   });
@@ -77,7 +74,6 @@ export async function updateRoomType({
   extraAdultCharge,
   allowExtraBed,
   extraBedCharge,
-  childAgeLimit,
 }: {
   id:                   string;
   hotelId:              string;
@@ -93,7 +89,6 @@ export async function updateRoomType({
   extraAdultCharge?:    number;
   allowExtraBed?:       boolean;
   extraBedCharge?:      number;
-  childAgeLimit?:       number;
 }) {
   return prisma.roomType.update({
     where: { id, hotelId },
@@ -108,7 +103,6 @@ export async function updateRoomType({
       extraAdultCharge: extraAdultCharge ?? null,
       allowExtraBed:    allowExtraBed    ?? false,
       extraBedCharge:   extraBedCharge   ?? null,
-      childAgeLimit:    childAgeLimit    ?? null,
       ...(totalRooms !== undefined && { totalRooms }),
       ...(carouselButtonLabel !== undefined && { carouselButtonLabel }),
     },

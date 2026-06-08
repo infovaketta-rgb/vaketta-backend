@@ -112,11 +112,9 @@ export async function editBooking(req: Request, res: Response) {
     const { bookingId } = req.params;
     if (!bookingId) return res.status(400).json({ error: "bookingId required" });
 
-    const { guestName, roomTypeId, checkIn, checkOut, pricePerNight, advancePaid } = req.body;
+    const { guestName, roomTypeId, checkIn, checkOut, pricePerNight, advancePaid, rooms } = req.body;
 
     // Serialize concurrent edits on the same booking to prevent lost updates.
-    // pg_advisory_xact_lock blocks any other transaction locking the same key
-    // until this transaction commits or rolls back — auto-released, no manual unlock.
     let booking: Awaited<ReturnType<typeof updateBookingService>>;
     await prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${bookingId}))`;
@@ -128,7 +126,8 @@ export async function editBooking(req: Request, res: Response) {
         checkIn,
         checkOut,
         ...(pricePerNight !== undefined ? { pricePerNight: Number(pricePerNight) } : {}),
-        ...(advancePaid !== undefined ? { advancePaid: Number(advancePaid) } : {}),
+        ...(advancePaid   !== undefined ? { advancePaid:   Number(advancePaid)   } : {}),
+        ...(Array.isArray(rooms)        ? { rooms }                               : {}),
       });
     });
 

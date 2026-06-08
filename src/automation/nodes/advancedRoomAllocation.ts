@@ -43,7 +43,7 @@ export type AraState = {
   guests:          { adults: number; children: number; childrenAges?: number[] };
   selectedRooms:   AllocationRoom[];
   remainingGuests: { adults: number; children: number };
-  phase:           "confirm" | "manual" | "room_menu" | "move_from_count" | "move_to_room" | "change_type_select" | "plan_selection";
+  phase:           "collecting_ages" | "confirm" | "manual" | "room_menu" | "move_from_count" | "move_to_room" | "change_type_select" | "plan_selection";
   // Structured-modify navigation (all optional — older state shapes stay valid):
   selectedRoomIndex?: number; // which room the guest is editing (room_menu / move_*)
   pendingMove?: { fromRoomIndex: number; adults: number; children: number };
@@ -51,6 +51,14 @@ export type AraState = {
   plans?:               AllocationPlan[];      // candidate plans offered to the guest
   selectedPlanIndex?:   number;                // which plan the guest chose
   eligibleRoomInputs?:  AllocationRoomInput[]; // room types used to build plans (for single-type selection)
+  // Stateful children-age collection (Task 1). Present only during "collecting_ages".
+  ageCollection?: {
+    adults:        number;   // raw guest counts, carried until ages are done
+    children:      number;
+    childrenCount: number;   // how many ages we still need (== children)
+    collectedAges: number[]; // ages gathered so far across rounds
+    rounds:        number;   // accumulation rounds used (each guest reply counts as one)
+  };
 };
 
 /** One candidate allocation plan offered in the Phase-1 carousel. */
@@ -80,7 +88,6 @@ export type AllocationRoomInput = {
   extraAdultCharge?: number | null;
   allowExtraBed?:    boolean | null;
   extraBedCharge?:   number | null;
-  childAgeLimit?:    number | null;
 };
 
 export type AllocationConfig = {
@@ -109,7 +116,8 @@ function resolveRoomConfig(room: AllocationRoomInput, base: AllocationConfig): A
     extraAdultCharge: room.extraAdultCharge ?? base.extraAdultCharge,
     allowExtraBed:    room.allowExtraBed    ?? base.allowExtraBed,
     extraBedCharge:   room.extraBedCharge   ?? base.extraBedCharge,
-    childAgeLimit:    room.childAgeLimit    ?? base.childAgeLimit,
+    // Hotel-wide value from config — no longer per-room (RoomType column dropped).
+    childAgeLimit:    base.childAgeLimit,
   };
 }
 
@@ -607,6 +615,113 @@ export function parseChildrenAges(raw: string): number[] {
     .filter((n) => Number.isFinite(n) && n >= 0 && n <= 17);
 }
 
+// ── Stateful children-age collection (Task 1) ─────────────────────────────────
+
+/** Words that hint at relative ages a plain integer regex would misread. */
+const AGE_TRIGGER_WORDS = /twins|both|eldest|youngest|same age/i;
+
+/** Max age-collection rounds before we give up and fill remaining slots with 0. */
+export const MAX_AGE_ROUNDS = 3;
+
+/**
+ * Step 1 of parsing — pull every integer in the child range 0–17 from a reply,
+ * preserving order. (Same shape as parseChildrenAges; named for the collection
+ * flow where it's the "regex first" step.)
+ */
+export function extractAgesRegex(reply: string): number[] {
+  return parseChildrenAges(reply);
+}
+
+/**
+ * Whether the AI fallback should be consulted for this reply: only when the
+ * regex found NO digits at all, OR the reply uses relative-age words
+ * ("twins", "both", "eldest", "youngest", "same age") that the regex misreads.
+ */
+export function needsAiAgeParse(reply: string): boolean {
+  return extractAgesRegex(reply).length === 0 || AGE_TRIGGER_WORDS.test(reply);
+}
+
+export type AgeAccumulation = {
+  ages:   number[];                          // collected so far (capped at childrenCount)
+  status: "complete" | "partial" | "over";   // vs childrenCount
+};
+
+/**
+ * Append newly-extracted ages to what's been collected and compare against the
+ * expected child count. Pure.
+ *   - equal  → "complete"
+ *   - fewer  → "partial"
+ *   - more   → "over" (take the first childrenCount)
+ */
+export function accumulateAges(
+  collected:     number[],
+  incoming:      number[],
+  childrenCount: number,
+): AgeAccumulation {
+  const merged = [...collected, ...incoming];
+  if (merged.length === childrenCount) return { ages: merged, status: "complete" };
+  if (merged.length <  childrenCount) return { ages: merged, status: "partial" };
+  return { ages: merged.slice(0, childrenCount), status: "over" };
+}
+
+// ── Reclassification (Task 3) ─────────────────────────────────────────────────
+
+export type ReclassResult = {
+  effectiveAdults:       number;
+  effectiveChildren:     number;
+  effectiveChildrenAges: number[];
+  promotedToAdult:       number;
+};
+
+/**
+ * Children strictly older than `childAgeLimit` are counted as adults. Pure.
+ * A null/undefined limit means "no reclassification" (everyone stays as-is).
+ */
+export function reclassifyGuests(
+  adults:        number,
+  children:      number,
+  childrenAges:  number[],
+  childAgeLimit: number | null | undefined,
+): ReclassResult {
+  if (childAgeLimit == null) {
+    return {
+      effectiveAdults:       adults,
+      effectiveChildren:     children,
+      effectiveChildrenAges: [...childrenAges],
+      promotedToAdult:       0,
+    };
+  }
+  const promotedToAdult       = childrenAges.filter((a) => a > childAgeLimit).length;
+  const effectiveChildrenAges = childrenAges.filter((a) => a <= childAgeLimit);
+  return {
+    effectiveAdults:   adults + promotedToAdult,
+    effectiveChildren: children - promotedToAdult,
+    effectiveChildrenAges,
+    promotedToAdult,
+  };
+}
+
+/**
+ * WhatsApp-safe occupancy summary (Task 4). Caller sends it only when
+ * promotedToAdult > 0. Bold/italic + newlines only — no box-drawing, no headers.
+ */
+export function buildOccupancyNotice(
+  effectiveAdults:   number,
+  effectiveChildren: number,
+  promotedToAdult:   number,
+  childAgeLimit:     number,
+): string {
+  const who = promotedToAdult > 1
+    ? `${promotedToAdult} of your children are`
+    : `One of your children is`;
+  const counted = promotedToAdult > 1 ? "adults" : "an adult";
+  return (
+    `*Occupancy Summary* 👥\n\n` +
+    `Adults: *${effectiveAdults}*   Children: *${effectiveChildren}*\n\n` +
+    `_${who} above ${childAgeLimit} years and will be counted as ${counted} per hotel policy._`
+  );
+}
+
 /** Join ages for display: [6,9] → "6 & 9", [4,7,12] → "4, 7 & 12". */
 function formatAges(ages: number[]): string {
   if (ages.length <= 1) return ages.join("");
@@ -854,6 +969,13 @@ function writeOutputContract(flowVars: Record<string, string>, allocated: Alloca
   flowVars["bookingRooms"]         = JSON.stringify(allocated);
   flowVars["bookingTotalPrice"]    = String(total);
   flowVars["bookingNights"]        = String(nights);
+
+  // Flat, message-friendly aliases so {{bookingTotal}} / {{roomCount}} /
+  // {{allocatedRooms}} resolve directly (the output schema declares these keys).
+  // bookingTotalPrice/bookingRooms are kept above for back-compat.
+  flowVars["bookingTotal"]   = String(total);
+  flowVars["roomCount"]      = String(allocated.length);
+  flowVars["allocatedRooms"] = JSON.stringify(allocated);
   return true;
 }
 
@@ -886,7 +1008,6 @@ export type FetchRoomTypesFn = (
   extraAdultCharge?: number | null;
   allowExtraBed?:    boolean | null;
   extraBedCharge?:   number | null;
-  childAgeLimit?:    number | null;
 }>>;
 
 export type GetCalendarDataFn = (
@@ -933,6 +1054,16 @@ export type AdvancedRoomAllocationDeps = {
   // OPTIONAL — sends the room-type carousel that precedes the plan list.
   // Absent → carousel step is skipped silently.
   sendRoomCarousel?: SendRoomCarouselFn;
+  // OPTIONAL — hotel-wide child age threshold (HotelConfig.childAgeLimit). A child
+  // strictly older than this is reclassified as an adult before allocation.
+  // Absent → no reclassification (back-compat; everyone stays as collected).
+  childAgeLimit?: number;
+  // OPTIONAL — AI fallback for ambiguous age replies ("the twins are 8"). Returns
+  // ages or null on any failure. Absent → regex-only collection.
+  extractChildrenAges?: (reply: string) => Promise<number[] | null>;
+  // OPTIONAL — sends the occupancy-summary text before the carousel when children
+  // are promoted to adults. Absent → notice is skipped silently.
+  sendOccupancyNotice?: (args: { hotelId: string; guestId: string; text: string }) => Promise<void>;
 };
 
 /** Sends the multi-plan interactive list; returns true if sent (→ "ALREADY_SENT"). */
@@ -973,7 +1104,15 @@ export type InterpretModificationFn = (
 
 // ── Config + flowVar parsing ──────────────────────────────────────────────────
 
-function resolveConfig(data: AdvancedRoomAllocationNodeData): AllocationConfig {
+/**
+ * Build the node-level allocation config. `childAgeLimit` is now hotel-wide:
+ * the injected HotelConfig value (when provided) wins over the legacy node-data
+ * field, which is kept only as a fallback for older flows / direct-config tests.
+ */
+function resolveConfig(
+  data: AdvancedRoomAllocationNodeData,
+  childAgeLimit?: number | null,
+): AllocationConfig {
   return {
     baseAdults:       data.baseAdults       ?? 2,
     baseChildren:     data.baseChildren     ?? 0,
@@ -982,7 +1121,7 @@ function resolveConfig(data: AdvancedRoomAllocationNodeData): AllocationConfig {
     extraAdultCharge: data.extraAdultCharge ?? 0,
     allowExtraBed:    data.allowExtraBed    ?? false,
     extraBedCharge:   data.extraBedCharge   ?? 0,
-    childAgeLimit:    data.childAgeLimit    ?? null,
+    childAgeLimit:    childAgeLimit ?? data.childAgeLimit ?? null,
   };
 }
 
@@ -1020,7 +1159,6 @@ async function buildInventoryRooms(
       extraAdultCharge: r.extraAdultCharge ?? null,
       allowExtraBed:    r.allowExtraBed    ?? null,
       extraBedCharge:   r.extraBedCharge   ?? null,
-      childAgeLimit:    r.childAgeLimit    ?? null,
     };
   });
 }
@@ -1107,16 +1245,104 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
   const adults   = parseInt(vars[adultsVarName]   ?? "2", 10) || 2;
   const children = parseInt(vars[childrenVarName] ?? "0", 10) || 0;
 
-  let childrenAges: number[] = [];
-  const agesVarName = data.childrenAgesVar || "";
-  if (agesVarName && vars[agesVarName]) {
-    childrenAges = parseChildrenAges(vars[agesVarName]);
-  }
-
   if (adults + children === 0) {
     await resetSession(guestId, hotelId);
     return "I need at least one guest to allocate a room. Please start over from the main menu.";
   }
+
+  // ── Children-age collection (Task 1) ──────────────────────────────────────
+  // If there are children and ages aren't already fully known, gather them
+  // statefully (possibly across several messages) before allocating. Ages may be
+  // pre-supplied via the configured childrenAgesVar; if that already has enough,
+  // we skip collection entirely (full back-compat).
+  let presetAges: number[] = [];
+  const agesVarName = data.childrenAgesVar || "";
+  if (agesVarName && vars[agesVarName]) {
+    presetAges = extractAgesRegex(vars[agesVarName]);
+  }
+
+  if (children > 0 && presetAges.length < children) {
+    // Enter stateful collection. The first prompt asks for the ages.
+    const collectState: AraState = {
+      guests:          { adults, children },
+      selectedRooms:   [],
+      remainingGuests: { adults: 0, children: 0 },
+      phase:           "collecting_ages",
+      ageCollection:   { adults, children, childrenCount: children, collectedAges: [], rounds: 0 },
+    };
+    writeState(vars, collectState);
+    flowData.waitingFor = "answer";
+    await persist(deps);
+    return children === 1
+      ? "How old is your child? 👶"
+      : `Please share the ages of your ${children} children — e.g. 5, 8 and 12 👶`;
+  }
+
+  // No children, or ages already supplied → reclassify and allocate immediately.
+  // Pre-supplied ages are passed through verbatim (back-compat: a count mismatch
+  // is preserved, and the summary's own equal-length check decides display).
+  return reclassifyAndProceed(deps, { adults, children, childrenAges: presetAges, checkIn, checkOut, nights, config });
+}
+
+/**
+ * Reclassify children over the hotel age limit into adults (Task 3), optionally
+ * send the occupancy notice (Task 4), then run the allocator with the EFFECTIVE
+ * counts. Shared by phase1 (no-ages path) and the collecting_ages completion.
+ * The base-first allocator is never touched — only its inputs.
+ */
+async function reclassifyAndProceed(
+  deps: AdvancedRoomAllocationDeps,
+  args: { adults: number; children: number; childrenAges: number[]; checkIn: string; checkOut: string; nights: number; config: AllocationConfig },
+): Promise<string | null> {
+  const { hotelId, guestId, flowData } = deps;
+  const vars = flowData.flowVars;
+  const { adults, children, childrenAges, checkIn, checkOut, nights } = args;
+
+  // childAgeLimit on the resolved config now comes from the injected HotelConfig
+  // value (deps.childAgeLimit), falling back to node-data inside resolveConfig.
+  const config = { ...args.config, childAgeLimit: deps.childAgeLimit ?? args.config.childAgeLimit };
+
+  const { effectiveAdults, effectiveChildren, effectiveChildrenAges, promotedToAdult } =
+    reclassifyGuests(adults, children, childrenAges, config.childAgeLimit);
+
+  // Persist the four computed values as flowVars (Task 3).
+  flowData.flowVars = {
+    ...flowData.flowVars,
+    effectiveAdults:       String(effectiveAdults),
+    effectiveChildren:     String(effectiveChildren),
+    effectiveChildrenAges: JSON.stringify(effectiveChildrenAges),
+    promotedToAdult:       String(promotedToAdult),
+  };
+
+  // Occupancy notice (Task 4) — only when at least one child became an adult.
+  if (promotedToAdult > 0 && deps.sendOccupancyNotice && config.childAgeLimit != null) {
+    const text = buildOccupancyNotice(effectiveAdults, effectiveChildren, promotedToAdult, config.childAgeLimit);
+    await deps.sendOccupancyNotice({ hotelId, guestId, text });
+  }
+
+  return proceedToAllocation(deps, {
+    effectiveAdults,
+    effectiveChildren,
+    effectiveChildrenAges,
+    checkIn,
+    checkOut,
+    nights,
+    config,
+  });
+}
+
+/**
+ * Build inventory, generate plans, and branch into the single-summary / plan
+ * list flow exactly as before — but using the EFFECTIVE (post-reclassification)
+ * guest counts. The allocation algorithm itself is unchanged.
+ */
+async function proceedToAllocation(
+  deps: AdvancedRoomAllocationDeps,
+  args: { effectiveAdults: number; effectiveChildren: number; effectiveChildrenAges: number[]; checkIn: string; checkOut: string; nights: number; config: AllocationConfig },
+): Promise<string | null> {
+  const { hotelId, guestId, flowData, fetchRoomTypes, getCalendarData, resetSession } = deps;
+  const vars = flowData.flowVars;
+  const { effectiveAdults: adults, effectiveChildren: children, effectiveChildrenAges, checkIn, checkOut, nights, config } = args;
 
   const roomInputs = await buildInventoryRooms(hotelId, checkIn, checkOut, fetchRoomTypes, getCalendarData);
   const plans = generatePlans({ adults, children, rooms: roomInputs, config, nights });
@@ -1127,6 +1353,7 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
     // ↑ Spec-mandated graceful failure (step 3 inventory-exhaustion path).
   }
 
+  const childrenAges = effectiveChildrenAges;
   const guestsField = { adults, children, ...(childrenAges.length > 0 ? { childrenAges } : {}) };
 
   // Single unique plan → existing single-summary confirm flow (no carousel).
@@ -1169,6 +1396,117 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
     if (sent) return "ALREADY_SENT";
   }
   return renderPlanTextFallback(plans);
+}
+
+/**
+ * Stateful children-age collection handler (Task 1). One call per guest reply.
+ * Parses regex-first, consults the AI fallback only for empty/ambiguous input,
+ * accumulates across rounds, guards against non-age messages, and on completion
+ * (or after MAX_AGE_ROUNDS, filling the rest with 0) hands off to
+ * reclassifyAndProceed. Stays in "collecting_ages" until done.
+ */
+async function handleAgeCollection(deps: AdvancedRoomAllocationDeps, state: AraState): Promise<string | null> {
+  const { input, flowData, hotelId, guestId, resetSession } = deps;
+  const vars = flowData.flowVars;
+  const ac = state.ageCollection;
+
+  // Corrupt state guard — no working data → reset gracefully.
+  if (!ac) {
+    clearState(vars);
+    await resetSession(guestId, hotelId);
+    return "Something went wrong collecting the children's ages. Please start over from the main menu.";
+  }
+
+  const round = ac.rounds + 1;
+
+  // Step 1 — regex first.
+  let extracted = extractAgesRegex(input);
+
+  // Step 2 — AI fallback ONLY when regex is empty or the reply is ambiguous.
+  let aiTried = false;
+  if (deps.extractChildrenAges && needsAiAgeParse(input)) {
+    aiTried = true;
+    const aiAges = await deps.extractChildrenAges(input);
+    if (aiAges && aiAges.length > 0) extracted = aiAges;
+  }
+
+  // Step 4 — non-age message guard: nothing parsed AND no age words → re-prompt,
+  // no advance. Counts as a round (so a stream of junk can't loop forever).
+  if (extracted.length === 0) {
+    const exhausted = round >= MAX_AGE_ROUNDS;
+    if (!exhausted) {
+      const next: AraState = { ...state, ageCollection: { ...ac, rounds: round } };
+      writeState(vars, next);
+      flowData.waitingFor = "answer";
+      await persist(deps);
+      return "I just need the ages of your children to continue — e.g. 5, 8 and 12 👶";
+    }
+    // Rounds exhausted with nothing parsed this turn → fall through to fill logic.
+  }
+
+  // Step 3 — accumulate.
+  const acc = accumulateAges(ac.collectedAges, extracted, ac.childrenCount);
+
+  if (acc.status === "complete" || acc.status === "over") {
+    return finishAgeCollection(deps, ac, acc.ages);
+  }
+
+  // status === "partial"
+  if (round >= MAX_AGE_ROUNDS) {
+    // Max rounds reached — fill remaining slots with 0 (a 0-year-old is a child
+    // under any reasonable age limit) and proceed.
+    const filled = [...acc.ages];
+    while (filled.length < ac.childrenCount) filled.push(0);
+    return finishAgeCollection(deps, ac, filled);
+  }
+
+  // Ask for the remaining ages, staying in the collection phase.
+  const remaining = ac.childrenCount - acc.ages.length;
+  const next: AraState = { ...state, ageCollection: { ...ac, collectedAges: acc.ages, rounds: round } };
+  writeState(vars, next);
+  flowData.waitingFor = "answer";
+  await persist(deps);
+  void aiTried; // (kept for clarity; AI use is internal)
+  return (
+    `Got ${acc.ages.join(", ")} — what's the age of your other ${remaining} ` +
+    `${remaining === 1 ? "child" : "children"}?`
+  );
+}
+
+/**
+ * Ages are finalized — recompute dates/config and run reclassification + allocation.
+ */
+async function finishAgeCollection(
+  deps: AdvancedRoomAllocationDeps,
+  ac:   NonNullable<AraState["ageCollection"]>,
+  childrenAges: number[],
+): Promise<string | null> {
+  const { node, hotelId, guestId, flowData, resetSession } = deps;
+  const vars = flowData.flowVars;
+  const data = (node.data ?? {}) as AdvancedRoomAllocationNodeData;
+  const config = resolveConfig(data, deps.childAgeLimit);
+
+  const checkIn  = vars["bookingCheckIn"];
+  const checkOut = vars["bookingCheckOut"];
+  if (!checkIn || !checkOut) {
+    await resetSession(guestId, hotelId);
+    return "I don't have your check-in / check-out dates yet. Please start over from the main menu.";
+  }
+  const nights = countNights(checkIn, checkOut);
+  if (nights <= 0) {
+    await resetSession(guestId, hotelId);
+    return "Check-out must be after check-in. Please start over from the main menu.";
+  }
+
+  return reclassifyAndProceed(deps, {
+    adults:   ac.adults,
+    children: ac.children,
+    childrenAges,
+    checkIn,
+    checkOut,
+    nights,
+    config,
+  });
 }
 
 // ── Phase 2 helpers ───────────────────────────────────────────────────────────
@@ -1360,6 +1698,12 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     // No state and not a confirm-like input → reset gracefully.
     await resetSession(guestId, hotelId);
     return safeMenu(hotelId);
+  }
+
+  // ── Children-age collection sub-phase (Task 1) ─────────────────────────────
+  // (MENU is already handled globally above.)
+  if (state.phase === "collecting_ages") {
+    return handleAgeCollection(deps, state);
   }
 
   // ── Plan selection sub-phase ───────────────────────────────────────────────

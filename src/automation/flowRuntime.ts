@@ -42,15 +42,16 @@ import { generateReferenceNumber } from "../utils/booking.utils";
 import { cancelBooking } from "../services/booking.service";
 import { BookingStatus, MessageChannel, MessageStatus } from "@prisma/client";
 import { shouldAutoReply } from "./shouldAutoReply";
-import { sendCarouselMessage, sendMediaMessage, sendListMessage, type CarouselCard } from "../services/whatsapp.send.service";
+import { sendCarouselMessage, sendMediaMessage, sendListMessage, sendTextMessage, type CarouselCard } from "../services/whatsapp.send.service";
 import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
 import { getHotelConfigCached } from "../services/settings.service";
-import { extractDateWithAI, classifyBookingIntent, interpretAllocationModification } from "../services/ai.service";
+import { extractDateWithAI, classifyBookingIntent, interpretAllocationModification, extractChildrenAgesAI } from "../services/ai.service";
 import { handleAdvancedRoomAllocation, type AllocationRoomInput, type SendRoomCarouselFn } from "./nodes/advancedRoomAllocation";
 import { trySendPlanList } from "./nodes/planList";
 import { aggregateRoomQuantities } from "./bookingAllocation";
+import { interpolate } from "./interpolate";
 // randomUUID removed — no longer needed after multi-room booking refactor
 
 // Generic placeholder served when a room has no photos. Reliable HTTPS host —
@@ -142,10 +143,8 @@ function todayUTC(): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
-/** Replace {{varName}} or {{obj.field}} placeholders in text with values from flowVars. */
-function interpolate(text: string, flowVars: Record<string, string>): string {
-  return text.replace(/\{\{([\w.]+)\}\}/g, (_, key) => flowVars[key] ?? `{{${key}}}`);
-}
+// interpolate() moved to ./interpolate.ts (dependency-free, unit-testable);
+// imported at the top of this file.
 
 // Variable names that are injected by the runtime or set by action nodes from
 // DB-verified data. A flow admin naming a *question* node with one of these
@@ -469,6 +468,41 @@ const trySendRoomTypeCarousel: SendRoomCarouselFn = async ({ hotelId, guestId, r
   }
 };
 
+// ── ARA occupancy-notice sender ───────────────────────────────────────────────
+// Sends the "children counted as adults" summary directly (sendTextMessage, not
+// BullMQ) right before the room carousel. Persists the OUT bubble + emits so the
+// dashboard shows it. Never throws — a failed notice must not block allocation.
+async function trySendOccupancyNotice(args: { hotelId: string; guestId: string; text: string }): Promise<void> {
+  const { hotelId, guestId, text } = args;
+  try {
+    const [hotel, guest] = await Promise.all([
+      prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } }),
+      prisma.guest.findUnique({ where: { id: guestId }, select: { phone: true } }),
+    ]);
+    if (!hotel || !guest) return;
+
+    await sendTextMessage({ toPhone: guest.phone, fromPhone: hotel.phone, hotelId, guestId, text });
+
+    const saved = await prisma.message.create({
+      data: {
+        direction:   "OUT",
+        fromPhone:   hotel.phone,
+        toPhone:     guest.phone,
+        body:        text,
+        messageType: "text",
+        hotelId,
+        guestId,
+        channel:     MessageChannel.WHATSAPP,
+        status:      MessageStatus.SENT,
+      },
+    });
+    const { emitToHotel } = await import("../realtime/emit");
+    emitToHotel(hotelId, "message:new", { message: saved });
+  } catch (err) {
+    log.warn({ err, hotelId, guestId }, "ARA occupancy notice send failed — skipping");
+  }
+}
+
 // ── Room type fetcher ──────────────────────────────────────────────────────────
 
 async function fetchRoomTypes(hotelId: string, filters?: {
@@ -494,7 +528,6 @@ async function fetchRoomTypes(hotelId: string, filters?: {
       extraAdultCharge: true,
       allowExtraBed: true,
       extraBedCharge: true,
-      childAgeLimit: true,
     },
   });
 }
@@ -1279,6 +1312,9 @@ export async function executeFlowStep(
           interpretModification: interpretAllocationModification,
           sendPlanList:     trySendPlanList,
           sendRoomCarousel: trySendRoomTypeCarousel,
+          childAgeLimit:        hotelCfg?.childAgeLimit ?? 12,
+          extractChildrenAges:  extractChildrenAgesAI,
+          sendOccupancyNotice:  trySendOccupancyNotice,
         });
       }
 

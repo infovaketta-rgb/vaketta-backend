@@ -677,3 +677,68 @@ export async function interpretAllocationModification(
     return FALLBACK;
   }
 }
+
+/**
+ * Extract children's ages from a free-text reply when plain integer parsing can't
+ * (e.g. "the twins are 8", "both are the same age, 6", "my eldest is 12").
+ * Returns the ages as an array of ints, or null on any error/timeout/parse
+ * failure so the caller can fall back to its regex result. Never throws.
+ *
+ * Same cheap/safe shape as classifyBookingIntent: temperature 0, tiny
+ * max_tokens, 3 s timeout.
+ */
+export async function extractChildrenAgesAI(reply: string): Promise<number[] | null> {
+  const system =
+    `Extract the ages of children from the guest message as a JSON array of integers. ` +
+    `Resolve relative phrasing: "twins"/"both"/"same age" mean two (or more) children share ` +
+    `one stated age; "eldest"/"youngest" refer to one child. ` +
+    `Respond with ONLY a JSON object, no prose, no markdown fences: {"ages": number[]}`;
+  const user = `Message: "${reply}"`;
+
+  const provider = activeProvider();
+  const timeout  = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000));
+
+  let raw: string | null = null;
+
+  try {
+    if (provider === "openai") {
+      const client = getOpenAIClient();
+      if (!client) return null;
+      const call = client.chat.completions.create({
+        model:       OPENAI_MODEL,
+        max_tokens:  40,
+        temperature: 0,
+        messages:    [{ role: "system", content: system }, { role: "user", content: user }],
+      }).then((r) => r.choices[0]?.message?.content?.trim() ?? null);
+      raw = await Promise.race([call, timeout]);
+    } else {
+      const client = getAnthropicClient();
+      if (!client) return null;
+      const call = client.messages.create({
+        model:      ANTHROPIC_MODEL,
+        max_tokens: 40,
+        system,
+        messages:   [{ role: "user", content: user }],
+      }).then((r) => (r.content[0]?.type === "text" ? r.content[0].text.trim() : null));
+      raw = await Promise.race([call, timeout]);
+    }
+  } catch (err) {
+    log.warn({ err }, "extractChildrenAgesAI: API call failed");
+    return null;
+  }
+
+  if (!raw) return null;
+
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+
+  try {
+    const parsed = JSON.parse(match[0]) as Record<string, unknown>;
+    if (!Array.isArray(parsed.ages)) return null;
+    const ages = parsed.ages
+      .filter((a): a is number => typeof a === "number" && Number.isInteger(a) && a >= 0 && a <= 30);
+    return ages;
+  } catch {
+    return null;
+  }
+}

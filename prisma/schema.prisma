@@ -130,6 +130,10 @@ model HotelConfig {
   botMessages       Json     @default("{}")
   aiInstructions    String?
 
+  // Hotel-wide age threshold: a child older than this is counted as an adult for
+  // occupancy/allocation. Replaces the (now deprecated) per-RoomType childAgeLimit.
+  childAgeLimit     Int      @default(12)
+
   // Message delay (undo-send)
   messageDelayEnabled   Boolean @default(false)
   messageDelaySeconds   Int     @default(10)    // 1–60
@@ -311,7 +315,7 @@ model RoomType {
   extraAdultCharge  Float?   // extra charge per adult per night above baseAdults
   allowExtraBed     Boolean  @default(false)
   extraBedCharge    Float?   // charge per night for the extra bed
-  childAgeLimit     Int?     // children above this age counted as adults
+  // childAgeLimit removed — now a single hotel-wide HotelConfig.childAgeLimit.
 
   totalRooms  Int         @default(1)
 
