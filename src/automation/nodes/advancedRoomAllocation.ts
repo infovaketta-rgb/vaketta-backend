@@ -43,7 +43,7 @@ export type AraState = {
   guests:          { adults: number; children: number; childrenAges?: number[] };
   selectedRooms:   AllocationRoom[];
   remainingGuests: { adults: number; children: number };
-  phase:           "collecting_ages" | "confirm" | "manual" | "room_menu" | "move_from_count" | "move_to_room" | "change_type_select" | "plan_selection";
+  phase:           "collecting_ages" | "collecting_room_preference" | "confirm" | "manual" | "room_menu" | "move_from_count" | "move_to_room" | "change_type_select" | "plan_selection";
   // Structured-modify navigation (all optional — older state shapes stay valid):
   selectedRoomIndex?: number; // which room the guest is editing (room_menu / move_*)
   pendingMove?: { fromRoomIndex: number; adults: number; children: number };
@@ -59,7 +59,26 @@ export type AraState = {
     collectedAges: number[]; // ages gathered so far across rounds
     rounds:        number;   // accumulation rounds used (each guest reply counts as one)
   };
+  // ── Room-preference collection (Piece 2A). Present during
+  // "collecting_room_preference"; carries the inputs needed to generate plans
+  // once the guest taps a carousel card or "Mix it up". ──
+  preferredRoomTypeId?: string | null;     // set on tap; null = "Mix it up"
+  selectedPlanType?:    PlanType;          // which plan the guest finally chose
+  prefCollection?: {
+    adults:   number;
+    children: number;
+    nights:   number;
+    rooms:    AllocationRoomInput[];        // inventory snapshot (avoids re-query)
+  };
 };
+
+/** Smart-plan classification (Piece 2). */
+export type PlanType =
+  | "YOUR_CHOICE"
+  | "BEST_VALUE"
+  | "BEST_EXPERIENCE"
+  | "BUDGET_FRIENDLY"
+  | "DYNAMIC_EXTRAS";
 
 /** One candidate allocation plan offered in the Phase-1 carousel. */
 export interface AllocationPlan {
@@ -71,6 +90,11 @@ export interface AllocationPlan {
   extraBedCount:     number;
   primaryRoomTypeId: string;            // most-used type in this plan (for the photo)
   planTag:           "comfort" | "value" | "premium";
+  // ── Smart-plan fields (Piece 2). Optional so the legacy generatePlans path and
+  // its tests stay valid; generateSmartPlans always sets all three. ──
+  planId?:           string;            // stable per-plan id ("smart_0", …)
+  rationale?:        string;            // one-line explanation shown in the list row
+  planType?:         PlanType;          // which strategy produced this plan
 }
 
 export type AllocationRoomInput = {
@@ -80,6 +104,7 @@ export type AllocationRoomInput = {
   maxAdults:      number | null;
   maxChildren:    number | null;
   availableCount: number;
+  description?:   string | null; // guest-facing blurb (RoomType.description)
   // Per-room-type occupancy/pricing overrides (DB). Null/undefined → fall back
   // to the node-level config. Allocation caps still use the node config; these
   // only influence the per-room price breakdown.
@@ -375,6 +400,134 @@ export function generatePlans(params: {
     p.roomCount > 0 ? p.roomCount * (p.totalPrice / p.roomCount) : 0;
   unique.sort((x, y) => score(x) - score(y));
   return unique;
+}
+
+// ── Smart multi-plan generator (Piece 2 — pure, testable) ─────────────────────
+//
+// Orchestration layer ONLY. Every candidate is produced by the protected
+// `allocateRooms` engine; this function just chooses inputs (which room types,
+// which strategy) and labels/dedups/ranks the results. The base-first absorb
+// algorithm is never modified.
+
+const PLAN_PRIORITY: Record<PlanType, number> = {
+  YOUR_CHOICE: 0, BEST_VALUE: 1, BEST_EXPERIENCE: 2, BUDGET_FRIENDLY: 3, DYNAMIC_EXTRAS: 4,
+};
+
+/** Composition signature for dedup: sorted "typeId×qty" + total price. */
+function planSignature(p: AllocationPlan): string {
+  const counts = new Map<string, number>();
+  for (const r of p.rooms) counts.set(r.roomTypeId, (counts.get(r.roomTypeId) ?? 0) + 1);
+  const comp = [...counts.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([id, c]) => `${id}x${c}`).join(",");
+  return `${comp}|${p.totalPrice}`;
+}
+
+/** True if `p` differs meaningfully from every plan in `existing` (Piece 2 dynamic rule). */
+function isDistinctPlan(p: AllocationPlan, existing: AllocationPlan[]): boolean {
+  const sig = planSignature(p);
+  for (const e of existing) {
+    if (planSignature(e) === sig) return false; // identical composition + price
+    // ...also treat as duplicate when total price is within 10% AND same room count.
+    const diff = e.totalPrice === 0 ? 0 : Math.abs(p.totalPrice - e.totalPrice) / e.totalPrice;
+    if (diff <= 0.10 && p.roomCount === e.roomCount) return false;
+  }
+  return true;
+}
+
+/** Cheapest available room type, or undefined when none have inventory. */
+function cheapestType(rooms: AllocationRoomInput[]): AllocationRoomInput | undefined {
+  return [...rooms].filter((r) => r.availableCount > 0).sort((a, b) => a.basePrice - b.basePrice)[0];
+}
+
+type SmartPlanArgs = {
+  adults:               number;
+  children:             number;
+  rooms:                AllocationRoomInput[];
+  config:               AllocationConfig;
+  nights:               number;
+  preferredRoomTypeId?: string | null; // null/undefined = "Mix it up" (no preference)
+  maxPlans:             number;        // 1–8
+};
+
+/**
+ * Preference-aware multi-plan engine. Generates the plan types in priority order,
+ * dedups by composition+price (and ±10% price w/ same room count), and trims to
+ * maxPlans keeping highest-priority first. Always returns ≥1 plan when anything
+ * fits, [] only when nothing houses the party.
+ */
+export function generateSmartPlans(args: SmartPlanArgs): AllocationPlan[] {
+  const { adults, children, rooms, config, nights, preferredRoomTypeId, maxPlans } = args;
+  const cap = Math.min(8, Math.max(1, Math.floor(maxPlans) || 4));
+
+  const inr = (n: number) => `₹${Math.round(n).toLocaleString("en-IN")}`;
+  const out: AllocationPlan[] = [];
+
+  // Helper: run the engine + wrap as a typed smart plan (or null if it can't fit).
+  const make = (
+    roomSet: AllocationRoomInput[],
+    strategy: "base-first" | "max-fill",
+    planType: PlanType,
+    label: string,
+    rationale: (p: AllocationPlan) => string,
+  ): AllocationPlan | null => {
+    if (roomSet.length === 0) return null;
+    const rooms = allocateRooms({ adults, children, rooms: roomSet, config, nights, strategy });
+    if (!rooms || rooms.length === 0) return null;
+    const base = toPlan(label, planType === "BEST_VALUE" || planType === "BUDGET_FRIENDLY" ? "value" : planType === "BEST_EXPERIENCE" ? "premium" : "comfort", rooms, nights);
+    return { ...base, planType, rationale: rationale(base) };
+  };
+
+  // ── YOUR_CHOICE — only when a preference is set. Preferred type for max slots. ──
+  if (preferredRoomTypeId) {
+    const preferred = rooms.find((r) => r.roomTypeId === preferredRoomTypeId && r.availableCount > 0);
+    if (preferred) {
+      // Prefer preferred-only (so the whole stay is the requested type). If that
+      // can't house everyone, fall back to preferred + the rest (best-effort).
+      const yourChoice =
+        make([preferred], "base-first", "YOUR_CHOICE", "Your Choice ⭐",
+          (p) => `${p.roomCount} ${preferred.name} room${p.roomCount === 1 ? "" : "s"} as requested`)
+        ?? make([preferred, ...rooms.filter((r) => r.roomTypeId !== preferredRoomTypeId)], "base-first", "YOUR_CHOICE", "Your Choice ⭐",
+          (p) => `Includes your preferred ${preferred.name}`);
+      if (yourChoice) out.push(yourChoice);
+    }
+  }
+
+  // ── BEST_VALUE — cheapest, aggressive extra beds → fewest rooms (max-fill). ──
+  const bestValue = make(rooms, "max-fill", "BEST_VALUE", "Best Value 💰",
+    (p) => `Fewest rooms — best rate at ${inr(p.totalPrice)}`);
+  if (bestValue && isDistinctPlan(bestValue, out)) out.push(bestValue);
+
+  // ── BEST_EXPERIENCE — priciest types, base occupancy (no cramming). ──
+  const cheapest = cheapestType(rooms);
+  const premiumRooms = cheapest ? rooms.filter((r) => r.roomTypeId !== cheapest.roomTypeId) : rooms;
+  const bestExperience = make(premiumRooms.length > 0 ? premiumRooms : rooms, "base-first", "BEST_EXPERIENCE", "Best Experience 🌟",
+    (p) => `Most spacious — ${planTypeName(p)} throughout`);
+  if (bestExperience && isDistinctPlan(bestExperience, out)) out.push(bestExperience);
+
+  // ── BUDGET_FRIENDLY — uniform cheapest type for all rooms; only if distinct. ──
+  if (cheapest) {
+    const budget = make([cheapest], "max-fill", "BUDGET_FRIENDLY", "Budget Friendly 🤝",
+      (p) => `Best rate — all ${cheapest.name}`);
+    if (budget && isDistinctPlan(budget, out)) out.push(budget);
+  }
+
+  // ── DYNAMIC_EXTRAS — up to 2 more distinct combos. ──
+  let extras = 0;
+  const dynamicCandidates: Array<AllocationPlan | null> = [
+    make(rooms, "base-first", "DYNAMIC_EXTRAS", "Comfort Pick ✨", (p) => `${p.roomCount} room${p.roomCount === 1 ? "" : "s"}, base occupancy`),
+    cheapest ? make(rooms.filter((r) => r.roomTypeId !== cheapest.roomTypeId), "max-fill", "DYNAMIC_EXTRAS", "Premium Value ✨", (p) => `${planTypeName(p)} — ${inr(p.totalPrice)}`) : null,
+  ];
+  for (const cand of dynamicCandidates) {
+    if (extras >= 2) break;
+    if (cand && isDistinctPlan(cand, out)) { out.push(cand); extras++; }
+  }
+
+  // Trim to maxPlans, keeping highest-priority plan types first.
+  out.sort((a, b) => (PLAN_PRIORITY[a.planType!] - PLAN_PRIORITY[b.planType!]) || (a.totalPrice - b.totalPrice));
+  const trimmed = out.slice(0, cap);
+
+  // Assign stable ids after trimming.
+  trimmed.forEach((p, i) => { p.planId = `smart_${i}`; });
+  return trimmed;
 }
 
 // ── Manual modification (pure, testable appliers) ─────────────────────────────
@@ -949,6 +1102,31 @@ export function renderPlanTextFallback(plans: AllocationPlan[]): string {
   return text;
 }
 
+/**
+ * Room-descriptions text (Piece 1D). One block per AVAILABLE room type:
+ *   *{name}* — ₹{basePrice}/night
+ *   _{description}_   ← omitted entirely when the type has no description
+ * WhatsApp-safe (bold/italic/newlines only). Pure + exported. Returns null when
+ * there are no available room types (caller skips the send).
+ */
+export function buildRoomDescriptionsMessage(rooms: AllocationRoomInput[]): string | null {
+  const inr = (n: number) => `₹${Math.round(n).toLocaleString("en-IN")}`;
+  const available = rooms.filter((r) => r.availableCount > 0);
+  if (available.length === 0) return null;
+
+  const blocks = available.map((r) => {
+    const head = `*${r.name}* — ${inr(r.basePrice)}/night`;
+    const desc = (r.description ?? "").trim();
+    return desc ? `${head}\n_${desc}_` : head; // no empty italic line when blank
+  });
+
+  return (
+    `🏨 *Our Room Types*\n\n` +
+    `${blocks.join("\n\n")}\n\n` +
+    `_Tap the options below to choose your preferred room type_ 👇`
+  );
+}
+
 // ── Output contract ───────────────────────────────────────────────────────────
 
 /**
@@ -1064,6 +1242,12 @@ export type AdvancedRoomAllocationDeps = {
   // OPTIONAL — sends the occupancy-summary text before the carousel when children
   // are promoted to adults. Absent → notice is skipped silently.
   sendOccupancyNotice?: (args: { hotelId: string; guestId: string; text: string }) => Promise<void>;
+  // OPTIONAL (Piece 1D) — sends a plain-text room-descriptions message before the
+  // carousel when the node's sendRoomDescriptions toggle is on. Absent → skipped.
+  sendRoomDescriptions?: (args: { hotelId: string; guestId: string; text: string }) => Promise<void>;
+  // OPTIONAL (Piece 2A) — sends the "Mix it up 🎲" interactive list AFTER the
+  // carousel. Reply id "MIX_IT_UP". Returns true if sent. Absent → text fallback.
+  sendMixItUpList?: (args: { hotelId: string; guestId: string }) => Promise<boolean>;
 };
 
 /** Sends the multi-plan interactive list; returns true if sent (→ "ALREADY_SENT"). */
@@ -1154,6 +1338,7 @@ async function buildInventoryRooms(
       maxAdults:     r.maxAdults,
       maxChildren:   r.maxChildren,
       availableCount,
+      description:      r.description     ?? null,
       baseAdults:       r.baseAdults       ?? null,
       baseChildren:     r.baseChildren     ?? null,
       extraAdultCharge: r.extraAdultCharge ?? null,
@@ -1345,18 +1530,96 @@ async function proceedToAllocation(
   const { effectiveAdults: adults, effectiveChildren: children, effectiveChildrenAges, checkIn, checkOut, nights, config } = args;
 
   const roomInputs = await buildInventoryRooms(hotelId, checkIn, checkOut, fetchRoomTypes, getCalendarData);
-  const plans = generatePlans({ adults, children, rooms: roomInputs, config, nights });
 
-  if (plans.length === 0) {
+  // Inventory-exhaustion guard: if no combination can house the party at all,
+  // fail gracefully BEFORE sending the carousel (no point asking for a preference).
+  const feasible = allocateRooms({ adults, children, rooms: roomInputs, config, nights });
+  if (!feasible || feasible.length === 0) {
     await resetSession(guestId, hotelId);
     return `Sorry, we don't have enough rooms for ${adults + children} guests on those dates. Please contact us directly or try different dates.`;
-    // ↑ Spec-mandated graceful failure (step 3 inventory-exhaustion path).
   }
 
   const childrenAges = effectiveChildrenAges;
   const guestsField = { adults, children, ...(childrenAges.length > 0 ? { childrenAges } : {}) };
+  const node = (deps.node.data ?? {}) as AdvancedRoomAllocationNodeData;
 
-  // Single unique plan → existing single-summary confirm flow (no carousel).
+  // ── Piece 2A: carousel-first preference collection. ──
+  // 1D — optional room-descriptions text before the carousel.
+  if (node.sendRoomDescriptions && deps.sendRoomDescriptions) {
+    const descText = buildRoomDescriptionsMessage(roomInputs);
+    if (descText) await deps.sendRoomDescriptions({ hotelId, guestId, text: descText });
+  }
+
+  // Enter collecting_room_preference and persist the inventory snapshot so the
+  // preference handler can generate plans without re-querying.
+  const prefState: AraState = {
+    guests:          guestsField,
+    selectedRooms:   [],
+    remainingGuests: { adults: 0, children: 0 },
+    phase:           "collecting_room_preference",
+    prefCollection:  { adults, children, nights, rooms: roomInputs },
+  };
+  writeState(vars, prefState);
+  flowData.waitingFor = "answer";
+  await persist(deps);
+
+  // Message: room-type carousel (cards = room types; tap sets the preference).
+  if (deps.sendRoomCarousel) {
+    await deps.sendRoomCarousel({ hotelId, guestId, roomInputs, adults });
+  }
+
+  // Message: "Mix it up 🎲" interactive list AFTER the carousel.
+  if (deps.sendMixItUpList) {
+    const sent = await deps.sendMixItUpList({ hotelId, guestId });
+    if (sent) return "ALREADY_SENT";
+  }
+  // Text fallback (no list dep): tell the guest how to pick / mix.
+  return "_Not sure? Reply *MIX* and we'll pick the best combination for you_ 🎲";
+}
+
+/**
+ * Generate preference-aware plans and send the plan list (Piece 2B/2C). Shared by
+ * the preference handler. Writes plan_selection state. Returns the reply string
+ * ("ALREADY_SENT" when the list was dispatched, else a text fallback / error).
+ */
+async function generateAndSendPlans(
+  deps: AdvancedRoomAllocationDeps,
+  args: {
+    guestsField:          AraState["guests"];
+    preferredRoomTypeId:  string | null;
+    pref:                 NonNullable<AraState["prefCollection"]>;
+  },
+): Promise<string | null> {
+  const { hotelId, guestId, flowData, resetSession } = deps;
+  const vars = flowData.flowVars;
+  const { guestsField, preferredRoomTypeId, pref } = args;
+
+  const node    = (deps.node.data ?? {}) as AdvancedRoomAllocationNodeData;
+  const maxPlans = typeof node.maxPlans === "number" ? node.maxPlans : 4;
+  const config   = { ...resolveConfig(node), childAgeLimit: deps.childAgeLimit ?? resolveConfig(node).childAgeLimit };
+
+  const plans = generateSmartPlans({
+    adults:   pref.adults,
+    children: pref.children,
+    rooms:    pref.rooms,
+    config,
+    nights:   pref.nights,
+    preferredRoomTypeId,
+    maxPlans,
+  });
+
+  if (plans.length === 0) {
+    await resetSession(guestId, hotelId);
+    return `Sorry, we don't have enough rooms for ${pref.adults + pref.children} guests on those dates. Please contact us directly or try different dates.`;
+  }
+
+  // Record the preference + plan count as flow vars (Piece 2E partial). Mutate
+  // the live flowVars object in place — `vars` (and writeState below) reference
+  // it, so reassigning flowData.flowVars would orphan those writes.
+  vars["preferredRoomTypeId"] = preferredRoomTypeId ?? "";
+  vars["planCount"]           = String(plans.length);
+
+  // Single plan → straight to confirm (no list needed).
   if (plans.length === 1) {
     const only = plans[0]!;
     const newState: AraState = {
@@ -1364,35 +1627,31 @@ async function proceedToAllocation(
       selectedRooms:   only.rooms,
       remainingGuests: { adults: 0, children: 0 },
       phase:           "confirm",
+      preferredRoomTypeId,
+      ...(only.planType ? { selectedPlanType: only.planType } : {}),
     };
     writeState(vars, newState);
     flowData.waitingFor = "answer";
     await persist(deps);
-    return renderAllocationSummary(only.rooms, { trailing: confirmPromptFooter(), childrenAges });
+    return renderAllocationSummary(only.rooms, { trailing: confirmPromptFooter(), childrenAges: guestsField.childrenAges });
   }
 
-  // 2–3 plans → plan_selection: store plans + eligible room types, offer carousel
-  // then plan list (fall back to text when deps absent).
+  // Multiple plans → plan_selection.
   const planState: AraState = {
     guests:          guestsField,
     selectedRooms:   [],
     remainingGuests: { adults: 0, children: 0 },
     phase:           "plan_selection",
     plans,
-    eligibleRoomInputs: roomInputs,
+    eligibleRoomInputs: pref.rooms,
+    preferredRoomTypeId,
   };
   writeState(vars, planState);
   flowData.waitingFor = "answer";
   await persist(deps);
 
-  // Message 1 — room type carousel (fire-and-forget on failure; plan list still follows)
-  if (deps.sendRoomCarousel) {
-    await deps.sendRoomCarousel({ hotelId, guestId, roomInputs, adults });
-  }
-
-  // Message 2 — plan list
   if (deps.sendPlanList) {
-    const sent = await deps.sendPlanList({ hotelId, guestId, plans, eligibleRoomInputs: roomInputs });
+    const sent = await deps.sendPlanList({ hotelId, guestId, plans, eligibleRoomInputs: pref.rooms });
     if (sent) return "ALREADY_SENT";
   }
   return renderPlanTextFallback(plans);
@@ -1530,7 +1789,14 @@ function isDoneInput(raw: string): boolean {
 async function finalizeAndAdvance(deps: AdvancedRoomAllocationDeps, allocated: AllocationRoom[]): Promise<string | null> {
   const { flowData, currentNodeId, adjacency, nextNodeId, advance, guestId, hotelId, resetSession, safeMenu } = deps;
   // Output contract write is guarded by !bookingRooms inside writeOutputContract.
-  writeOutputContract(flowData.flowVars, allocated);
+  const wrote = writeOutputContract(flowData.flowVars, allocated);
+  // Piece 2E — selectedPlanType from the (pre-clear) state. preferredRoomTypeId +
+  // planCount were already written when the plan list was generated. Only write on
+  // the first finalize (same idempotency window as the output contract).
+  if (wrote) {
+    const st = readState(flowData.flowVars);
+    if (st?.selectedPlanType) flowData.flowVars["selectedPlanType"] = st.selectedPlanType;
+  }
   clearState(flowData.flowVars);
   delete flowData.waitingFor;
 
@@ -1706,8 +1972,39 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     return handleAgeCollection(deps, state);
   }
 
+  // ── Room-preference collection sub-phase (Piece 2A) ────────────────────────
+  // Guest taps a carousel card (room_TYPE:{id}) → that's the preferred type;
+  // taps/types "Mix it up" (MIX_IT_UP / "mix") → no preference. Then we generate
+  // preference-aware plans and send the plan list. (MENU handled globally above.)
+  if (state.phase === "collecting_room_preference") {
+    const pref = state.prefCollection;
+    if (!pref) {                         // corrupt state → reset gracefully
+      clearState(vars);
+      await resetSession(guestId, hotelId);
+      return safeMenu(hotelId);
+    }
+    const t = input.trim();
+
+    // "Mix it up" — list reply id MIX_IT_UP, or a typed "mix" fallback.
+    if (/^MIX_IT_UP$/i.test(t) || /^mix$/i.test(t)) {
+      return generateAndSendPlans(deps, { guestsField: state.guests, preferredRoomTypeId: null, pref });
+    }
+
+    // Carousel card tap — "room_TYPE:{id}" (or "ROOM_TYPE:{id}" text fallback).
+    const tappedId = t.match(/^room_TYPE:(.+)$/i)?.[1] ?? t.match(/^ROOM_TYPE:(.+)$/i)?.[1];
+    if (tappedId) {
+      const known = pref.rooms.some((r) => r.roomTypeId === tappedId && r.availableCount > 0);
+      const preferredRoomTypeId = known ? tappedId : null; // unknown id → treat as no preference
+      return generateAndSendPlans(deps, { guestsField: state.guests, preferredRoomTypeId, pref });
+    }
+
+    // Unrecognised reply → re-prompt (stay in the phase, no mutation).
+    return "Please tap a room type from the cards above, or *Mix it up 🎲* to let us choose. Reply *MENU* to cancel.";
+  }
+
   // ── Plan selection sub-phase ───────────────────────────────────────────────
-  // (MENU is already handled globally above.)
+  // (MENU is already handled globally above.) Carousel taps are handled in the
+  // preference phase now; here we only accept a plan choice.
   if (state.phase === "plan_selection") {
     const plans = state.plans ?? [];
     if (plans.length === 0) {            // corrupt state → reset gracefully
@@ -1718,38 +2015,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
 
     const t = input.trim();
 
-    // ── Single room-type selection: carousel button ("room_{id}") or list row ("ROOM_TYPE:{id}") ──
-    // When a guest taps a carousel card or picks from Section 2 of the plan list, we
-    // run allocateRooms restricted to that single type and jump straight to confirm.
-    const roomTypeIdFromButton = t.match(/^room_TYPE:(.+)$/i)?.[1]    // list row id
-                              ?? t.match(/^ROOM_TYPE:(.+)$/i)?.[1];   // text fallback
-    if (roomTypeIdFromButton) {
-      const eligible = state.eligibleRoomInputs ?? [];
-      const single   = eligible.filter((r) => r.roomTypeId === roomTypeIdFromButton);
-      if (single.length > 0) {
-        const nodeConfig = resolveConfig((deps.node.data ?? {}) as AdvancedRoomAllocationNodeData);
-        const nights     = countNights(deps.flowData.flowVars["bookingCheckIn"] ?? "", deps.flowData.flowVars["bookingCheckOut"] ?? "");
-        const singlePlan = allocateRooms({ adults: state.guests.adults, children: state.guests.children, rooms: single, config: nodeConfig, nights });
-        if (singlePlan && singlePlan.length > 0) {
-          const confirmState: AraState = {
-            guests:          state.guests,
-            selectedRooms:   singlePlan,
-            remainingGuests: { adults: 0, children: 0 },
-            phase:           "confirm",
-          };
-          writeState(vars, confirmState);
-          await persist(deps);
-          return renderAllocationSummary(singlePlan, { trailing: confirmPromptFooter(), childrenAges: state.guests.childrenAges });
-        }
-        // allocateRooms returned null — that room type can't house the guests on those dates
-        const typeName = single[0]?.name ?? "That room type";
-        return `Sorry, *${typeName}* is not available for your selected dates. Please choose another option.\n\n${renderPlanTextFallback(plans)}`;
-      }
-      // Room type id not found in state — re-show the list
-      return renderPlanTextFallback(plans);
-    }
-
-    // ── Recommended-plan selection: "plan_N" (0-based) or text "1".."N" ──
+    // ── Plan selection: "plan_N" (0-based) or text "1".."N" ──
     let idx = -1;
     const m = t.match(/^plan_(\d+)$/i);
     if (m) {
@@ -1766,11 +2032,13 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
 
     const chosen = plans[idx]!;
     const confirmState: AraState = {
-      guests:            state.guests,
-      selectedRooms:     chosen.rooms,
-      remainingGuests:   { adults: 0, children: 0 },
-      phase:             "confirm",
-      selectedPlanIndex: idx,
+      guests:              state.guests,
+      selectedRooms:       chosen.rooms,
+      remainingGuests:     { adults: 0, children: 0 },
+      phase:               "confirm",
+      selectedPlanIndex:   idx,
+      ...(state.preferredRoomTypeId !== undefined ? { preferredRoomTypeId: state.preferredRoomTypeId } : {}),
+      ...(chosen.planType ? { selectedPlanType: chosen.planType } : {}),
     };
     writeState(vars, confirmState);
     await persist(deps);

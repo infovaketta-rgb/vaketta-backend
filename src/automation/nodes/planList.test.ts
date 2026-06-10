@@ -131,7 +131,9 @@ describe("plan detail text", () => {
     expect(opts.sections[0]!.title).toBe("Choose a Plan");
     const rows = opts.sections[0]!.rows;
     expect(rows.map((r) => r.id)).toEqual(["plan_0", "plan_1"]);
-    expect(rows[0]!.title.startsWith("Plan 1")).toBe(true);
+    // New row format (Piece 2C): "{label} — ₹{total}" title; rationale (or the
+    // legacy buildPlanDescription when a plan has no rationale) as description.
+    expect(rows[0]!.title.startsWith("A —")).toBe(true);
     expect(rows[0]!.title.length).toBeLessThanOrEqual(24);
     expect(rows[1]!.description).toBe(buildPlanDescription(plans[1]!));
     expect(opts.bodyText).toContain("Your Room Options"); // full breakdown is the body

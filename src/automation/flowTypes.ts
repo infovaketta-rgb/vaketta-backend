@@ -275,6 +275,10 @@ export interface AdvancedRoomAllocationNodeData {
   adultsVar?:         string;  // flowVar holding number of adults
   childrenVar?:       string;  // flowVar holding number of children
   childrenAgesVar?:   string;  // flowVar holding children ages (CSV/text)
+  // Piece 1D — when true, send a room-descriptions text before the carousel.
+  sendRoomDescriptions?: boolean; // default false
+  // Piece 2D — how many smart plans to offer (1–8, default 4).
+  maxPlans?:             number;
   label?:             string;
 }
 

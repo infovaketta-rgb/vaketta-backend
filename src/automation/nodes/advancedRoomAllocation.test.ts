@@ -20,6 +20,8 @@ import {
   applyChangeRoomType,
   roomMenuOptions,
   generatePlans,
+  generateSmartPlans,
+  buildRoomDescriptionsMessage,
   renderPlanTextFallback,
   extractAgesRegex,
   needsAiAgeParse,
@@ -252,9 +254,14 @@ describe("handleAdvancedRoomAllocation — handler", () => {
   });
 
   // ── Phase 1 happy path — for subsequent handler tests we need real araState ─
+  // Phase 1 now lands in collecting_room_preference (carousel-first, Piece 2A);
+  // drive through it with "Mix it up" (no preference) to reach confirm/plan_selection.
   async function primeConfirmState(rooms: AllocationRoomInput[], flowVars: Record<string, string>) {
     const deps = makeDeps({ rooms, flowVars });
-    await handleAdvancedRoomAllocation(deps);
+    await handleAdvancedRoomAllocation(deps);             // → collecting_room_preference
+    deps.input = "MIX_IT_UP";
+    await handleAdvancedRoomAllocation(deps);             // → confirm / plan_selection
+    deps.input = "";                                     // reset for the caller's own input
     return deps;
   }
 
@@ -519,12 +526,15 @@ describe("guest count variables", () => {
   });
 
   // 4. Ages count matches children → stored + shown on the child line.
+  // (Drive through the preference step to reach the confirm summary.)
   it("Case G4: ages stored and shown when count matches children", async () => {
     const deps = makeDeps({
       nodeData: { childrenAgesVar: "kidAges", maxChildren: 2 },
       flowVars: { bookingAdults: "2", bookingChildren: "2", kidAges: "6, 9" },
       rooms: [room({ roomTypeId: "rt_fam", name: "Family", maxAdults: 3, maxChildren: 2, availableCount: 5 })],
     });
+    await handleAdvancedRoomAllocation(deps);            // → collecting_room_preference
+    deps.input = "MIX_IT_UP";
     const result = await handleAdvancedRoomAllocation(deps);
     const state = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
     expect(state.guests.childrenAges).toEqual([6, 9]);
@@ -538,6 +548,8 @@ describe("guest count variables", () => {
       flowVars: { bookingAdults: "2", bookingChildren: "1", kidAges: "6, 9" }, // 2 ages, 1 child
       rooms: [room({ roomTypeId: "rt_std", name: "Standard", maxAdults: 3, maxChildren: 2, availableCount: 5 })],
     });
+    await handleAdvancedRoomAllocation(deps);            // → collecting_room_preference
+    deps.input = "MIX_IT_UP";
     const result = await handleAdvancedRoomAllocation(deps);
     const state = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
     expect(state.guests.childrenAges).toEqual([6, 9]);
@@ -546,6 +558,7 @@ describe("guest count variables", () => {
   });
 
   // 6. Back-compat — no vars set → bookingAdults / bookingChildren defaults.
+  // Phase 1 now lands in collecting_room_preference; guests still carried in state.
   it("Case G6: falls back to bookingAdults/bookingChildren when no vars set", async () => {
     const deps = makeDeps({
       flowVars: { bookingAdults: "3", bookingChildren: "0" },
@@ -1588,7 +1601,7 @@ describe("multiple plans carousel", () => {
     expect((deps.fetchRoomTypes as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0); // never re-allocated
   });
 
-  // 15. Single-plan path: Phase 1 with one plan → single summary, no plan_selection.
+  // 15. Single-plan path: after preference (Mix it up) → single summary, no list.
   it("Case PC15: single plan goes straight to confirm, list not triggered", async () => {
     const sendPlanList = vi.fn(async () => true);
     const deps = makeDeps({
@@ -1596,6 +1609,8 @@ describe("multiple plans carousel", () => {
       rooms: [room({ roomTypeId: "rt_a", name: "Standard", basePrice: 5000, availableCount: 5 })],
       sendPlanList,
     });
+    await handleAdvancedRoomAllocation(deps);            // → collecting_room_preference
+    deps.input = "MIX_IT_UP";
     const result = await handleAdvancedRoomAllocation(deps);
     const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
     expect(after.phase).toBe("confirm");
@@ -1603,7 +1618,7 @@ describe("multiple plans carousel", () => {
     expect(sendPlanList).not.toHaveBeenCalled();
   });
 
-  // 16. Multi-plan + list dep → sends the list, returns ALREADY_SENT, stores plans.
+  // 16. Multi-plan + list dep → after preference, sends the list, ALREADY_SENT.
   it("Case PC16: multi-plan sends the list and returns ALREADY_SENT", async () => {
     const sendPlanList = vi.fn(async () => true);
     const deps = makeDeps({
@@ -1611,6 +1626,8 @@ describe("multiple plans carousel", () => {
       rooms: twoTypes(),
       sendPlanList,
     });
+    await handleAdvancedRoomAllocation(deps);            // → collecting_room_preference
+    deps.input = "MIX_IT_UP";
     const result = await handleAdvancedRoomAllocation(deps);
     const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
     expect(result).toBe("ALREADY_SENT");
@@ -1619,12 +1636,14 @@ describe("multiple plans carousel", () => {
     expect(after.plans!.length).toBeGreaterThanOrEqual(2);
   });
 
-  // 17. Multi-plan, no list dep → text fallback returned, plans stored.
+  // 17. Multi-plan, no list dep → after preference, text fallback, plans stored.
   it("Case PC17: multi-plan without list dep falls back to text", async () => {
     const deps = makeDeps({
       flowVars: { bookingAdults: "6", bookingChildren: "0" },
       rooms: twoTypes(),
     });
+    await handleAdvancedRoomAllocation(deps);            // → collecting_room_preference
+    deps.input = "MIX_IT_UP";
     const result = await handleAdvancedRoomAllocation(deps);
     const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
     expect(result).toMatch(/Choose your room plan/i);
@@ -1983,5 +2002,156 @@ describe("collecting_ages handler", () => {
     await handleAdvancedRoomAllocation(deps);
     expect(sendOccupancyNotice).not.toHaveBeenCalled();
     expect(deps.flowData.flowVars["promotedToAdult"]).toBe("0");
+  });
+});
+
+// ── Piece 2B: generateSmartPlans (pure — no DB, no Redis) ─────────────────────
+describe("generateSmartPlans", () => {
+  const cfg: AllocationConfig = {
+    baseAdults: 2, baseChildren: 0, maxAdults: 3, maxChildren: 1,
+    extraAdultCharge: 0, allowExtraBed: true, extraBedCharge: 500, childAgeLimit: null,
+  };
+  const twoTypes = (): AllocationRoomInput[] => [
+    room({ roomTypeId: "rt_dlx", name: "Deluxe",   basePrice: 5000, maxAdults: 3, maxChildren: 1, availableCount: 5 }),
+    room({ roomTypeId: "rt_sup", name: "Superior", basePrice: 6500, maxAdults: 3, maxChildren: 1, availableCount: 5 }),
+  ];
+
+  // 1. Preference set → YOUR_CHOICE uses the preferred type for max slots.
+  it("SP1: preferredRoomTypeId set → YOUR_CHOICE present and uses preferred type", () => {
+    const plans = generateSmartPlans({
+      adults: 4, children: 0, rooms: twoTypes(), config: cfg, nights: 2,
+      preferredRoomTypeId: "rt_sup", maxPlans: 8,
+    });
+    const yc = plans.find((p) => p.planType === "YOUR_CHOICE");
+    expect(yc).toBeTruthy();
+    expect(yc!.rooms.every((r) => r.roomTypeId === "rt_sup")).toBe(true);
+    expect(yc!.label).toBe("Your Choice ⭐");
+    expect(yc!.rationale).toContain("Superior");
+  });
+
+  // 2. No preference → YOUR_CHOICE not generated.
+  it("SP2: preferredRoomTypeId null → no YOUR_CHOICE plan", () => {
+    const plans = generateSmartPlans({
+      adults: 4, children: 0, rooms: twoTypes(), config: cfg, nights: 2,
+      preferredRoomTypeId: null, maxPlans: 8,
+    });
+    expect(plans.some((p) => p.planType === "YOUR_CHOICE")).toBe(false);
+  });
+
+  // 3. Duplicate plans removed before returning (no two share composition+price).
+  it("SP3: no duplicate plans (composition + price unique enough)", () => {
+    const plans = generateSmartPlans({
+      adults: 4, children: 0, rooms: twoTypes(), config: cfg, nights: 2,
+      preferredRoomTypeId: null, maxPlans: 8,
+    });
+    const sigs = plans.map((p) => {
+      const counts = new Map<string, number>();
+      for (const r of p.rooms) counts.set(r.roomTypeId, (counts.get(r.roomTypeId) ?? 0) + 1);
+      return `${[...counts.entries()].sort().map(([id, c]) => `${id}x${c}`).join(",")}|${p.totalPrice}`;
+    });
+    expect(new Set(sigs).size).toBe(sigs.length);
+  });
+
+  // 4. maxPlans=2 → at most 2 plans returned.
+  it("SP4: maxPlans=2 → only top 2 plans", () => {
+    const plans = generateSmartPlans({
+      adults: 6, children: 0, rooms: twoTypes(), config: cfg, nights: 2,
+      preferredRoomTypeId: "rt_dlx", maxPlans: 2,
+    });
+    expect(plans.length).toBeLessThanOrEqual(2);
+  });
+
+  // 5. All returned plans pass occupancy validation (every guest placed).
+  it("SP5: all plans house exactly the requested guests", () => {
+    const adults = 5, children = 2;
+    const plans = generateSmartPlans({
+      adults, children, rooms: twoTypes(), config: cfg, nights: 2,
+      preferredRoomTypeId: null, maxPlans: 8,
+    });
+    expect(plans.length).toBeGreaterThan(0);
+    for (const p of plans) {
+      const a = p.rooms.reduce((s, r) => s + r.adults, 0);
+      const c = p.rooms.reduce((s, r) => s + r.children, 0);
+      expect(a).toBe(adults);
+      expect(c).toBe(children);
+    }
+  });
+
+  // 6. BEST_VALUE total ≤ BEST_EXPERIENCE total (when both exist).
+  it("SP6: BEST_VALUE total ≤ BEST_EXPERIENCE total", () => {
+    const plans = generateSmartPlans({
+      adults: 6, children: 0, rooms: twoTypes(), config: cfg, nights: 2,
+      preferredRoomTypeId: null, maxPlans: 8,
+    });
+    const bv = plans.find((p) => p.planType === "BEST_VALUE");
+    const be = plans.find((p) => p.planType === "BEST_EXPERIENCE");
+    if (bv && be) expect(bv.totalPrice).toBeLessThanOrEqual(be.totalPrice);
+  });
+
+  // 7. Single room type available → only distinct plans, no duplicates.
+  it("SP7: single room type → distinct plans only", () => {
+    const one = [room({ roomTypeId: "rt_only", name: "Only", basePrice: 5000, maxAdults: 3, maxChildren: 1, availableCount: 5 })];
+    const plans = generateSmartPlans({
+      adults: 6, children: 0, rooms: one, config: cfg, nights: 2,
+      preferredRoomTypeId: null, maxPlans: 8,
+    });
+    expect(plans.length).toBeGreaterThanOrEqual(1);
+    const sigs = plans.map((p) => `${p.roomCount}|${p.totalPrice}|${p.extraBedCount}`);
+    expect(new Set(sigs).size).toBe(sigs.length);
+  });
+
+  // 8. BUDGET_FRIENDLY not generated when identical to BEST_VALUE.
+  it("SP8: BUDGET_FRIENDLY dropped if identical to BEST_VALUE", () => {
+    // Single type → BEST_VALUE (max-fill cheapest) == BUDGET_FRIENDLY (uniform cheapest).
+    const one = [room({ roomTypeId: "rt_only", name: "Only", basePrice: 5000, maxAdults: 3, maxChildren: 1, availableCount: 5 })];
+    const plans = generateSmartPlans({
+      adults: 6, children: 0, rooms: one, config: cfg, nights: 2,
+      preferredRoomTypeId: null, maxPlans: 8,
+    });
+    const bv = plans.filter((p) => p.planType === "BEST_VALUE").length;
+    const bf = plans.filter((p) => p.planType === "BUDGET_FRIENDLY").length;
+    // At most one of the two value-style plans survives dedup for a single type.
+    expect(bv + bf).toBeLessThanOrEqual(1);
+  });
+});
+
+// ── Piece 1D: buildRoomDescriptionsMessage (pure) ─────────────────────────────
+describe("buildRoomDescriptionsMessage", () => {
+  // 1. All rooms have descriptions → full text with name+price+italic desc.
+  it("RD1: all rooms described → name, price, and italic description per room", () => {
+    const rooms = [
+      room({ roomTypeId: "a", name: "Deluxe",   basePrice: 5000, availableCount: 3, description: "Cozy sea view" }),
+      room({ roomTypeId: "b", name: "Superior", basePrice: 6500, availableCount: 2, description: "Spacious suite" }),
+    ];
+    const msg = buildRoomDescriptionsMessage(rooms)!;
+    expect(msg).toContain("🏨 *Our Room Types*");
+    expect(msg).toContain("*Deluxe* — ₹5,000/night");
+    expect(msg).toContain("_Cozy sea view_");
+    expect(msg).toContain("*Superior* — ₹6,500/night");
+    expect(msg).toContain("_Spacious suite_");
+    expect(msg).toContain("Tap the options below");
+  });
+
+  // 2. One room has no description → name+price only, no empty italic line.
+  it("RD2: missing description → name+price only, no empty italic", () => {
+    const rooms = [
+      room({ roomTypeId: "a", name: "Deluxe",   basePrice: 5000, availableCount: 3, description: "Cozy sea view" }),
+      room({ roomTypeId: "b", name: "Basic",    basePrice: 4000, availableCount: 2, description: "" }),
+    ];
+    const msg = buildRoomDescriptionsMessage(rooms)!;
+    expect(msg).toContain("*Basic* — ₹4,000/night");
+    expect(msg).not.toContain("__");          // no empty italic markers
+    // The described-less Basic block is exactly its head line — no italic follows.
+    const basicBlock = msg.split("\n\n").find((b) => b.startsWith("*Basic*"))!;
+    expect(basicBlock).toBe("*Basic* — ₹4,000/night");
+    expect(basicBlock).not.toContain("_");
+  });
+
+  // 3. Only available rooms shown; none available → null.
+  it("RD3: filters to available rooms; none available → null", () => {
+    const rooms = [
+      room({ roomTypeId: "a", name: "Deluxe", basePrice: 5000, availableCount: 0, description: "x" }),
+    ];
+    expect(buildRoomDescriptionsMessage(rooms)).toBeNull();
   });
 });

@@ -144,9 +144,11 @@ export async function trySendPlanList(args: {
   hotelId:              string;
   guestId:              string;
   plans:                AllocationPlan[];
+  // Kept for API compatibility (callers still pass it); the plan list no longer
+  // renders a per-room-type section now that preference is collected up front.
   eligibleRoomInputs?:  AllocationRoomInput[];
 }): Promise<boolean> {
-  const { hotelId, guestId, plans, eligibleRoomInputs } = args;
+  const { hotelId, guestId, plans } = args;
   if (plans.length === 0) return false;
   if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
 
@@ -165,27 +167,20 @@ export async function trySendPlanList(args: {
 
     const buttonLabel = "View Plans";
 
-    // Section 1 — recommended plans
-    const planRows = plans.map((plan, i) => ({
-      id:          `plan_${i}`,
-      title:       `Plan ${i + 1} — ₹${plan.totalPrice.toLocaleString("en-IN")}`.slice(0, 24),
-      description: buildPlanDescription(plan),
-    }));
+    // Smart-plan rows (Piece 2C): "{label} — ₹{total}" title + rationale description.
+    // Falls back to the legacy "Plan N — ₹total" / buildPlanDescription when a plan
+    // carries no label/rationale (legacy generatePlans output).
+    const planRows = plans.map((plan, i) => {
+      const inr   = `₹${plan.totalPrice.toLocaleString("en-IN")}`;
+      const title = (plan.label ? `${plan.label} — ${inr}` : `Plan ${i + 1} — ${inr}`).slice(0, 24);
+      return {
+        id:          `plan_${i}`,
+        title,
+        description: (plan.rationale ?? buildPlanDescription(plan)).slice(0, 72),
+      };
+    });
 
-    // Section 2 — individual room types (one row per eligible type)
-    const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
-    const roomRows = (eligibleRoomInputs ?? []).filter((r) => r.availableCount > 0).map((r) => ({
-      id:          `room_TYPE:${r.roomTypeId}`,
-      title:       r.name.slice(0, 24),
-      description: `${inr(r.basePrice)}/night`,
-    }));
-
-    const sections = roomRows.length > 0
-      ? [
-          { title: "⭐ Recommended Plans",  rows: planRows },
-          { title: "🛏 All Room Types",     rows: roomRows },
-        ]
-      : [{ title: "Choose a Plan", rows: planRows }];
+    const sections = [{ title: "Choose a Plan", rows: planRows }];
 
     // Chunk plan detail text so no single message exceeds MAX_BODY.
     // All chunks except the last are plain text; the last carries the list button.

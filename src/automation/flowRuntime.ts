@@ -431,7 +431,7 @@ const trySendRoomTypeCarousel: SendRoomCarouselFn = async ({ hotelId, guestId, r
         price:       r.basePrice,
         description: desc.slice(0, 60),
         buttonId:    `room_TYPE:${r.roomTypeId}`,
-        buttonLabel: "View Plans",
+        buttonLabel: "Choose",
       };
     });
 
@@ -500,6 +500,54 @@ async function trySendOccupancyNotice(args: { hotelId: string; guestId: string; 
     emitToHotel(hotelId, "message:new", { message: saved });
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "ARA occupancy notice send failed — skipping");
+  }
+}
+
+// ── ARA "Mix it up" list sender (Piece 2A) ────────────────────────────────────
+// Sent AFTER the room carousel. A single tappable row "Mix it up 🎲" → reply id
+// MIX_IT_UP (the webhook collapses list_reply.id to a text body the ARA handler
+// matches). Returns true if sent. Never throws.
+async function trySendMixItUpList(args: { hotelId: string; guestId: string }): Promise<boolean> {
+  const { hotelId, guestId } = args;
+  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
+  try {
+    const [hotel, guest] = await Promise.all([
+      prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
+      prisma.guest.findUnique({ where: { id: guestId } }),
+    ]);
+    if (!hotel || !guest) return false;
+    const cfg = hotel.config;
+    const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
+    const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
+    if (!phoneNumberId || !encryptedTok) return false;
+    const accessToken = decryptWhatsAppToken(encryptedTok);
+
+    const bodyText    = "_Not sure? Let us pick the best combination for you_ 👇";
+    const buttonLabel = "Options";
+    const sections    = [{ title: "Let us choose", rows: [{ id: "MIX_IT_UP", title: "Mix it up 🎲", description: "We'll pick the best room combination" }] }];
+
+    const wamid = await sendListMessage(guest.phone, phoneNumberId, accessToken, { bodyText, buttonLabel, sections });
+
+    const saved = await prisma.message.create({
+      data: {
+        direction:   "OUT",
+        fromPhone:   hotel.phone,
+        toPhone:     guest.phone,
+        body:        JSON.stringify({ bodyText, buttonLabel, rows: sections[0]!.rows }),
+        messageType: "list",
+        hotelId,
+        guestId,
+        channel:     MessageChannel.WHATSAPP,
+        status:      MessageStatus.SENT,
+        wamid,
+      },
+    });
+    const { emitToHotel } = await import("../realtime/emit");
+    emitToHotel(hotelId, "message:new", { message: saved });
+    return true;
+  } catch (err) {
+    log.warn({ err, hotelId, guestId }, "ARA mix-it-up list send failed — skipping");
+    return false;
   }
 }
 
@@ -1315,6 +1363,8 @@ export async function executeFlowStep(
           childAgeLimit:        hotelCfg?.childAgeLimit ?? 12,
           extractChildrenAges:  extractChildrenAgesAI,
           sendOccupancyNotice:  trySendOccupancyNotice,
+          sendRoomDescriptions: trySendOccupancyNotice, // generic text sender (same shape)
+          sendMixItUpList:      trySendMixItUpList,
         });
       }
 
