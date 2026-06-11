@@ -1272,6 +1272,16 @@ export type AdvancedRoomAllocationDeps = {
   // Absent → caller returns the legacy text summary with the reply-instructions
   // footer (full back-compat).
   sendConfirmButtons?: (args: { hotelId: string; guestId: string; bodyText: string }) => Promise<boolean>;
+  // OPTIONAL — sends the room-action menu (room_menu phase) as an interactive list.
+  // Returns true if sent (→ "ALREADY_SENT"). Absent → plain-text renderRoomMenu.
+  sendRoomMenuList?: (args: { hotelId: string; guestId: string; room: AllocationRoom; options: import("./modifyLists").RoomAction[]; roomIndex: number }) => Promise<boolean>;
+  // OPTIONAL — sends the "move to which room?" picker (move_to_room phase) as an
+  // interactive list. Returns { sent, destIndices } so the handler knows the slot→
+  // roomIndex mapping. Absent → plain-text renderMoveToRoom.
+  sendMoveToRoomList?: (args: { hotelId: string; guestId: string; state: AraState; fromIndex: number; pending: { adults: number; children: number }; resolveCfg: RoomConfigResolver }) => Promise<{ sent: boolean; destIndices: number[] }>;
+  // OPTIONAL — sends the manual-mode booking overview (manual phase) as an
+  // interactive list. Returns true if sent (→ "ALREADY_SENT"). Absent → text.
+  sendManualModeList?: (args: { hotelId: string; guestId: string; state: AraState; addable: AllocationRoomInput[] }) => Promise<boolean>;
 };
 
 /** Sends the multi-plan interactive list; returns true if sent (→ "ALREADY_SENT"). */
@@ -1819,7 +1829,66 @@ function isMenuInput(raw: string): boolean {
 }
 function isDoneInput(raw: string): boolean {
   const s = raw.trim().toLowerCase();
-  return s === "done" || s === "confirm";
+  if (s === "done" || s === "confirm") return true;
+  if (raw.trim().toUpperCase() === "MODIFY_DONE") return true;
+  return false;
+}
+// ── List-reply id helpers for Phase 2 ────────────────────────────────────────
+
+/** True when the input is a "go back" action from any Phase-2 list reply. */
+function isGoBackInput(raw: string): boolean {
+  const s = raw.trim().toUpperCase();
+  return s === "0" || s === "MOD_GO_BACK" || s === "MOVE_GO_BACK" || s === "MODIFY_GO_BACK";
+}
+
+/**
+ * If input is a room-menu list-reply id (MOD_REMOVE_EXTRA_BED etc.), return the
+ * equivalent 1-based option number; otherwise return null.
+ * The options array is the one returned by roomMenuOptions() — same order.
+ */
+function roomMenuListReplyToIdx(
+  raw:     string,
+  options: import("./modifyLists").RoomAction[],
+): number | null {
+  const MAP: Record<string, import("./modifyLists").RoomAction> = {
+    MOD_ADD_EXTRA_BED:    "add_bed",
+    MOD_REMOVE_EXTRA_BED: "remove_bed",
+    MOD_MOVE_GUEST_OUT:   "move_guest",
+    MOD_CHANGE_ROOM_TYPE: "change_type",
+    MOD_REMOVE_ROOM:      "remove_room",
+  };
+  const action = MAP[raw.trim().toUpperCase()];
+  if (!action) return null;
+  const idx = options.indexOf(action);
+  return idx >= 0 ? idx + 1 : null; // 1-based, matching the text handler
+}
+
+/**
+ * If input is a MOVE_TO_ROOM_{n} list-reply, return the slot number (1-based).
+ * Otherwise return null.
+ */
+function parseMoveToRoomSlot(raw: string): number | null {
+  const m = raw.trim().match(/^MOVE_TO_ROOM_(\d+)$/i);
+  if (!m) return null;
+  const n = parseInt(m[1]!, 10);
+  return Number.isFinite(n) && n >= 1 ? n : null;
+}
+
+/**
+ * If input is an EDIT_ROOM_{n} or ADD_ROOM_{id} list-reply from the manual-mode
+ * overview, return { kind: "edit", slot } or { kind: "add", roomTypeId }.
+ * Otherwise return null.
+ */
+function parseManualListReply(raw: string): { kind: "edit"; slot: number } | { kind: "add"; roomTypeId: string } | null {
+  const s = raw.trim();
+  const editM = s.match(/^EDIT_ROOM_(\d+)$/i);
+  if (editM) {
+    const n = parseInt(editM[1]!, 10);
+    return Number.isFinite(n) && n >= 1 ? { kind: "edit", slot: n } : null;
+  }
+  const addM = s.match(/^ADD_ROOM_(.+)$/i);
+  if (addM) return { kind: "add", roomTypeId: addM[1]! };
+  return null;
 }
 
 async function finalizeAndAdvance(deps: AdvancedRoomAllocationDeps, allocated: AllocationRoom[]): Promise<string | null> {
@@ -2152,7 +2221,21 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     };
     writeState(vars, m);
     await persist(deps);
-    return renderManualMode(m, addableRooms(rooms, selectedRooms));
+    const addable = addableRooms(rooms, selectedRooms);
+    if (deps.sendManualModeList) {
+      const sent = await deps.sendManualModeList({ hotelId, guestId, state: m, addable });
+      if (sent) return "ALREADY_SENT";
+    }
+    return renderManualMode(m, addable);
+  };
+
+  // Helper to show / re-show the room-menu: optionally via interactive list.
+  const showRoomMenu = async (targetRoom: AllocationRoom, roomOpts: import("./modifyLists").RoomAction[], roomIdx: number): Promise<string> => {
+    if (deps.sendRoomMenuList) {
+      const sent = await deps.sendRoomMenuList({ hotelId, guestId, room: targetRoom, options: roomOpts, roomIndex: roomIdx });
+      if (sent) return "ALREADY_SENT";
+    }
+    return renderRoomMenu(targetRoom, roomOpts, roomIdx);
   };
 
   // ── room_menu — per-room action picker (deterministic, no AI) ──────────────
@@ -2162,10 +2245,13 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     const targetRoom = state.selectedRooms[idx]!;
     const options    = roomMenuOptions(targetRoom, resolveCfg(targetRoom));
     const t = input.trim();
-    if (t === "0") return toManual(state.selectedRooms);
-    const sel = parseInt(t, 10);
+    // "0" typed or MOD_GO_BACK list reply → go back to manual overview.
+    if (isGoBackInput(t)) return toManual(state.selectedRooms);
+    // Map list-reply ids to 1-based option indices; fall through to numeric parse.
+    const listSel = roomMenuListReplyToIdx(t, options);
+    const sel = listSel ?? parseInt(t, 10);
     if (!Number.isFinite(sel) || sel < 1 || sel > options.length) {
-      return `Please reply 1–${options.length} or 0 to go back.\n\n${renderRoomMenu(targetRoom, options, idx)}`;
+      return showRoomMenu(targetRoom, options, idx);
     }
     const action = options[sel - 1]!;
     if (action === "move_guest") {
@@ -2180,7 +2266,9 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     if (action === "change_type") {
       const candidates = changeTypeCandidates(rooms, targetRoom);
       if (candidates.length === 0) {
-        return `Sorry, there are no other room types to switch to.\n\n${renderRoomMenu(targetRoom, options, idx)}`;
+        // No other types available — explain and re-show the menu (not an error).
+        const menuText = renderRoomMenu(targetRoom, options, idx);
+        return `Sorry, there are no other room types to switch to.\n\n${menuText}`;
       }
       const ct: AraState = {
         guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
@@ -2205,14 +2293,14 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     if (!inRange(state.selectedRooms, idx)) return toManual(state.selectedRooms);
     const targetRoom = state.selectedRooms[idx]!;
     const t = input.trim();
-    if (t === "0") {
+    if (isGoBackInput(t)) {
       const rm: AraState = {
         guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
         phase: "room_menu", selectedRoomIndex: idx,
       };
       writeState(vars, rm);
       await persist(deps);
-      return renderRoomMenu(targetRoom, roomMenuOptions(targetRoom, resolveCfg(targetRoom)), idx);
+      return showRoomMenu(targetRoom, roomMenuOptions(targetRoom, resolveCfg(targetRoom)), idx);
     }
     const nums = t.split(/\s+/).map((s) => parseInt(s, 10));
     const mvA = Number.isFinite(nums[0]) ? nums[0]! : NaN;
@@ -2227,6 +2315,10 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     };
     writeState(vars, mv);
     await persist(deps);
+    if (deps.sendMoveToRoomList) {
+      const r = await deps.sendMoveToRoomList({ hotelId, guestId, state: mv, fromIndex: idx, pending: mv.pendingMove!, resolveCfg });
+      if (r.sent) return "ALREADY_SENT";
+    }
     return renderMoveToRoom(mv, mv.pendingMove!, idx, resolveCfg);
   }
 
@@ -2236,7 +2328,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     if (!pm || !inRange(state.selectedRooms, pm.fromRoomIndex)) return toManual(state.selectedRooms);
     const fromIdx = pm.fromRoomIndex;
     const t = input.trim();
-    if (t === "0") {
+    if (isGoBackInput(t)) {
       const back: AraState = {
         guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
         phase: "move_from_count", selectedRoomIndex: fromIdx, pendingMove: pm, // preserve pendingMove
@@ -2246,8 +2338,11 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
       return renderMoveFromCount(state.selectedRooms[fromIdx]!, fromIdx);
     }
     const destIndices = state.selectedRooms.map((_, i) => i).filter((i) => i !== fromIdx);
-    const sel = parseInt(t, 10);
+    // Accept MOVE_TO_ROOM_{n} list-reply OR typed slot number.
+    const listSlot = parseMoveToRoomSlot(t);
+    const sel = listSlot ?? parseInt(t, 10);
     if (!Number.isFinite(sel) || sel < 1 || sel > destIndices.length) {
+      // Re-show — list senders are fire-and-forget here (re-render only).
       return renderMoveToRoom(state, pm, fromIdx, resolveCfg);
     }
     const toIdx = destIndices[sel - 1]!;
@@ -2264,14 +2359,14 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     const targetRoom = state.selectedRooms[idx]!;
     const candidates = changeTypeCandidates(rooms, targetRoom);
     const t = input.trim();
-    if (t === "0") {
+    if (isGoBackInput(t)) {
       const rm: AraState = {
         guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
         phase: "room_menu", selectedRoomIndex: idx,
       };
       writeState(vars, rm);
       await persist(deps);
-      return renderRoomMenu(targetRoom, roomMenuOptions(targetRoom, resolveCfg(targetRoom)), idx);
+      return showRoomMenu(targetRoom, roomMenuOptions(targetRoom, resolveCfg(targetRoom)), idx);
     }
     const sel = parseInt(t, 10);
     if (!Number.isFinite(sel) || sel < 1 || sel > candidates.length) {
@@ -2294,41 +2389,85 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     return finalizeAndAdvance(deps, state.selectedRooms);
   }
 
-  const pick = parseInt(input.trim(), 10);
+  const rawInput = input.trim();
+  const pick = parseInt(rawInput, 10);
 
   // All guests placed → numbered menu: 1..N edit an existing room (room_menu),
-  // N+1..N+M add a room type (offset). Anything else → AI free text, else re-render.
+  // N+1..N+M add a room type (offset). Also accepts list-reply ids (EDIT_ROOM_*,
+  // ADD_ROOM_*, MODIFY_GO_BACK). Anything else → AI free text, else re-render.
   if (allPlaced) {
     const addable = addableRooms(rooms, state.selectedRooms);
     const n = state.selectedRooms.length;
 
-    if (Number.isFinite(pick) && pick >= 1 && pick <= n) {
-      const targetRoom = state.selectedRooms[pick - 1]!;
+    // MODIFY_GO_BACK list reply → same as "0" (back to confirm, no-op here since
+    // the manual phase has no "back" — just re-show the overview).
+    if (isGoBackInput(rawInput)) {
+      return toManual(state.selectedRooms);
+    }
+
+    // Resolve list-reply to a slot number or room-type id.
+    const listReply = parseManualListReply(rawInput);
+
+    // Determine effective edit slot: list reply EDIT_ROOM_{n} or typed number.
+    const editSlot = listReply?.kind === "edit" ? listReply.slot :
+      (Number.isFinite(pick) && pick >= 1 && pick <= n ? pick : null);
+
+    if (editSlot !== null) {
+      const targetRoom = state.selectedRooms[editSlot - 1]!;
       const menu: AraState = {
         guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
-        phase: "room_menu", selectedRoomIndex: pick - 1,
+        phase: "room_menu", selectedRoomIndex: editSlot - 1,
       };
       writeState(vars, menu);
       await persist(deps);
-      return renderRoomMenu(targetRoom, roomMenuOptions(targetRoom, resolveCfg(targetRoom)), pick - 1);
+      return showRoomMenu(targetRoom, roomMenuOptions(targetRoom, resolveCfg(targetRoom)), editSlot - 1);
     }
 
+    // Add-room via list reply ADD_ROOM_{roomTypeId}: find in addable by roomTypeId.
+    if (listReply?.kind === "add") {
+      const roomToAdd = addable.find((r) => r.roomTypeId === listReply.roomTypeId);
+      if (roomToAdd) {
+        const rc   = resolveRoomConfig(roomToAdd, config);
+        const effMaxAdults   = Math.min(config.maxAdults + (config.allowExtraBed ? 1 : 0), roomToAdd.maxAdults ?? Infinity);
+        const effMaxChildren = Math.min(config.maxChildren, roomToAdd.maxChildren ?? Infinity);
+        const addAdults   = Math.min(rc.baseAdults,   effMaxAdults);
+        const addChildren = Math.min(rc.baseChildren, effMaxChildren);
+        const p = computeRoomPricing(roomToAdd.basePrice, addAdults, false, nights, rc);
+        const extraRoom: AllocationRoom = {
+          roomTypeId:    roomToAdd.roomTypeId,
+          roomTypeName:  roomToAdd.name,
+          adults:        addAdults,
+          children:      addChildren,
+          extraBed:      false,
+          basePrice:     roomToAdd.basePrice,
+          extraAdultCost: p.extraAdultCost,
+          extraBedCost:   p.extraBedCost,
+          childAgeLimit: rc.childAgeLimit,
+          pricePerNight:  p.pricePerNight,
+          nights,
+          totalPrice:     p.totalPrice,
+        };
+        return toManual([...state.selectedRooms, extraRoom]);
+      }
+    }
+
+    // Add-room via typed offset number N+1..N+M.
     if (Number.isFinite(pick) && pick >= n + 1 && pick <= n + addable.length) {
-      const room = addable[pick - n - 1]!;
-      const rc   = resolveRoomConfig(room, config);
-      const effMaxAdults   = Math.min(config.maxAdults + (config.allowExtraBed ? 1 : 0), room.maxAdults ?? Infinity);
-      const effMaxChildren = Math.min(config.maxChildren, room.maxChildren ?? Infinity);
+      const roomToAdd = addable[pick - n - 1]!;
+      const rc   = resolveRoomConfig(roomToAdd, config);
+      const effMaxAdults   = Math.min(config.maxAdults + (config.allowExtraBed ? 1 : 0), roomToAdd.maxAdults ?? Infinity);
+      const effMaxChildren = Math.min(config.maxChildren, roomToAdd.maxChildren ?? Infinity);
       // Extra room by choice → base occupancy, no extra bed (base never exceeds base).
       const addAdults   = Math.min(rc.baseAdults,   effMaxAdults);
       const addChildren = Math.min(rc.baseChildren, effMaxChildren);
-      const p = computeRoomPricing(room.basePrice, addAdults, false, nights, rc);
+      const p = computeRoomPricing(roomToAdd.basePrice, addAdults, false, nights, rc);
       const extraRoom: AllocationRoom = {
-        roomTypeId:    room.roomTypeId,
-        roomTypeName:  room.name,
+        roomTypeId:    roomToAdd.roomTypeId,
+        roomTypeName:  roomToAdd.name,
         adults:        addAdults,
         children:      addChildren,
         extraBed:      false,
-        basePrice:     room.basePrice,
+        basePrice:     roomToAdd.basePrice,
         extraAdultCost: p.extraAdultCost,
         extraBedCost:   p.extraBedCost,
         childAgeLimit: rc.childAgeLimit,
@@ -2339,7 +2478,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
       return toManual([...state.selectedRooms, extraRoom]);
     }
 
-    // Not a valid menu number → AI free-text convenience, else re-show the menu.
+    // Not a valid menu number or list reply → AI free-text convenience, else re-show.
     const aiReply = await tryModify(deps, state, rooms, input, "manual");
     return aiReply ?? renderManualMode(state, addable);
   }

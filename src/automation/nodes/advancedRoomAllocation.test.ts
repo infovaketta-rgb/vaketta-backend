@@ -41,6 +41,19 @@ import {
   type RoomConfigResolver,
 } from "./advancedRoomAllocation";
 import { buildPlanDescription } from "./planList";
+import {
+  buildRoomMenuSections,
+  buildMoveToRoomSections,
+  buildManualModeSections,
+  MOD_REMOVE_EXTRA_BED,
+  MOD_GO_BACK,
+  MOVE_GO_BACK,
+  MOVE_TO_ROOM_PREFIX,
+  MODIFY_DONE,
+  MODIFY_GO_BACK,
+  EDIT_ROOM_PREFIX,
+  ADD_ROOM_PREFIX,
+} from "./modifyLists";
 import type { SerializedFlowNode } from "../flowTypes";
 import type { SessionData } from "../../services/session.service";
 
@@ -2233,5 +2246,334 @@ describe("confirm interactive buttons", () => {
     const result = await handleAdvancedRoomAllocation(deps);
     expect(typeof result).toBe("string");
     expect(result).toContain("Suggested Allocation");
+  });
+});
+
+// ── Modify-phase list messages (room menu / move-to-room / manual overview) ───
+describe("modify phase list messages", () => {
+  // Shared helpers — build an allocated room (simplified).
+  function sR(over: Partial<AllocationRoom> = {}): AllocationRoom {
+    return {
+      roomTypeId: "rt_a", roomTypeName: "Standard",
+      adults: 2, children: 0, extraBed: false,
+      basePrice: 5000, extraAdultCost: 0, extraBedCost: 0,
+      childAgeLimit: null, pricePerNight: 5000, nights: 2, totalPrice: 10000,
+      ...over,
+    };
+  }
+  function aRoom(over: Partial<AllocationRoomInput> = {}): AllocationRoomInput {
+    return { roomTypeId: "rt_b", name: "Deluxe", basePrice: 7000, maxAdults: 3, maxChildren: 1, availableCount: 2, ...over };
+  }
+  // Build deps pre-positioned in manual phase with two rooms placed.
+  function mkManual(input = "", over: Partial<AdvancedRoomAllocationDeps> = {}) {
+    const state: AraState = {
+      guests: { adults: 4, children: 0 },
+      selectedRooms:   [sR({ roomTypeId: "rt_a", roomTypeName: "Standard" }), sR({ roomTypeId: "rt_a", roomTypeName: "Standard" })],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "manual",
+    };
+    return makeDeps({
+      waitingFor: "answer",
+      flowVars:   { __araState__: JSON.stringify(state) },
+      rooms:      [aRoom()],
+      input,
+      ...over,
+    });
+  }
+  // Build deps pre-positioned in room_menu phase, room 0.
+  function mkRoomMenu(input = "", extra: Partial<AraState> = {}, over: Partial<AdvancedRoomAllocationDeps> = {}) {
+    const state: AraState = {
+      guests: { adults: 2, children: 0 },
+      selectedRooms:   [sR()],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "room_menu", selectedRoomIndex: 0,
+      ...extra,
+    };
+    return makeDeps({
+      waitingFor: "answer",
+      flowVars:   { __araState__: JSON.stringify(state) },
+      rooms:      [aRoom()],
+      input,
+      ...over,
+    });
+  }
+  const readPhase = (deps: AdvancedRoomAllocationDeps) =>
+    deps.flowData.flowVars["__araState__"]
+      ? (JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState).phase
+      : undefined;
+
+  // ── buildRoomMenuSections pure tests ─────────────────────────────────────────
+
+  it("ML1: buildRoomMenuSections has Modify Room and Navigation sections", () => {
+    const r = sR();
+    const opts: import("./modifyLists").RoomAction[] = ["move_guest", "change_type", "remove_room"];
+    const sections = buildRoomMenuSections(r, opts);
+    expect(sections.length).toBe(2);
+    expect(sections[0]!.title).toBe("Modify Room");
+    expect(sections[0]!.rows.map((row) => row.id)).toEqual(
+      ["MOD_MOVE_GUEST_OUT", "MOD_CHANGE_ROOM_TYPE", "MOD_REMOVE_ROOM"]
+    );
+    expect(sections[1]!.title).toBe("Navigation");
+    expect(sections[1]!.rows[0]!.id).toBe(MOD_GO_BACK);
+  });
+
+  it("ML2: buildRoomMenuSections add_bed uses MOD_ADD_EXTRA_BED id", () => {
+    const r = sR();
+    const sections = buildRoomMenuSections(r, ["add_bed", "move_guest", "remove_room"]);
+    const ids = sections[0]!.rows.map((row) => row.id);
+    expect(ids).toContain("MOD_ADD_EXTRA_BED");
+  });
+
+  it("ML3: buildRoomMenuSections remove_bed uses MOD_REMOVE_EXTRA_BED id", () => {
+    const sections = buildRoomMenuSections(sR({ extraBed: true }), ["remove_bed", "move_guest", "remove_room"]);
+    expect(sections[0]!.rows[0]!.id).toBe(MOD_REMOVE_EXTRA_BED);
+  });
+
+  // ── buildMoveToRoomSections pure tests ────────────────────────────────────────
+
+  it("ML4: buildMoveToRoomSections builds N-1 room rows for N rooms", () => {
+    const state: AraState = {
+      guests: { adults: 4, children: 0 },
+      selectedRooms: [sR({ roomTypeName: "Standard" }), sR({ roomTypeName: "Deluxe" })],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "move_to_room", selectedRoomIndex: 0,
+      pendingMove: { fromRoomIndex: 0, adults: 1, children: 0 },
+    };
+    const resolveCfg: RoomConfigResolver = (_r) => ({
+      baseAdults: 2, baseChildren: 0, maxAdults: 3, maxChildren: 1,
+      extraAdultCharge: 0, allowExtraBed: false, extraBedCharge: 0, childAgeLimit: null,
+    });
+    const { sections, destIndices } = buildMoveToRoomSections(state, 0, { adults: 1, children: 0 }, resolveCfg);
+    // fromIndex=0 excluded → 1 row for room at index 1.
+    expect(destIndices).toEqual([1]);
+    expect(sections[0]!.rows.length).toBe(1);
+    expect(sections[0]!.rows[0]!.id).toBe(`${MOVE_TO_ROOM_PREFIX}1`);
+    expect(sections[0]!.rows[0]!.title).toBe("Deluxe");
+    expect(sections[1]!.rows[0]!.id).toBe(MOVE_GO_BACK);
+  });
+
+  it("ML5: buildMoveToRoomSections description ≤72 chars", () => {
+    const longName = "A".repeat(100);
+    const state: AraState = {
+      guests: { adults: 4, children: 0 },
+      selectedRooms: [sR(), sR({ roomTypeName: longName })],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "move_to_room", selectedRoomIndex: 0,
+      pendingMove: { fromRoomIndex: 0, adults: 1, children: 0 },
+    };
+    const resolveCfg: RoomConfigResolver = (_r) => ({
+      baseAdults: 2, baseChildren: 0, maxAdults: 3, maxChildren: 1,
+      extraAdultCharge: 0, allowExtraBed: false, extraBedCharge: 0, childAgeLimit: null,
+    });
+    const { sections } = buildMoveToRoomSections(state, 0, { adults: 1, children: 0 }, resolveCfg);
+    const desc = sections[0]!.rows[0]!.description ?? "";
+    expect(desc.length).toBeLessThanOrEqual(72);
+  });
+
+  // ── buildManualModeSections pure tests ────────────────────────────────────────
+
+  it("ML6: buildManualModeSections has edit rows, add rows, confirm section", () => {
+    const state: AraState = {
+      guests: { adults: 4, children: 0 },
+      selectedRooms: [sR({ roomTypeName: "Standard" })],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "manual",
+    };
+    const addable = [aRoom({ roomTypeId: "rt_dlx", name: "Deluxe" })];
+    const sections = buildManualModeSections(state, addable);
+    expect(sections.some((s) => s.title === "Edit Existing Rooms")).toBe(true);
+    expect(sections.some((s) => s.title === "Add a Room")).toBe(true);
+    expect(sections.some((s) => s.title === "Confirm")).toBe(true);
+    const editSection = sections.find((s) => s.title === "Edit Existing Rooms")!;
+    expect(editSection.rows[0]!.id).toBe(`${EDIT_ROOM_PREFIX}1`);
+    const addSection = sections.find((s) => s.title === "Add a Room")!;
+    expect(addSection.rows[0]!.id).toBe(`${ADD_ROOM_PREFIX}rt_dlx`);
+    const confirmSection = sections.find((s) => s.title === "Confirm")!;
+    expect(confirmSection.rows.map((r) => r.id)).toContain(MODIFY_DONE);
+    expect(confirmSection.rows.map((r) => r.id)).toContain(MODIFY_GO_BACK);
+  });
+
+  it("ML7: buildManualModeSections add row description ≤72 chars", () => {
+    const state: AraState = {
+      guests: { adults: 2, children: 0 },
+      selectedRooms: [sR()],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "manual",
+    };
+    const addable = [aRoom({ name: "Luxury Ocean-Facing Suite with Balcony", basePrice: 99999, availableCount: 10, maxAdults: 5, maxChildren: 3 })];
+    const sections = buildManualModeSections(state, addable);
+    const addSection = sections.find((s) => s.title === "Add a Room")!;
+    const desc = addSection.rows[0]!.description ?? "";
+    expect(desc.length).toBeLessThanOrEqual(72);
+  });
+
+  // ── Handler integration: list-reply ids route correctly ───────────────────────
+
+  // ML8: MOD_GO_BACK list reply → goes back from room_menu to manual phase.
+  it("ML8: MOD_GO_BACK from room_menu → returns to manual", async () => {
+    const deps = mkRoomMenu(MOD_GO_BACK);
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("manual");
+  });
+
+  // ML9: MOD_REMOVE_EXTRA_BED list reply → same action as typed "1" for a room with extra bed.
+  it("ML9: MOD_REMOVE_EXTRA_BED from room_menu removes extra bed", async () => {
+    const state: AraState = {
+      guests: { adults: 2, children: 0 },
+      selectedRooms: [sR({ extraBed: true, roomTypeId: "rt_a" })],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "room_menu", selectedRoomIndex: 0,
+    };
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars:   { __araState__: JSON.stringify(state) },
+      rooms:      [aRoom()],
+      input:      MOD_REMOVE_EXTRA_BED,
+      nodeData:   { allowExtraBed: true },
+    });
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("manual");
+    const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(after.selectedRooms[0]!.extraBed).toBe(false);
+  });
+
+  // ML10: MODIFY_DONE list reply → same action as typed "DONE" (finalizes booking).
+  it("ML10: MODIFY_DONE list reply finalizes booking like 'DONE'", async () => {
+    const deps = mkManual(MODIFY_DONE);
+    await handleAdvancedRoomAllocation(deps);
+    expect(deps.flowData.flowVars["bookingRooms"]).toBeTruthy();
+    expect(deps.advance).toHaveBeenCalled();
+  });
+
+  // ML11: MODIFY_GO_BACK in manual phase re-shows the overview (toManual).
+  it("ML11: MODIFY_GO_BACK in manual phase re-shows manual overview", async () => {
+    const deps = mkManual(MODIFY_GO_BACK);
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("manual");
+    // No finalize — advance not called.
+    expect(deps.advance).not.toHaveBeenCalled();
+    // Result should be the manual overview text (no dep → text fallback).
+    expect(result).toContain("Modify your booking");
+  });
+
+  // ML12: EDIT_ROOM_1 list reply → enters room_menu for room 1 (same as typed "1").
+  it("ML12: EDIT_ROOM_1 list reply enters room_menu", async () => {
+    const deps = mkManual(`${EDIT_ROOM_PREFIX}1`);
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("room_menu");
+    const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(after.selectedRoomIndex).toBe(0);
+  });
+
+  // ML13: ADD_ROOM_{id} list reply → adds a room type to the selection.
+  it("ML13: ADD_ROOM_{id} list reply adds a room", async () => {
+    const deps = mkManual(`${ADD_ROOM_PREFIX}rt_b`);
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("manual");
+    const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    // Should now have 3 rooms (2 original + 1 added).
+    expect(after.selectedRooms.length).toBe(3);
+    expect(after.selectedRooms[2]!.roomTypeId).toBe("rt_b");
+  });
+
+  // ML14: MOVE_GO_BACK in move_to_room → goes back to move_from_count.
+  it("ML14: MOVE_GO_BACK in move_to_room → back to move_from_count", async () => {
+    const pm = { fromRoomIndex: 0, adults: 1, children: 0 };
+    const state: AraState = {
+      guests: { adults: 4, children: 0 },
+      selectedRooms: [sR({ adults: 3 }), sR({ adults: 2 })],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "move_to_room", selectedRoomIndex: 0, pendingMove: pm,
+    };
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars:   { __araState__: JSON.stringify(state) },
+      rooms:      [aRoom()],
+      input:      MOVE_GO_BACK,
+    });
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("move_from_count");
+  });
+
+  // ML15: MOVE_TO_ROOM_1 list reply → moves guest to first destination room.
+  it("ML15: MOVE_TO_ROOM_1 list reply moves guest to dest slot 1", async () => {
+    const pm = { fromRoomIndex: 0, adults: 1, children: 0 };
+    const state: AraState = {
+      guests: { adults: 4, children: 0 },
+      selectedRooms: [sR({ adults: 3, roomTypeName: "Standard" }), sR({ adults: 2, roomTypeName: "Deluxe" })],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "move_to_room", selectedRoomIndex: 0, pendingMove: pm,
+    };
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars:   { __araState__: JSON.stringify(state) },
+      rooms:      [aRoom()],
+      input:      `${MOVE_TO_ROOM_PREFIX}1`,
+    });
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("manual");
+    const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    // room 0 gives 1 adult, room 1 receives it.
+    expect(after.selectedRooms[0]!.adults).toBe(2);
+    expect(after.selectedRooms[1]!.adults).toBe(3);
+  });
+
+  // ML16: sendRoomMenuList dep present → ALREADY_SENT from room_menu (re-render path).
+  it("ML16: sendRoomMenuList dep → ALREADY_SENT on unrecognised room_menu input", async () => {
+    let menuSent = false;
+    const sendRoomMenuList = vi.fn(async () => { menuSent = true; return true; });
+    const deps = mkRoomMenu("garbage", {}, { sendRoomMenuList });
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(menuSent).toBe(true);
+    expect(result).toBe("ALREADY_SENT");
+  });
+
+  // ML17: sendManualModeList dep present → ALREADY_SENT from toManual.
+  it("ML17: sendManualModeList dep → ALREADY_SENT when entering manual", async () => {
+    let listSent = false;
+    const sendManualModeList = vi.fn(async () => { listSent = true; return true; });
+    // Start at room_menu, press MOD_GO_BACK → toManual → list send.
+    const deps = mkRoomMenu(MOD_GO_BACK, {}, { sendManualModeList });
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(listSent).toBe(true);
+    expect(result).toBe("ALREADY_SENT");
+  });
+
+  // ML18: Typed fallbacks still work — "1" and "DONE" remain valid alongside list ids.
+  it("ML18: typed '1' from manual still enters room_menu (back-compat)", async () => {
+    const deps = mkManual("1");
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("room_menu");
+  });
+
+  it("ML18b: typed 'DONE' from manual still finalizes booking (back-compat)", async () => {
+    const deps = mkManual("DONE");
+    await handleAdvancedRoomAllocation(deps);
+    expect(deps.flowData.flowVars["bookingRooms"]).toBeTruthy();
+    expect(deps.advance).toHaveBeenCalled();
+  });
+
+  // ML19: sendMoveToRoomList dep present → ALREADY_SENT when entering move_to_room.
+  it("ML19: sendMoveToRoomList dep → ALREADY_SENT when entering move_to_room", async () => {
+    let moveSent = false;
+    const sendMoveToRoomList = vi.fn(async () => ({ sent: true, destIndices: [1] }));
+    // Build deps in move_from_count to transition to move_to_room.
+    const state: AraState = {
+      guests: { adults: 4, children: 0 },
+      selectedRooms: [sR({ adults: 3 }), sR({ adults: 2 })],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "move_from_count", selectedRoomIndex: 0,
+    };
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars:   { __araState__: JSON.stringify(state) },
+      rooms:      [aRoom()],
+      input:      "1 0",
+      sendMoveToRoomList,
+    });
+    const result = await handleAdvancedRoomAllocation(deps);
+    void moveSent; // dep was called
+    expect(sendMoveToRoomList).toHaveBeenCalledTimes(1);
+    expect(result).toBe("ALREADY_SENT");
   });
 });
