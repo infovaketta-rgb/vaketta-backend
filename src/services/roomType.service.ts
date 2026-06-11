@@ -6,6 +6,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 export async function createRoomType({
   hotelId,
   name,
+  description,
   basePrice,
   capacity,
   maxAdults,
@@ -20,6 +21,7 @@ export async function createRoomType({
 }: {
   hotelId:              string;
   name:                 string;
+  description?:         string;
   basePrice:            number;
   capacity?:            number;
   maxAdults?:           number;
@@ -47,6 +49,7 @@ export async function createRoomType({
       allowExtraBed:    allowExtraBed    ?? false,
       extraBedCharge:   extraBedCharge   ?? null,
       ...(carouselButtonLabel !== undefined && { carouselButtonLabel }),
+      ...(description !== undefined && { description }),
     },
   });
 }
@@ -63,6 +66,7 @@ export async function updateRoomType({
   id,
   hotelId,
   name,
+  description,
   basePrice,
   capacity,
   maxAdults,
@@ -78,6 +82,7 @@ export async function updateRoomType({
   id:                   string;
   hotelId:              string;
   name?:                string;
+  description?:         string;
   basePrice:            number;
   capacity?:            number;
   maxAdults?:           number;
@@ -105,6 +110,7 @@ export async function updateRoomType({
       extraBedCharge:   extraBedCharge   ?? null,
       ...(totalRooms !== undefined && { totalRooms }),
       ...(carouselButtonLabel !== undefined && { carouselButtonLabel }),
+      ...(description !== undefined && { description }),
     },
   });
 }

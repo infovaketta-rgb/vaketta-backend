@@ -76,7 +76,7 @@ export async function createRoomTypeController(req: Request, res: Response) {
     const hotelId = (req as any).user?.hotelId; // ✅ fixed
     if (!hotelId) return res.status(401).json({ error: "Unauthorized" });
 
-    const { name, basePrice, capacity, maxAdults, maxChildren, totalRooms, carouselButtonLabel } = req.body;
+    const { name, description, basePrice, capacity, maxAdults, maxChildren, totalRooms, carouselButtonLabel } = req.body;
 
     if (!name || !basePrice) {
       return res.status(400).json({ error: "Name and basePrice are required" });
@@ -94,6 +94,7 @@ export async function createRoomTypeController(req: Request, res: Response) {
       hotelId,
       name,
       basePrice:   Number(basePrice),
+      ...(typeof description === "string" ? { description } : {}),
       ...(capacity    ? { capacity:    Number(capacity)    } : {}),
       ...(maxAdults   ? { maxAdults:   Number(maxAdults)   } : {}),
       ...(maxChildren ? { maxChildren: Number(maxChildren) } : {}),
@@ -130,7 +131,7 @@ export async function updateRoomTypeController(req: Request, res: Response) {
 
     const { id } = req.params;
 if (!id) return res.status(400).json({ error: "Room type ID is required" });
-    const { name, basePrice, capacity, maxAdults, maxChildren, totalRooms, carouselButtonLabel } = req.body;
+    const { name, description, basePrice, capacity, maxAdults, maxChildren, totalRooms, carouselButtonLabel } = req.body;
 
     if (!name || !basePrice) {
       return res.status(400).json({ error: "Name and basePrice are required" });
@@ -148,6 +149,7 @@ if (!id) return res.status(400).json({ error: "Room type ID is required" });
       hotelId,
       name,
       basePrice:   Number(basePrice),
+      ...(typeof description === "string" ? { description } : {}),
       ...(capacity    ? { capacity:    Number(capacity)    } : {}),
       ...(maxAdults   ? { maxAdults:   Number(maxAdults)   } : {}),
       ...(maxChildren ? { maxChildren: Number(maxChildren) } : {}),
