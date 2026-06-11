@@ -929,6 +929,25 @@ function confirmPromptFooter(): string {
   return "Reply *1* to Confirm\nReply *2* to Modify manually\nReply *MENU* to cancel";
 }
 
+/**
+ * Confirm-step reply: when a button sender is injected, send the allocation
+ * summary (WITHOUT the text footer) as an interactive 3-button message and
+ * return "ALREADY_SENT". Otherwise return the legacy text summary with the
+ * reply-instructions footer (full back-compat — tests with no dep are unchanged).
+ */
+async function confirmReply(
+  deps: AdvancedRoomAllocationDeps,
+  rooms: AllocationRoom[],
+  childrenAges: number[] | undefined,
+): Promise<string> {
+  if (deps.sendConfirmButtons) {
+    const bodyText = renderAllocationSummary(rooms, { childrenAges }); // no text footer — buttons replace it
+    const sent = await deps.sendConfirmButtons({ hotelId: deps.hotelId, guestId: deps.guestId, bodyText });
+    if (sent) return "ALREADY_SENT";
+  }
+  return renderAllocationSummary(rooms, { trailing: confirmPromptFooter(), childrenAges });
+}
+
 function buildManualRoomList(rooms: AllocationRoomInput[], remaining: { adults: number; children: number }): string {
   let text = `Pick a room to add to your booking. *${remaining.adults} adult${remaining.adults === 1 ? "" : "s"}` +
     (remaining.children > 0 ? `, ${remaining.children} child${remaining.children > 1 ? "ren" : ""}` : "") +
@@ -1248,6 +1267,11 @@ export type AdvancedRoomAllocationDeps = {
   // OPTIONAL (Piece 2A) — sends the "Mix it up 🎲" interactive list AFTER the
   // carousel. Reply id "MIX_IT_UP". Returns true if sent. Absent → text fallback.
   sendMixItUpList?: (args: { hotelId: string; guestId: string }) => Promise<boolean>;
+  // OPTIONAL — sends the suggested-allocation summary as an interactive 3-button
+  // message (Confirm / Modify / Cancel). Returns true if sent (→ "ALREADY_SENT").
+  // Absent → caller returns the legacy text summary with the reply-instructions
+  // footer (full back-compat).
+  sendConfirmButtons?: (args: { hotelId: string; guestId: string; bodyText: string }) => Promise<boolean>;
 };
 
 /** Sends the multi-plan interactive list; returns true if sent (→ "ALREADY_SENT"). */
@@ -1633,7 +1657,7 @@ async function generateAndSendPlans(
     writeState(vars, newState);
     flowData.waitingFor = "answer";
     await persist(deps);
-    return renderAllocationSummary(only.rooms, { trailing: confirmPromptFooter(), childrenAges: guestsField.childrenAges });
+    return confirmReply(deps, only.rooms, guestsField.childrenAges);
   }
 
   // Multiple plans → plan_selection.
@@ -1770,16 +1794,28 @@ async function finishAgeCollection(
 
 // ── Phase 2 helpers ───────────────────────────────────────────────────────────
 
+// Interactive button ids (sent on the confirm summary). The webhook collapses a
+// button_reply to a text body equal to the button id, so these arrive here as
+// plain input alongside the legacy "1"/"2"/"MENU" replies.
+const CONFIRM_BTN_ID = "CONFIRM_BOOKING";
+const MODIFY_BTN_ID  = "MODIFY_BOOKING";
+const CANCEL_BTN_ID  = "CANCEL_BOOKING";
+
 function isConfirmInput(raw: string): boolean {
-  const s = raw.trim().toLowerCase();
-  return s === "1" || s === "confirm";
+  const s = raw.trim();
+  if (s.toUpperCase() === CONFIRM_BTN_ID) return true;
+  const l = s.toLowerCase();
+  return l === "1" || l === "confirm";
 }
 function isModifyInput(raw: string): boolean {
-  const s = raw.trim().toLowerCase();
-  return s === "2" || s === "modify";
+  const s = raw.trim();
+  if (s.toUpperCase() === MODIFY_BTN_ID) return true;
+  const l = s.toLowerCase();
+  return l === "2" || l === "modify";
 }
 function isMenuInput(raw: string): boolean {
-  return raw.trim().toUpperCase() === "MENU";
+  const s = raw.trim().toUpperCase();
+  return s === "MENU" || s === CANCEL_BTN_ID;
 }
 function isDoneInput(raw: string): boolean {
   const s = raw.trim().toLowerCase();
@@ -2042,7 +2078,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     };
     writeState(vars, confirmState);
     await persist(deps);
-    return renderAllocationSummary(chosen.rooms, { trailing: confirmPromptFooter(), childrenAges: state.guests.childrenAges });
+    return confirmReply(deps, chosen.rooms, state.guests.childrenAges);
   }
 
   // ── Confirm sub-phase ──────────────────────────────────────────────────────

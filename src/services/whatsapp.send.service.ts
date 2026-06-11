@@ -326,6 +326,80 @@ export async function sendListMessage(
   return wamid as string;
 }
 
+// ── Interactive reply-button message ──────────────────────────────────────────
+
+export interface ReplyButton {
+  id:    string; // returned to the webhook as button_reply.id
+  title: string; // shown on the button; Meta caps at 20 chars
+}
+
+/** Meta interactive-button body limit. */
+const BUTTON_BODY_MAX = 1024;
+
+/**
+ * Sends a WhatsApp Cloud API "interactive reply buttons" message — up to 3 quick
+ * buttons below a body of text. Meta collapses a tap into a button_reply with the
+ * chosen button id, which the webhook already synthesises to a plain text body
+ * (see whatsapp.controller.ts ~line 148), so downstream code matches the id as if
+ * it were typed text.
+ *
+ * The body is capped at 1024 chars (Meta limit) — a longer summary is truncated
+ * with a trailing "…" so the buttons still attach. Buttons are limited to 3 and
+ * titles to 20 chars (Meta limits). Returns the wamid; throws on failure.
+ */
+export async function sendButtonMessage(
+  toPhone:       string,
+  phoneNumberId: string,
+  accessToken:   string,
+  opts: {
+    bodyText:    string;
+    footerText?: string;
+    buttons:     ReplyButton[];
+  },
+): Promise<string> {
+  if (process.env["MOCK_WHATSAPP_SEND"] === "true") {
+    log.info({ toPhone, buttonCount: opts.buttons.length }, "MOCK BUTTON send");
+    return "mock-wamid";
+  }
+
+  const bodyText = opts.bodyText.length > BUTTON_BODY_MAX
+    ? opts.bodyText.slice(0, BUTTON_BODY_MAX - 1) + "…"
+    : opts.bodyText;
+
+  const interactive: Record<string, unknown> = {
+    type:   "button",
+    body:   { text: bodyText },
+    action: {
+      buttons: opts.buttons.slice(0, 3).map((b) => ({
+        type:  "reply",
+        reply: { id: b.id, title: b.title.slice(0, 20) },
+      })),
+    },
+  };
+
+  if (opts.footerText) {
+    interactive["footer"] = { text: opts.footerText.slice(0, 60) };
+  }
+
+  log.info({ toPhone, buttons: opts.buttons.length }, "sending button message");
+
+  const data = await withRetry(() =>
+    metaPost(`${phoneNumberId}/messages`, {
+      messaging_product: "whatsapp",
+      recipient_type:    "individual",
+      to:                toPhone,
+      type:              "interactive",
+      interactive,
+    }, accessToken)
+  );
+
+  const wamid = data?.messages?.[0]?.id;
+  if (!wamid) {
+    throw new Error(`sendButtonMessage: Meta response missing message id: ${JSON.stringify(data)}`);
+  }
+  return wamid as string;
+}
+
 // ── Media message ─────────────────────────────────────────────────────────────
 
 export async function sendMediaMessage(input: {

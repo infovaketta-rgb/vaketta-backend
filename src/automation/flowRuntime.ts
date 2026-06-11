@@ -42,7 +42,7 @@ import { generateReferenceNumber } from "../utils/booking.utils";
 import { cancelBooking } from "../services/booking.service";
 import { BookingStatus, MessageChannel, MessageStatus } from "@prisma/client";
 import { shouldAutoReply } from "./shouldAutoReply";
-import { sendCarouselMessage, sendMediaMessage, sendListMessage, sendTextMessage, type CarouselCard } from "../services/whatsapp.send.service";
+import { sendCarouselMessage, sendMediaMessage, sendListMessage, sendTextMessage, sendButtonMessage, type CarouselCard } from "../services/whatsapp.send.service";
 import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
@@ -547,6 +547,57 @@ async function trySendMixItUpList(args: { hotelId: string; guestId: string }): P
     return true;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "ARA mix-it-up list send failed — skipping");
+    return false;
+  }
+}
+
+// ── ARA confirm-buttons sender ────────────────────────────────────────────────
+// Sends the suggested-allocation summary as an interactive 3-button message
+// (Confirm / Modify / Cancel). The button ids map to the same actions as the
+// legacy "1"/"2"/"MENU" text replies (the webhook collapses button_reply.id to a
+// text body). Returns true if sent (→ "ALREADY_SENT"). Never throws.
+async function trySendConfirmButtons(args: { hotelId: string; guestId: string; bodyText: string }): Promise<boolean> {
+  const { hotelId, guestId, bodyText } = args;
+  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
+  try {
+    const [hotel, guest] = await Promise.all([
+      prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
+      prisma.guest.findUnique({ where: { id: guestId } }),
+    ]);
+    if (!hotel || !guest) return false;
+    const cfg = hotel.config;
+    const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
+    const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
+    if (!phoneNumberId || !encryptedTok) return false;
+    const accessToken = decryptWhatsAppToken(encryptedTok);
+
+    const buttons = [
+      { id: "CONFIRM_BOOKING", title: "✅ Confirm" },
+      { id: "MODIFY_BOOKING",  title: "✏️ Modify" },
+      { id: "CANCEL_BOOKING",  title: "✖️ Cancel" },
+    ];
+
+    const wamid = await sendButtonMessage(guest.phone, phoneNumberId, accessToken, { bodyText, buttons });
+
+    const saved = await prisma.message.create({
+      data: {
+        direction:   "OUT",
+        fromPhone:   hotel.phone,
+        toPhone:     guest.phone,
+        body:        JSON.stringify({ bodyText, buttons }),
+        messageType: "button",
+        hotelId,
+        guestId,
+        channel:     MessageChannel.WHATSAPP,
+        status:      MessageStatus.SENT,
+        wamid,
+      },
+    });
+    const { emitToHotel } = await import("../realtime/emit");
+    emitToHotel(hotelId, "message:new", { message: saved });
+    return true;
+  } catch (err) {
+    log.warn({ err, hotelId, guestId }, "ARA confirm buttons send failed — falling back to text");
     return false;
   }
 }
@@ -1365,6 +1416,7 @@ export async function executeFlowStep(
           sendOccupancyNotice:  trySendOccupancyNotice,
           sendRoomDescriptions: trySendOccupancyNotice, // generic text sender (same shape)
           sendMixItUpList:      trySendMixItUpList,
+          sendConfirmButtons:   trySendConfirmButtons,
         });
       }
 

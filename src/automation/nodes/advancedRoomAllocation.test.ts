@@ -2155,3 +2155,83 @@ describe("buildRoomDescriptionsMessage", () => {
     expect(buildRoomDescriptionsMessage(rooms)).toBeNull();
   });
 });
+
+// ── Interactive confirm buttons (CONFIRM/MODIFY/CANCEL ids map to 1/2/MENU) ────
+describe("confirm interactive buttons", () => {
+  // Drive Phase 1 → preference (Mix it up) → confirm, returning deps at confirm.
+  async function primeAtConfirm(over: Partial<AdvancedRoomAllocationDeps> = {}) {
+    const deps = makeDeps({
+      rooms: [room({ roomTypeId: "rt_std", name: "Standard", basePrice: 6000, availableCount: 3 })],
+      flowVars: { bookingAdults: "2", bookingChildren: "0" },
+      ...over,
+    });
+    await handleAdvancedRoomAllocation(deps);   // → collecting_room_preference
+    deps.input = "MIX_IT_UP";
+    await handleAdvancedRoomAllocation(deps);   // → confirm
+    deps.input = "";
+    return deps;
+  }
+  const readPhase = (deps: AdvancedRoomAllocationDeps) =>
+    deps.flowData.flowVars["__araState__"] ? (JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState).phase : undefined;
+
+  // 1. CONFIRM_BOOKING button id → same as "1": writes output contract + advances.
+  it("CB1: CONFIRM_BOOKING finalizes like '1'", async () => {
+    const deps = await primeAtConfirm();
+    expect(readPhase(deps)).toBe("confirm");
+    deps.input = "CONFIRM_BOOKING";
+    await handleAdvancedRoomAllocation(deps);
+    expect(deps.flowData.flowVars["bookingRooms"]).toBeTruthy();
+    expect(deps.flowData.flowVars["__araState__"]).toBeUndefined();
+    expect(deps.advance).toHaveBeenCalledWith("node_next");
+  });
+
+  // 2. MODIFY_BOOKING button id → same as "2": switches to manual phase.
+  it("CB2: MODIFY_BOOKING switches to manual like '2'", async () => {
+    const deps = await primeAtConfirm();
+    deps.input = "MODIFY_BOOKING";
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("manual");
+    expect(deps.advance).not.toHaveBeenCalled();
+  });
+
+  // 3. CANCEL_BOOKING button id → same as "MENU": resets + shows menu.
+  it("CB3: CANCEL_BOOKING cancels like 'MENU'", async () => {
+    const deps = await primeAtConfirm();
+    deps.input = "CANCEL_BOOKING";
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(deps.resetSession).toHaveBeenCalled();
+    expect(deps.flowData.flowVars["__araState__"]).toBeUndefined();
+    expect(result).toBe("MENU_TEXT"); // safeMenu mock
+  });
+
+  // 4. With sendConfirmButtons dep → buttons sent (ALREADY_SENT), body has NO text footer.
+  it("CB4: sendConfirmButtons dep → interactive send, no '*1*' footer in body", async () => {
+    let sentBody = "";
+    const sendConfirmButtons = vi.fn(async (a: { hotelId: string; guestId: string; bodyText: string }) => {
+      sentBody = a.bodyText; return true;
+    });
+    const deps = makeDeps({
+      rooms: [room({ roomTypeId: "rt_std", name: "Standard", basePrice: 6000, availableCount: 3 })],
+      flowVars: { bookingAdults: "2", bookingChildren: "0" },
+      sendConfirmButtons,
+    });
+    await handleAdvancedRoomAllocation(deps);   // → collecting_room_preference
+    deps.input = "MIX_IT_UP";
+    const result = await handleAdvancedRoomAllocation(deps); // → confirm (single plan)
+    expect(sendConfirmButtons).toHaveBeenCalledTimes(1);
+    expect(result).toBe("ALREADY_SENT");
+    expect(sentBody).toContain("Suggested Allocation");
+    expect(sentBody).not.toContain("Reply *1*");   // footer replaced by buttons
+    expect(sentBody).not.toContain("to Confirm");
+  });
+
+  // 5. Without the dep → legacy text summary WITH the reply-instructions footer.
+  it("CB5: no dep → legacy text footer retained", async () => {
+    const deps = await primeAtConfirm();   // primeAtConfirm injects no button dep
+    // Re-render the confirm summary by sending an unrecognised input.
+    deps.input = "garbage";
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(typeof result).toBe("string");
+    expect(result).toContain("Suggested Allocation");
+  });
+});
