@@ -2171,8 +2171,13 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
       // Re-fetch room inputs so the add-room prompt has live availability info.
       const checkIn  = vars["bookingCheckIn"]!;
       const checkOut = vars["bookingCheckOut"]!;
-      const rooms = await buildInventoryRooms(hotelId, checkIn, checkOut, deps.fetchRoomTypes, deps.getCalendarData);
-      return renderManualMode(next, addableRooms(rooms, next.selectedRooms));
+      const confirmRooms  = await buildInventoryRooms(hotelId, checkIn, checkOut, deps.fetchRoomTypes, deps.getCalendarData);
+      const confirmAddable = addableRooms(confirmRooms, next.selectedRooms);
+      if (deps.sendManualModeList) {
+        const sent = await deps.sendManualModeList({ hotelId, guestId, state: next, addable: confirmAddable });
+        if (sent) return "ALREADY_SENT";
+      }
+      return renderManualMode(next, confirmAddable);
     }
     // Free text at the confirm step → AI modification, staying in confirm phase
     // (Fix B). No interpreter dep → unchanged behaviour (no AI call, no fetch).
