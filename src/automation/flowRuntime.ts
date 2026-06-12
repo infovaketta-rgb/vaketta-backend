@@ -22,7 +22,7 @@ import { logger } from "../utils/logger";
 
 const log = logger.child({ service: "flow-runtime" });
 import { updateSession as updateSessionDb, resetSession as resetSessionDb, SessionData } from "../services/session.service";
-import { buildMenuMessage } from "./buildMenuResponse";
+import { buildMenuMessage, buildMenuListPayload } from "./buildMenuResponse";
 import { checkRoomAvailability, getCalendarData } from "../services/availability.service";
 import {
   SerializedFlowNode,
@@ -194,7 +194,47 @@ function safeSetVar(
   return { ...flowVars, [key]: value };
 }
 
-async function safeMenu(hotelId: string): Promise<string | null> {
+async function safeMenu(hotelId: string, guestId: string): Promise<string | null> {
+  const cfg = await getHotelConfigCached(hotelId);
+  const botMsgsMap = (cfg?.botMessages as Record<string, string> | null) ?? {};
+  if (botMsgsMap.menuUseListMessage === "true") {
+    try {
+      const payload = await buildMenuListPayload(hotelId);
+      if (payload) {
+        const [hotel, guest] = await Promise.all([
+          prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } }),
+          prisma.guest.findUnique({ where: { id: guestId  }, select: { phone: true } }),
+        ]);
+        const phoneNumberId = (cfg as any)?.metaPhoneNumberId as string ?? "";
+        const encTok        = (cfg as any)?.metaAccessTokenEncrypted as string ?? "";
+        if (hotel && guest && phoneNumberId && encTok) {
+          const accessToken = decryptWhatsAppToken(encTok);
+          const wamid = await sendListMessage(guest.phone, phoneNumberId, accessToken, {
+            bodyText:    payload.bodyText,
+            buttonLabel: payload.buttonLabel,
+            sections:    payload.sections,
+          });
+          const saved = await prisma.message.create({
+            data: {
+              direction:   "OUT",
+              fromPhone:   hotel.phone,
+              toPhone:     guest.phone,
+              body:        JSON.stringify({ bodyText: payload.bodyText, buttonLabel: payload.buttonLabel }),
+              messageType: "list",
+              hotelId,
+              guestId,
+              channel:     MessageChannel.WHATSAPP,
+              status:      MessageStatus.SENT,
+              wamid,
+            },
+          });
+          const { emitToHotel } = await import("../realtime/emit");
+          emitToHotel(hotelId, "message:new", { message: saved });
+          return null; // list already dispatched
+        }
+      }
+    } catch { /* credentials missing or send failed — fall through to plain text */ }
+  }
   return (await buildMenuMessage(hotelId)) ?? MENU_FALLBACK;
 }
 
@@ -684,7 +724,7 @@ export async function executeFlowStep(
   const flowContent = await getPublishedNodes(flowId);
   if (!flowContent) {
     await resetSessionDb(guestId, hotelId);
-    return safeMenu(hotelId);
+    return safeMenu(hotelId, guestId);
   }
 
   const { nodes, edges } = flowContent;
@@ -780,7 +820,7 @@ export async function executeFlowStep(
     if (++hops > MAX_HOPS) {
       log.error({ flowId, guestId, lastNode: currentNodeId }, `MAX_HOPS(${MAX_HOPS}) exceeded — likely infinite loop`);
       await resetSession(guestId, hotelId);
-      const hopMenu = await safeMenu(hotelId);
+      const hopMenu = await safeMenu(hotelId, guestId);
       const hopNote = "Something went wrong in our conversation flow. Let's start over.";
       return hopMenu ? `${hopNote}\n\n${hopMenu}` : hopNote;
     }
@@ -789,7 +829,7 @@ export async function executeFlowStep(
     if (!node) {
       // Node missing — flow was likely re-published mid-session.
       await resetSession(guestId, hotelId);
-      const driftMenu = await safeMenu(hotelId);
+      const driftMenu = await safeMenu(hotelId, guestId);
       const driftNote = "We've just updated our options — starting fresh.";
       return driftMenu ? `${driftNote}\n\n${driftMenu}` : driftNote;
     }
@@ -824,7 +864,7 @@ export async function executeFlowStep(
       // ── start ───────────────────────────────────────────────────────────────
       case "start": {
         const next = nextNodeId(currentNodeId, adjacency);
-        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
         return advance(next);
       }
 
@@ -836,7 +876,7 @@ export async function executeFlowStep(
 
         if (!next) {
           await resetSession(guestId, hotelId);
-          return text || safeMenu(hotelId);
+          return text || safeMenu(hotelId, guestId);
         }
 
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
@@ -869,7 +909,7 @@ export async function executeFlowStep(
 
           let rawList: { id: string; name: string; price: number }[] = [];
           try { rawList = JSON.parse(flowData.flowVars["__roomList__"] ?? "[]"); } catch { /* corrupted — treat as empty */ }
-          if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+          if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
 
           const num = parseInt(input, 10);
           if (isNaN(num) || num < 1 || num > rawList.length) {
@@ -895,7 +935,7 @@ export async function executeFlowStep(
           delete flowData.waitingFor;
 
           const next = nextNodeId(currentNodeId, adjacency);
-          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
           return advance(next);
         }
@@ -948,7 +988,7 @@ export async function executeFlowStep(
 
           delete flowData.waitingFor;
           const next = nextNodeId(currentNodeId, adjacency);
-          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
           return advance(next);
         }
@@ -981,7 +1021,7 @@ export async function executeFlowStep(
           delete flowData.flowVars["__questionType__"];
           delete flowData.waitingFor;
           const next = nextNodeId(currentNodeId, adjacency);
-          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
           return advance(next);
         }
@@ -1007,7 +1047,7 @@ export async function executeFlowStep(
               flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, intent === "confirm" ? "yes" : "no");
               delete flowData.waitingFor;
               const next = nextNodeId(currentNodeId, adjacency);
-              if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+              if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
               await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
               return advance(next);
             }
@@ -1018,7 +1058,7 @@ export async function executeFlowStep(
           flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, isYes ? "yes" : "no");
           delete flowData.waitingFor;
           const next = nextNodeId(currentNodeId, adjacency);
-          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
           return advance(next);
         }
@@ -1107,7 +1147,7 @@ export async function executeFlowStep(
         delete flowData.waitingFor;
 
         const next = nextNodeId(currentNodeId, adjacency);
-        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
         return advance(next);
       }
@@ -1270,7 +1310,7 @@ export async function executeFlowStep(
         let rawList: { id: string; name: string; price: number; maxAdults: number | null; maxChildren: number | null }[] = [];
         try { rawList = JSON.parse(flowData.flowVars["__roomList__"] ?? "[]"); } catch { /* corrupted — treat as empty */ }
 
-        if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+        if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
 
         // ── View Photos handler ───────────────────────────────────────────────
         // Carousel "View Photos" buttons emit "photos_<roomId>". Send extra
@@ -1386,7 +1426,7 @@ export async function executeFlowStep(
         delete flowData.waitingFor;
 
         const next = nextNodeId(currentNodeId, adjacency);
-        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
         return advance(next);
       }
@@ -1448,7 +1488,7 @@ export async function executeFlowStep(
         if (!next) {
           log.error({ flowId, nodeId: currentNodeId, handle }, "branch node has no outgoing edge");
           await resetSession(guestId, hotelId);
-          return safeMenu(hotelId);
+          return safeMenu(hotelId, guestId);
         }
         return advance(next);
       }
@@ -1818,7 +1858,7 @@ export async function executeFlowStep(
         if (d.actionType === "start_booking_flow") {
           log.error({ flowId }, 'deprecated action "start_booking_flow" — replace with create_booking');
           await resetSession(guestId, hotelId);
-          return (d.message ? `${d.message}\n\n` : "") + (await safeMenu(hotelId) ?? "");
+          return (d.message ? `${d.message}\n\n` : "") + (await safeMenu(hotelId, guestId) ?? "");
         }
 
         // ── handoff_to_staff ───────────────────────────────────────────────────
@@ -1833,7 +1873,7 @@ export async function executeFlowStep(
         // ── reset_to_menu ──────────────────────────────────────────────────────
         if (d.actionType === "reset_to_menu") {
           await resetSession(guestId, hotelId);
-          const menu = await safeMenu(hotelId);
+          const menu = await safeMenu(hotelId, guestId);
           return d.message ? `${d.message}\n\n${menu ?? ""}`.trim() : menu;
         }
 
@@ -1950,7 +1990,7 @@ export async function executeFlowStep(
           nextNodeId(currentNodeId, adjacency, handle) ??
           nextNodeId(currentNodeId, adjacency);
 
-        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
         return advance(next);
       }
@@ -1962,7 +2002,7 @@ export async function executeFlowStep(
         if (!d.targetNodeId || !nodeMap.has(d.targetNodeId)) {
           log.error({ flowId, targetNodeId: d.targetNodeId }, "jump node references missing targetNodeId");
           await resetSession(guestId, hotelId);
-          return safeMenu(hotelId);
+          return safeMenu(hotelId, guestId);
         }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${d.targetNodeId}`, { ...sessionData, flow: { ...flowData } });
         return advance(d.targetNodeId);
@@ -2152,7 +2192,7 @@ export async function executeFlowStep(
 
         if (!opts.length) {
           await resetSession(guestId, hotelId);
-          return safeMenu(hotelId);
+          return safeMenu(hotelId, guestId);
         }
 
         if (!flowData.waitingFor) {
@@ -2203,14 +2243,14 @@ export async function executeFlowStep(
         delete flowData.waitingFor;
 
         const next = nextNodeId(currentNodeId, adjacency);
-        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
+        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
         return advance(next);
       }
 
       default: {
         await resetSession(guestId, hotelId);
-        return safeMenu(hotelId);
+        return safeMenu(hotelId, guestId);
       }
     }
   }

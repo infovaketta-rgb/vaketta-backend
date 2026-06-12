@@ -1238,7 +1238,7 @@ export type AdvancedRoomAllocationDeps = {
   nextNodeId:     (nodeId: string, adjacency: Adjacency, handle?: string) => string | null;
   updateSession:  (guestId: string, hotelId: string, state: string, data: SessionData) => Promise<unknown>;
   resetSession:   (guestId: string, hotelId: string) => Promise<unknown>;
-  safeMenu:       (hotelId: string) => Promise<string | null>;
+  safeMenu:       (hotelId: string, guestId: string) => Promise<string | null>;
   fetchRoomTypes: FetchRoomTypesFn;
   getCalendarData: GetCalendarDataFn;
   // OPTIONAL — when provided, manual mode uses it as a fallback to interpret
@@ -1912,7 +1912,7 @@ async function finalizeAndAdvance(deps: AdvancedRoomAllocationDeps, allocated: A
   if (!next) {
     // No downstream node — booking can't progress. Best-effort: reset and show menu.
     await resetSession(guestId, hotelId);
-    return safeMenu(hotelId);
+    return safeMenu(hotelId, guestId);
   }
   // Don't persist here — the recursive advance call will re-save under the
   // new node's state. Persisting twice would race with the downstream save.
@@ -2048,7 +2048,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
   if (isMenuInput(input)) {
     clearState(vars);
     await resetSession(guestId, hotelId);
-    return safeMenu(hotelId);
+    return safeMenu(hotelId, guestId);
   }
 
   const state = readState(vars);
@@ -2065,13 +2065,13 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
       const next = nextNodeId(currentNodeId, adjacency);
       if (!next) {
         await resetSession(guestId, hotelId);
-        return safeMenu(hotelId);
+        return safeMenu(hotelId, guestId);
       }
       return advance(next);
     }
     // No state and not a confirm-like input → reset gracefully.
     await resetSession(guestId, hotelId);
-    return safeMenu(hotelId);
+    return safeMenu(hotelId, guestId);
   }
 
   // ── Children-age collection sub-phase (Task 1) ─────────────────────────────
@@ -2089,7 +2089,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     if (!pref) {                         // corrupt state → reset gracefully
       clearState(vars);
       await resetSession(guestId, hotelId);
-      return safeMenu(hotelId);
+      return safeMenu(hotelId, guestId);
     }
     const t = input.trim();
 
@@ -2118,7 +2118,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     if (plans.length === 0) {            // corrupt state → reset gracefully
       clearState(vars);
       await resetSession(guestId, hotelId);
-      return safeMenu(hotelId);
+      return safeMenu(hotelId, guestId);
     }
 
     const t = input.trim();
@@ -2203,7 +2203,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
   if (!checkIn || !checkOut) {
     clearState(vars);
     await resetSession(guestId, hotelId);
-    return safeMenu(hotelId);
+    return safeMenu(hotelId, guestId);
   }
   const rooms = await buildInventoryRooms(hotelId, checkIn, checkOut, deps.fetchRoomTypes, deps.getCalendarData);
   const data   = (deps.node.data ?? {}) as AdvancedRoomAllocationNodeData;
