@@ -2556,6 +2556,26 @@ describe("modify phase list messages", () => {
     expect(deps.advance).toHaveBeenCalled();
   });
 
+  // ML19b: "0" during move_to_room phase → goes back to move_from_count, not main menu.
+  it("ML19b: '0' in move_to_room phase goes back, not main menu", async () => {
+    const state: AraState = {
+      guests: { adults: 4, children: 0 },
+      selectedRooms: [sR({ adults: 3 }), sR({ adults: 2 })],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "move_to_room", selectedRoomIndex: 0,
+      pendingMove: { fromRoomIndex: 0, adults: 1, children: 0 },
+    };
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars:   { __araState__: JSON.stringify(state) },
+      rooms:      [aRoom()],
+      input:      "0",
+    });
+    await handleAdvancedRoomAllocation(deps);
+    const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(after.phase).toBe("move_from_count");
+  });
+
   // ML19: sendMoveToRoomList dep present → ALREADY_SENT when entering move_to_room.
   it("ML19: sendMoveToRoomList dep → ALREADY_SENT when entering move_to_room", async () => {
     let moveSent = false;

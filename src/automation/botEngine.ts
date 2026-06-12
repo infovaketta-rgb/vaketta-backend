@@ -28,6 +28,9 @@ import { MessageChannel, MessageStatus } from "@prisma/client";
 
 const RESET_KEYWORDS = new Set(["MENU", "0", "HI", "HELLO", "START", "RESTART", "BACK", "HOME"]);
 
+import { isZeroExempt } from "./zeroExempt";
+export { isZeroExempt } from "./zeroExempt";
+
 // ── Public entry point ─────────────────────────────────────────────────────────
 
 export async function processMessage(
@@ -48,8 +51,11 @@ export async function processMessage(
     session.state = "IDLE";
   }
 
-  // Global reset — works from any state except IDLE/AWAITING_SELECTION
-  if (RESET_KEYWORDS.has(upper) && !["IDLE", "AWAITING_SELECTION"].includes(session.state)) {
+  // Global reset — works from any state except IDLE/AWAITING_SELECTION.
+  // "0" is additionally exempt when the session is inside an ARA modification
+  // phase (means go-back) or a question node awaiting a numeric answer (0 is valid).
+  const zeroBlocked = upper === "0" && isZeroExempt(session.state, data);
+  if (RESET_KEYWORDS.has(upper) && !["IDLE", "AWAITING_SELECTION"].includes(session.state) && !zeroBlocked) {
     await resetSession(guestId, hotelId);
     return showMenu(hotelId, guestId, {}, input);
   }

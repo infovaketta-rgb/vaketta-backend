@@ -957,6 +957,8 @@ export async function executeFlowStep(
         if (qt === "number") {
           if (!flowData.waitingFor) {
             flowData.waitingFor = "answer";
+            // Tag so the global "0" → main-menu intercept in botEngine knows not to fire.
+            flowData.flowVars = { ...flowData.flowVars, __questionType__: "number" };
             await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
             return interpolate(d.text || "Please enter a number:", flowData.flowVars);
           }
@@ -976,6 +978,7 @@ export async function executeFlowStep(
           }
 
           flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, String(num));
+          delete flowData.flowVars["__questionType__"];
           delete flowData.waitingFor;
           const next = nextNodeId(currentNodeId, adjacency);
           if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId); }
