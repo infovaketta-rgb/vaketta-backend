@@ -45,6 +45,7 @@ import {
   buildRoomMenuSections,
   buildMoveToRoomSections,
   buildManualModeSections,
+  buildChangeTypeSections,
   MOD_REMOVE_EXTRA_BED,
   MOD_GO_BACK,
   MOVE_GO_BACK,
@@ -53,6 +54,8 @@ import {
   MODIFY_GO_BACK,
   EDIT_ROOM_PREFIX,
   ADD_ROOM_PREFIX,
+  CHANGE_TYPE_GO_BACK,
+  CHANGE_TYPE_PREFIX,
 } from "./modifyLists";
 import type { SerializedFlowNode } from "../flowTypes";
 import type { SessionData } from "../../services/session.service";
@@ -2575,5 +2578,160 @@ describe("modify phase list messages", () => {
     void moveSent; // dep was called
     expect(sendMoveToRoomList).toHaveBeenCalledTimes(1);
     expect(result).toBe("ALREADY_SENT");
+  });
+});
+
+// ── Change-room-type list message ─────────────────────────────────────────────
+describe("change room type list message", () => {
+  function cRoom(over: Partial<AllocationRoom> = {}): AllocationRoom {
+    return {
+      roomTypeId: "rt_dlx", roomTypeName: "Deluxe",
+      adults: 2, children: 0, extraBed: false,
+      basePrice: 5000, extraAdultCost: 0, extraBedCost: 0, childAgeLimit: null,
+      pricePerNight: 5000, nights: 2, totalPrice: 10000,
+      ...over,
+    };
+  }
+  function twoTypes() {
+    return [
+      room({ roomTypeId: "rt_dlx", name: "Deluxe",   basePrice: 5000, maxAdults: 3, maxChildren: 1, availableCount: 5 }),
+      room({ roomTypeId: "rt_sup", name: "Superior", basePrice: 6500, maxAdults: 3, maxChildren: 1, availableCount: 3 }),
+    ];
+  }
+  // Build deps in change_type_select phase for room 0 (Deluxe).
+  function mkCT(input: string, over: Partial<AdvancedRoomAllocationDeps> = {}) {
+    const state: AraState = {
+      guests: { adults: 2, children: 0 },
+      selectedRooms: [cRoom()],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "change_type_select", selectedRoomIndex: 0,
+    };
+    return makeDeps({
+      waitingFor: "answer",
+      flowVars:   { __araState__: JSON.stringify(state) },
+      rooms:      twoTypes(),
+      input,
+      ...over,
+    });
+  }
+  const readPhase = (deps: AdvancedRoomAllocationDeps) =>
+    deps.flowData.flowVars["__araState__"]
+      ? (JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState).phase
+      : undefined;
+
+  // ── Pure builder tests ───────────────────────────────────────────────────────
+
+  // CL1: buildChangeTypeSections produces correct sections and row ids.
+  it("CL1: buildChangeTypeSections has Available Room Types and Navigation sections", () => {
+    const candidates = [
+      room({ roomTypeId: "rt_sup", name: "Superior", basePrice: 6500, availableCount: 3 }),
+      room({ roomTypeId: "rt_pre", name: "Premier",  basePrice: 8000, availableCount: 1 }),
+    ];
+    const sections = buildChangeTypeSections(candidates);
+    expect(sections.length).toBe(2);
+    expect(sections[0]!.title).toBe("Available Room Types");
+    expect(sections[0]!.rows.map((r) => r.id)).toEqual([
+      `${CHANGE_TYPE_PREFIX}rt_sup`,
+      `${CHANGE_TYPE_PREFIX}rt_pre`,
+    ]);
+    expect(sections[1]!.title).toBe("Navigation");
+    expect(sections[1]!.rows[0]!.id).toBe(CHANGE_TYPE_GO_BACK);
+  });
+
+  // CL2: Current room type is excluded from candidates (pure — caller responsibility,
+  //      confirmed by checking changeTypeCandidates logic).
+  it("CL2: buildChangeTypeSections does not include a current-type row if caller filters", () => {
+    // Only Superior passed — Deluxe (current) is excluded by changeTypeCandidates upstream.
+    const sections = buildChangeTypeSections([
+      room({ roomTypeId: "rt_sup", name: "Superior", basePrice: 6500, availableCount: 2 }),
+    ]);
+    const ids = sections[0]!.rows.map((r) => r.id);
+    expect(ids).not.toContain(`${CHANGE_TYPE_PREFIX}rt_dlx`);
+    expect(ids).toContain(`${CHANGE_TYPE_PREFIX}rt_sup`);
+  });
+
+  // CL3: Row description is truncated to ≤72 chars.
+  it("CL3: buildChangeTypeSections description ≤72 chars", () => {
+    const candidates = [
+      room({ roomTypeId: "rt_x", name: "x", basePrice: 99999, availableCount: 99 }),
+    ];
+    const sections = buildChangeTypeSections(candidates);
+    const desc = sections[0]!.rows[0]!.description ?? "";
+    expect(desc.length).toBeLessThanOrEqual(72);
+  });
+
+  // ── Handler integration tests ─────────────────────────────────────────────────
+
+  // CL4: CHANGE_TYPE_{roomTypeId} list reply switches room type (same as typed "1").
+  it("CL4: CHANGE_TYPE_{id} list reply switches room type", async () => {
+    const deps = mkCT(`${CHANGE_TYPE_PREFIX}rt_sup`);
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("manual");
+    const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(after.selectedRooms[0]!.roomTypeId).toBe("rt_sup");
+  });
+
+  // CL5: CHANGE_TYPE_GO_BACK routes to room_menu (same as typed "0").
+  it("CL5: CHANGE_TYPE_GO_BACK goes back to room_menu", async () => {
+    const deps = mkCT(CHANGE_TYPE_GO_BACK);
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("room_menu");
+  });
+
+  // CL6: Typed "0" still routes back to room_menu (back-compat).
+  it("CL6: typed '0' still goes back to room_menu", async () => {
+    const deps = mkCT("0");
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("room_menu");
+  });
+
+  // CL7: Typed "1" still switches room type (back-compat).
+  it("CL7: typed '1' still switches room type", async () => {
+    const deps = mkCT("1");
+    await handleAdvancedRoomAllocation(deps);
+    expect(readPhase(deps)).toBe("manual");
+    const after = JSON.parse(deps.flowData.flowVars["__araState__"]!) as AraState;
+    expect(after.selectedRooms[0]!.roomTypeId).toBe("rt_sup");
+  });
+
+  // CL8: sendChangeRoomTypeList dep present → ALREADY_SENT on initial entry.
+  it("CL8: sendChangeRoomTypeList dep → ALREADY_SENT when entering change_type_select", async () => {
+    const sendChangeRoomTypeList = vi.fn(async () => true);
+    // Start in room_menu, pick "change_type" action to enter change_type_select.
+    // Options for Deluxe with allowExtraBed=false: [move_guest, change_type, remove_room] → "2" = change_type.
+    const roomMenuState: AraState = {
+      guests: { adults: 2, children: 0 },
+      selectedRooms: [cRoom()],
+      remainingGuests: { adults: 0, children: 0 },
+      phase: "room_menu", selectedRoomIndex: 0,
+    };
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars:   { __araState__: JSON.stringify(roomMenuState) },
+      rooms:      twoTypes(),
+      input:      "2",   // change_type is option 2 (allowExtraBed off: move_guest=1, change_type=2, remove_room=3)
+      sendChangeRoomTypeList,
+    });
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(sendChangeRoomTypeList).toHaveBeenCalledTimes(1);
+    expect(result).toBe("ALREADY_SENT");
+  });
+
+  // CL9: sendChangeRoomTypeList dep present → ALREADY_SENT on invalid reply (re-render).
+  it("CL9: sendChangeRoomTypeList dep → ALREADY_SENT on invalid input re-render", async () => {
+    const sendChangeRoomTypeList = vi.fn(async () => true);
+    const deps = mkCT("garbage", { sendChangeRoomTypeList });
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(sendChangeRoomTypeList).toHaveBeenCalledTimes(1);
+    expect(result).toBe("ALREADY_SENT");
+  });
+
+  // CL10: No dep → falls back to text format.
+  it("CL10: no dep → text fallback on invalid input", async () => {
+    const deps = mkCT("garbage");
+    const result = await handleAdvancedRoomAllocation(deps);
+    expect(typeof result).toBe("string");
+    expect(result).toContain("Change");
+    expect(result).toContain("Superior");
   });
 });

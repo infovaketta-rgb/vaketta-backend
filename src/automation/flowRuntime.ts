@@ -50,7 +50,7 @@ import { getHotelConfigCached } from "../services/settings.service";
 import { extractDateWithAI, classifyBookingIntent, interpretAllocationModification, extractChildrenAgesAI } from "../services/ai.service";
 import { handleAdvancedRoomAllocation, type AllocationRoomInput, type SendRoomCarouselFn } from "./nodes/advancedRoomAllocation";
 import { trySendPlanList } from "./nodes/planList";
-import { trySendRoomMenuList, trySendMoveToRoomList, trySendManualModeList } from "./nodes/modifyLists";
+import { trySendRoomMenuList, trySendMoveToRoomList, trySendManualModeList, trySendChangeRoomTypeList } from "./nodes/modifyLists";
 import { aggregateRoomQuantities } from "./bookingAllocation";
 import { interpolate } from "./interpolate";
 // randomUUID removed — no longer needed after multi-room booking refactor
@@ -1418,9 +1418,10 @@ export async function executeFlowStep(
           sendRoomDescriptions: trySendOccupancyNotice, // generic text sender (same shape)
           sendMixItUpList:      trySendMixItUpList,
           sendConfirmButtons:   trySendConfirmButtons,
-          sendRoomMenuList:     trySendRoomMenuList,
-          sendMoveToRoomList:   trySendMoveToRoomList,
-          sendManualModeList:   trySendManualModeList,
+          sendRoomMenuList:        trySendRoomMenuList,
+          sendMoveToRoomList:      trySendMoveToRoomList,
+          sendManualModeList:      trySendManualModeList,
+          sendChangeRoomTypeList:  trySendChangeRoomTypeList,
         });
       }
 

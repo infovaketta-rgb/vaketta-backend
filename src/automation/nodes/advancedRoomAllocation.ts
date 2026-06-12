@@ -1282,6 +1282,9 @@ export type AdvancedRoomAllocationDeps = {
   // OPTIONAL — sends the manual-mode booking overview (manual phase) as an
   // interactive list. Returns true if sent (→ "ALREADY_SENT"). Absent → text.
   sendManualModeList?: (args: { hotelId: string; guestId: string; state: AraState; addable: AllocationRoomInput[] }) => Promise<boolean>;
+  // OPTIONAL — sends the "change room type" picker (change_type_select phase) as
+  // an interactive list. Returns true if sent (→ "ALREADY_SENT"). Absent → text.
+  sendChangeRoomTypeList?: (args: { hotelId: string; guestId: string; room: AllocationRoom; roomIndex: number; candidates: AllocationRoomInput[] }) => Promise<boolean>;
 };
 
 /** Sends the multi-plan interactive list; returns true if sent (→ "ALREADY_SENT"). */
@@ -2281,6 +2284,10 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
       };
       writeState(vars, ct);
       await persist(deps);
+      if (deps.sendChangeRoomTypeList) {
+        const sent = await deps.sendChangeRoomTypeList({ hotelId, guestId, room: targetRoom, roomIndex: idx, candidates });
+        if (sent) return "ALREADY_SENT";
+      }
       return renderChangeTypeSelect(targetRoom, candidates, idx);
     }
     const res: ApplyResult =
@@ -2364,7 +2371,7 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
     const targetRoom = state.selectedRooms[idx]!;
     const candidates = changeTypeCandidates(rooms, targetRoom);
     const t = input.trim();
-    if (isGoBackInput(t)) {
+    if (isGoBackInput(t) || t.toUpperCase() === "CHANGE_TYPE_GO_BACK") {
       const rm: AraState = {
         guests: state.guests, selectedRooms: state.selectedRooms, remainingGuests: state.remainingGuests,
         phase: "room_menu", selectedRoomIndex: idx,
@@ -2373,14 +2380,32 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
       await persist(deps);
       return showRoomMenu(targetRoom, roomMenuOptions(targetRoom, resolveCfg(targetRoom)), idx);
     }
-    const sel = parseInt(t, 10);
-    if (!Number.isFinite(sel) || sel < 1 || sel > candidates.length) {
-      return renderChangeTypeSelect(targetRoom, candidates, idx);
+
+    // Accept CHANGE_TYPE_{roomTypeId} list-reply or typed slot number.
+    const typeId = t.match(/^CHANGE_TYPE_(.+)$/i)?.[1] ?? null;
+    let target: AllocationRoomInput | undefined;
+    if (typeId) {
+      target = candidates.find((c) => c.roomTypeId === typeId);
+    } else {
+      const sel = parseInt(t, 10);
+      if (Number.isFinite(sel) && sel >= 1 && sel <= candidates.length) {
+        target = candidates[sel - 1];
+      }
     }
-    const target = candidates[sel - 1]!;
+
+    // Helper to re-show the picker (optionally as list).
+    const showChangeTypePicker = async (): Promise<string> => {
+      if (deps.sendChangeRoomTypeList) {
+        const sent = await deps.sendChangeRoomTypeList({ hotelId, guestId, room: targetRoom, roomIndex: idx, candidates });
+        if (sent) return "ALREADY_SENT";
+      }
+      return renderChangeTypeSelect(targetRoom, candidates, idx);
+    };
+
+    if (!target) return showChangeTypePicker();
     const res = applyChangeRoomType(state.selectedRooms, idx, target, resolveCfg);
     if (res.ok) return toManual(res.rooms);
-    if (res.outOfRange) return renderChangeTypeSelect(targetRoom, candidates, idx);
+    if (res.outOfRange) return showChangeTypePicker();
     return `${res.reason}\n\n${renderChangeTypeSelect(targetRoom, candidates, idx)}`;
   }
 

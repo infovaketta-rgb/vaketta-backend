@@ -319,6 +319,83 @@ export async function trySendMoveToRoomList(args: {
   }
 }
 
+// ── Injectable sender 4: change-room-type picker ─────────────────────────────
+
+export const CHANGE_TYPE_GO_BACK   = "CHANGE_TYPE_GO_BACK";
+/** Prefix for change-room-type rows — id = CHANGE_TYPE_{roomTypeId}. */
+export const CHANGE_TYPE_PREFIX    = "CHANGE_TYPE_";
+
+/**
+ * If input is a CHANGE_TYPE_{roomTypeId} list-reply, return the roomTypeId.
+ * Otherwise return null.
+ */
+export function parseChangeTypeReply(raw: string): string | null {
+  const m = raw.trim().match(/^CHANGE_TYPE_(.+)$/i);
+  return m ? m[1]! : null;
+}
+
+/**
+ * Build the sections for the change-room-type list message.
+ * candidates is the already-filtered list (current type excluded).
+ */
+export function buildChangeTypeSections(
+  candidates: AllocationRoomInput[],
+): { title: string; rows: Array<{ id: string; title: string; description?: string }> }[] {
+  const typeRows = candidates.map((r) => ({
+    id:          `${CHANGE_TYPE_PREFIX}${r.roomTypeId}`,
+    title:       r.name.slice(0, 24),
+    description: `${inr(r.basePrice)}/night · ${r.availableCount} available`.slice(0, ROW_DESC_MAX),
+  }));
+
+  return [
+    { title: "Available Room Types", rows: typeRows },
+    { title: "Navigation",           rows: [{ id: CHANGE_TYPE_GO_BACK, title: "↩️ Go back" }] },
+  ];
+}
+
+export type SendChangeRoomTypeListFn = (args: {
+  hotelId:    string;
+  guestId:    string;
+  room:       AllocationRoom;
+  roomIndex:  number;
+  candidates: AllocationRoomInput[];
+}) => Promise<boolean>;
+
+export async function trySendChangeRoomTypeList(args: {
+  hotelId:    string;
+  guestId:    string;
+  room:       AllocationRoom;
+  roomIndex:  number;
+  candidates: AllocationRoomInput[];
+}): Promise<boolean> {
+  const { hotelId, guestId, room, roomIndex, candidates } = args;
+  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
+  try {
+    const creds = await resolveHotelGuest(hotelId, guestId);
+    if (!creds) return false;
+    const { phone, hotelPhone, phoneNumberId, accessToken } = creds;
+
+    const bodyText    = `Change Room ${roomIndex + 1} to which type?`;
+    const sections    = buildChangeTypeSections(candidates);
+    const buttonLabel = "Choose Type";
+    const footerText  = "Type MENU to cancel";
+    const allRows     = sections.flatMap((s) => s.rows);
+
+    const wamid = await sendListMessage(phone, phoneNumberId, accessToken, {
+      bodyText,
+      footerText,
+      buttonLabel,
+      sections,
+    });
+
+    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, bodyText, allRows);
+    return true;
+  } catch (err) {
+    log.warn({ err, hotelId, guestId }, "change-room-type list send failed — falling back to text");
+    return false;
+  }
+}
+
 // ── Injectable sender 3: manual-mode overview ────────────────────────────────
 
 export type SendManualModeListFn = (args: {
