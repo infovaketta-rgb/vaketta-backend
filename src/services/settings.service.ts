@@ -196,7 +196,7 @@ export async function testWhatsAppConnection(hotelId: string): Promise<{ ok: boo
     return { ok: false, detail: "Credentials not configured" };
   }
 
-  const version = process.env.META_API_VERSION || "v18.0";
+  const version = "v25.0";
   try {
     const res = await fetch(
       `https://graph.facebook.com/${version}/${phoneNumberId}?fields=id,display_phone_number`,

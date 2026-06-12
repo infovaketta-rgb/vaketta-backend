@@ -1,7 +1,7 @@
 import prisma from "../db/connect";
 import { encryptInstagramToken } from "./instagram.service";
 
-const META_VERSION = "v19.0";
+const META_VERSION = "v25.0";
 
 export interface FacebookPage {
   id: string;
