@@ -254,6 +254,12 @@ export async function confirmBookingOptions(req: Request, res: Response) {
     const channel = await getGuestChannel(booking.guestId, hotelId);
     const vars    = buildVars(booking);
 
+    const hotelCfg = await prisma.hotelConfig.findUnique({
+      where:  { hotelId },
+      select: { botMessages: true },
+    });
+    const botMsgs = (hotelCfg?.botMessages ?? {}) as Record<string, string>;
+
     if (channel === MessageChannel.WHATSAPP) {
       const templates = await prisma.whatsAppTemplate.findMany({
         where:   { hotelId, status: "APPROVED" },
@@ -270,7 +276,8 @@ export async function confirmBookingOptions(req: Request, res: Response) {
           bodyPreview: interpolateTemplateBody(bodyText, vars),
         };
       });
-      return res.json({ channel, options });
+      const defaultId = botMsgs.defaultConfirmTemplateId || null;
+      return res.json({ channel, options, defaultId });
     }
 
     // Instagram
@@ -285,7 +292,8 @@ export async function confirmBookingOptions(req: Request, res: Response) {
       category:    r.category ?? null,
       bodyPreview: interpolate(r.body, vars),
     }));
-    return res.json({ channel, options });
+    const defaultId = botMsgs.defaultConfirmSavedReplyId || null;
+    return res.json({ channel, options, defaultId });
   } catch (err) {
     log.error({ err }, "confirm-options failed");
     return res.status(500).json({ error: "Failed to load message options" });
