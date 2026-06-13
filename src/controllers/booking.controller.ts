@@ -197,10 +197,10 @@ export async function bulkUpdateBookingStatus(req: Request, res: Response) {
   }
 }
 
-// ── Helpers for confirm-with-message ─────────────────────────────────────────
+// ── Shared helpers ────────────────────────────────────────────────────────────
 
 function formatDateShort(d: Date): string {
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+  return d.toISOString().slice(0, 10);
 }
 
 async function getGuestChannel(guestId: string, hotelId: string): Promise<MessageChannel> {
@@ -226,63 +226,20 @@ function buildVars(booking: any): Record<string, string> {
   };
 }
 
-async function resolveMessagePreview(
-  hotelId: string,
-  channel: MessageChannel,
-  vars: Record<string, string>
-): Promise<{ preview: string; templateId?: string; savedReplyId?: string }> {
-  if (channel === MessageChannel.WHATSAPP) {
-    // Find first APPROVED template whose name contains "booking" or "confirm"
-    const template = await prisma.whatsAppTemplate.findFirst({
-      where: {
-        hotelId,
-        status: "APPROVED",
-        OR: [
-          { name: { contains: "booking",  mode: "insensitive" } },
-          { name: { contains: "confirm",  mode: "insensitive" } },
-        ],
-      },
-      orderBy: { createdAt: "asc" },
-    });
-    if (template) {
-      const comps = template.components as any;
-      const bodyText = comps?.body?.text ?? template.name;
-      const preview = bodyText.replace(
-        /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g,
-        (_: string, k: string) => vars[k] ?? `{{${k}}}`
-      );
-      return { preview, templateId: template.id };
-    }
-    return { preview: `Dear ${vars.guestName}, your booking ${vars.bookingRef} has been confirmed. Check-in: ${vars.checkIn}, Check-out: ${vars.checkOut}. Room: ${vars.roomType}.` };
-  }
-
-  // Instagram — use a SavedReply
-  const savedReply = await prisma.savedReply.findFirst({
-    where: {
-      hotelId,
-      OR: [
-        { category: { contains: "booking",  mode: "insensitive" } },
-        { category: { contains: "confirm",  mode: "insensitive" } },
-        { name:     { contains: "booking",  mode: "insensitive" } },
-        { name:     { contains: "confirm",  mode: "insensitive" } },
-      ],
-    },
-    orderBy: { createdAt: "asc" },
-  });
-  if (savedReply) {
-    return { preview: interpolate(savedReply.body, vars), savedReplyId: savedReply.id };
-  }
-  // Fallback: first saved reply for this hotel
-  const first = await prisma.savedReply.findFirst({ where: { hotelId }, orderBy: { createdAt: "asc" } });
-  if (first) {
-    return { preview: interpolate(first.body, vars), savedReplyId: first.id };
-  }
-  return { preview: `Dear ${vars.guestName}, your booking ${vars.bookingRef} has been confirmed. Check-in: ${vars.checkIn}, Check-out: ${vars.checkOut}.` };
+function interpolateTemplateBody(bodyText: string, vars: Record<string, string>): string {
+  return bodyText.replace(
+    /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g,
+    (_: string, k: string) => vars[k] ?? `{{${k}}}`
+  );
 }
 
-// ── GET /bookings/:id/confirm-preview ─────────────────────────────────────────
+// ── GET /bookings/:id/confirm-options ─────────────────────────────────────────
+//
+// Returns available message options for the guest's channel:
+//   WHATSAPP → { channel, options: [{ id, name, bodyPreview }] }  (APPROVED templates only)
+//   INSTAGRAM → { channel, options: [{ id, name, bodyPreview }] } (all saved replies)
 
-export async function confirmBookingPreview(req: Request, res: Response) {
+export async function confirmBookingOptions(req: Request, res: Response) {
   try {
     const hotelId     = (req as any).user.hotelId as string;
     const { bookingId } = req.params;
@@ -296,9 +253,87 @@ export async function confirmBookingPreview(req: Request, res: Response) {
 
     const channel = await getGuestChannel(booking.guestId, hotelId);
     const vars    = buildVars(booking);
-    const { preview, templateId, savedReplyId } = await resolveMessagePreview(hotelId, channel, vars);
 
-    return res.json({ channel, messagePreview: preview, templateId, savedReplyId });
+    if (channel === MessageChannel.WHATSAPP) {
+      const templates = await prisma.whatsAppTemplate.findMany({
+        where:   { hotelId, status: "APPROVED" },
+        orderBy: { name: "asc" },
+        select:  { id: true, name: true, language: true, components: true },
+      });
+      const options = templates.map((t) => {
+        const comps    = t.components as any;
+        const bodyText = comps?.body?.text ?? t.name;
+        return {
+          id:          t.id,
+          name:        t.name,
+          language:    t.language,
+          bodyPreview: interpolateTemplateBody(bodyText, vars),
+        };
+      });
+      return res.json({ channel, options });
+    }
+
+    // Instagram
+    const savedReplies = await prisma.savedReply.findMany({
+      where:   { hotelId },
+      orderBy: { name: "asc" },
+      select:  { id: true, name: true, category: true, body: true },
+    });
+    const options = savedReplies.map((r) => ({
+      id:          r.id,
+      name:        r.name,
+      category:    r.category ?? null,
+      bodyPreview: interpolate(r.body, vars),
+    }));
+    return res.json({ channel, options });
+  } catch (err) {
+    log.error({ err }, "confirm-options failed");
+    return res.status(500).json({ error: "Failed to load message options" });
+  }
+}
+
+// ── GET /bookings/:id/confirm-preview?templateId=&savedReplyId= ───────────────
+//
+// Returns interpolated preview for a specific selection.
+// If no id provided, returns the channel so the frontend can show options.
+
+export async function confirmBookingPreview(req: Request, res: Response) {
+  try {
+    const hotelId     = (req as any).user.hotelId as string;
+    const { bookingId } = req.params;
+    const { templateId, savedReplyId } = req.query as { templateId?: string; savedReplyId?: string };
+
+    if (!bookingId) return res.status(400).json({ error: "bookingId required" });
+
+    const booking = await prisma.booking.findFirst({
+      where:   { id: bookingId, hotelId },
+      include: { guest: true, roomType: true, rooms: { include: { roomType: { select: { name: true } } } } },
+    });
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    const channel = await getGuestChannel(booking.guestId, hotelId);
+    const vars    = buildVars(booking);
+
+    if (templateId) {
+      const template = await prisma.whatsAppTemplate.findFirst({
+        where: { id: templateId, hotelId, status: "APPROVED" },
+      });
+      if (!template) return res.status(404).json({ error: "Template not found or not approved" });
+      const comps    = template.components as any;
+      const bodyText = comps?.body?.text ?? template.name;
+      return res.json({ channel, messagePreview: interpolateTemplateBody(bodyText, vars), templateId });
+    }
+
+    if (savedReplyId) {
+      const savedReply = await prisma.savedReply.findFirst({
+        where: { id: savedReplyId, hotelId },
+      });
+      if (!savedReply) return res.status(404).json({ error: "Saved reply not found" });
+      return res.json({ channel, messagePreview: interpolate(savedReply.body, vars), savedReplyId });
+    }
+
+    // No selection yet — return channel only so modal can drive the selection UI
+    return res.json({ channel, messagePreview: null });
   } catch (err) {
     log.error({ err }, "confirm-preview failed");
     return res.status(500).json({ error: "Failed to generate preview" });
@@ -306,14 +341,22 @@ export async function confirmBookingPreview(req: Request, res: Response) {
 }
 
 // ── POST /bookings/:id/confirm ────────────────────────────────────────────────
+//
+// Body: { sendMessage: boolean, templateId?: string, savedReplyId?: string }
+// Sets booking to CONFIRMED. If sendMessage=true, uses the explicitly provided
+// templateId or savedReplyId — no hardcoded fallback lookup.
 
 export async function confirmBooking(req: Request, res: Response) {
   try {
     const hotelId     = (req as any).user.hotelId as string;
     const { bookingId } = req.params;
-    const { sendMessage } = req.body as { sendMessage?: boolean };
+    const { sendMessage, templateId, savedReplyId } =
+      req.body as { sendMessage?: boolean; templateId?: string; savedReplyId?: string };
 
     if (!bookingId) return res.status(400).json({ error: "bookingId required" });
+    if (sendMessage && !templateId && !savedReplyId) {
+      return res.status(400).json({ error: "templateId or savedReplyId required when sendMessage is true" });
+    }
 
     const booking = await prisma.booking.findFirst({
       where:   { id: bookingId, hotelId },
@@ -330,17 +373,17 @@ export async function confirmBooking(req: Request, res: Response) {
     emitToHotel(hotelId, "booking:updated", { bookingId, status: BookingStatus.CONFIRMED });
 
     if (sendMessage) {
-      // Fire-and-forget — don't let send failure block the confirm response
       (async () => {
         try {
           const channel = await getGuestChannel(booking.guestId, hotelId);
           const vars    = buildVars(booking);
-          const { templateId, savedReplyId, preview } = await resolveMessagePreview(hotelId, channel, vars);
 
-          if (channel === MessageChannel.WHATSAPP && templateId) {
+          if (templateId) {
             await sendTemplateMessage(hotelId, booking.guestId, templateId, vars);
-          } else {
-            // Instagram or WhatsApp with no template — send plain text via channel router
+          } else if (savedReplyId) {
+            const savedReply = await prisma.savedReply.findFirst({ where: { id: savedReplyId, hotelId } });
+            if (!savedReply) throw new Error("Saved reply not found");
+            const text  = interpolate(savedReply.body, vars);
             const hotel = await prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } });
             await sendChannelMessage({
               channel,
@@ -348,7 +391,7 @@ export async function confirmBooking(req: Request, res: Response) {
               fromPhone: hotel?.phone ?? "",
               hotelId,
               guestId:   booking.guestId,
-              text:      preview,
+              text,
             });
           }
         } catch (sendErr) {
