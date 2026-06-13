@@ -1,9 +1,12 @@
 import { Request, Response } from "express";
 import { createBookingService, updateBookingService } from "../services/booking.service";
 import prisma from "../db/connect";
-import { BookingStatus } from "@prisma/client";
+import { BookingStatus, MessageChannel } from "@prisma/client";
 import { logger } from "../utils/logger";
 import { emitToHotel } from "../realtime/emit";
+import { sendTemplateMessage } from "../services/templates.service";
+import { sendChannelMessage } from "../services/channel.send.service";
+import { interpolate } from "../automation/interpolate";
 
 const log = logger.child({ service: "booking" });
 
@@ -191,6 +194,173 @@ export async function bulkUpdateBookingStatus(req: Request, res: Response) {
   } catch (err) {
     log.error({ err }, "bulk booking status update failed");
     return res.status(500).json({ error: "Failed to update bookings" });
+  }
+}
+
+// ── Helpers for confirm-with-message ─────────────────────────────────────────
+
+function formatDateShort(d: Date): string {
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+async function getGuestChannel(guestId: string, hotelId: string): Promise<MessageChannel> {
+  const latest = await prisma.message.findFirst({
+    where:   { guestId, hotelId },
+    orderBy: { timestamp: "desc" },
+    select:  { channel: true },
+  });
+  return latest?.channel ?? MessageChannel.WHATSAPP;
+}
+
+function buildVars(booking: any): Record<string, string> {
+  const roomName =
+    booking.rooms?.length > 0
+      ? `${booking.rooms.length} room${booking.rooms.length !== 1 ? "s" : ""}`
+      : (booking.roomType?.name ?? "");
+  return {
+    guestName:  booking.guestName || booking.guest?.name || "",
+    bookingRef: booking.referenceNumber || booking.id,
+    checkIn:    formatDateShort(new Date(booking.checkIn)),
+    checkOut:   formatDateShort(new Date(booking.checkOut)),
+    roomType:   roomName,
+  };
+}
+
+async function resolveMessagePreview(
+  hotelId: string,
+  channel: MessageChannel,
+  vars: Record<string, string>
+): Promise<{ preview: string; templateId?: string; savedReplyId?: string }> {
+  if (channel === MessageChannel.WHATSAPP) {
+    // Find first APPROVED template whose name contains "booking" or "confirm"
+    const template = await prisma.whatsAppTemplate.findFirst({
+      where: {
+        hotelId,
+        status: "APPROVED",
+        OR: [
+          { name: { contains: "booking",  mode: "insensitive" } },
+          { name: { contains: "confirm",  mode: "insensitive" } },
+        ],
+      },
+      orderBy: { createdAt: "asc" },
+    });
+    if (template) {
+      const comps = template.components as any;
+      const bodyText = comps?.body?.text ?? template.name;
+      const preview = bodyText.replace(
+        /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g,
+        (_: string, k: string) => vars[k] ?? `{{${k}}}`
+      );
+      return { preview, templateId: template.id };
+    }
+    return { preview: `Dear ${vars.guestName}, your booking ${vars.bookingRef} has been confirmed. Check-in: ${vars.checkIn}, Check-out: ${vars.checkOut}. Room: ${vars.roomType}.` };
+  }
+
+  // Instagram — use a SavedReply
+  const savedReply = await prisma.savedReply.findFirst({
+    where: {
+      hotelId,
+      OR: [
+        { category: { contains: "booking",  mode: "insensitive" } },
+        { category: { contains: "confirm",  mode: "insensitive" } },
+        { name:     { contains: "booking",  mode: "insensitive" } },
+        { name:     { contains: "confirm",  mode: "insensitive" } },
+      ],
+    },
+    orderBy: { createdAt: "asc" },
+  });
+  if (savedReply) {
+    return { preview: interpolate(savedReply.body, vars), savedReplyId: savedReply.id };
+  }
+  // Fallback: first saved reply for this hotel
+  const first = await prisma.savedReply.findFirst({ where: { hotelId }, orderBy: { createdAt: "asc" } });
+  if (first) {
+    return { preview: interpolate(first.body, vars), savedReplyId: first.id };
+  }
+  return { preview: `Dear ${vars.guestName}, your booking ${vars.bookingRef} has been confirmed. Check-in: ${vars.checkIn}, Check-out: ${vars.checkOut}.` };
+}
+
+// ── GET /bookings/:id/confirm-preview ─────────────────────────────────────────
+
+export async function confirmBookingPreview(req: Request, res: Response) {
+  try {
+    const hotelId     = (req as any).user.hotelId as string;
+    const { bookingId } = req.params;
+    if (!bookingId) return res.status(400).json({ error: "bookingId required" });
+
+    const booking = await prisma.booking.findFirst({
+      where:   { id: bookingId, hotelId },
+      include: { guest: true, roomType: true, rooms: { include: { roomType: { select: { name: true } } } } },
+    });
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    const channel = await getGuestChannel(booking.guestId, hotelId);
+    const vars    = buildVars(booking);
+    const { preview, templateId, savedReplyId } = await resolveMessagePreview(hotelId, channel, vars);
+
+    return res.json({ channel, messagePreview: preview, templateId, savedReplyId });
+  } catch (err) {
+    log.error({ err }, "confirm-preview failed");
+    return res.status(500).json({ error: "Failed to generate preview" });
+  }
+}
+
+// ── POST /bookings/:id/confirm ────────────────────────────────────────────────
+
+export async function confirmBooking(req: Request, res: Response) {
+  try {
+    const hotelId     = (req as any).user.hotelId as string;
+    const { bookingId } = req.params;
+    const { sendMessage } = req.body as { sendMessage?: boolean };
+
+    if (!bookingId) return res.status(400).json({ error: "bookingId required" });
+
+    const booking = await prisma.booking.findFirst({
+      where:   { id: bookingId, hotelId },
+      include: { guest: true, roomType: true, rooms: { include: { roomType: { select: { name: true } } } } },
+    });
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    const result = await prisma.booking.updateMany({
+      where: { id: bookingId, hotelId },
+      data:  { status: BookingStatus.CONFIRMED },
+    });
+    if (result.count === 0) return res.status(404).json({ error: "Booking not found or unauthorized" });
+
+    emitToHotel(hotelId, "booking:updated", { bookingId, status: BookingStatus.CONFIRMED });
+
+    if (sendMessage) {
+      // Fire-and-forget — don't let send failure block the confirm response
+      (async () => {
+        try {
+          const channel = await getGuestChannel(booking.guestId, hotelId);
+          const vars    = buildVars(booking);
+          const { templateId, savedReplyId, preview } = await resolveMessagePreview(hotelId, channel, vars);
+
+          if (channel === MessageChannel.WHATSAPP && templateId) {
+            await sendTemplateMessage(hotelId, booking.guestId, templateId, vars);
+          } else {
+            // Instagram or WhatsApp with no template — send plain text via channel router
+            const hotel = await prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } });
+            await sendChannelMessage({
+              channel,
+              toPhone:   booking.guest!.phone,
+              fromPhone: hotel?.phone ?? "",
+              hotelId,
+              guestId:   booking.guestId,
+              text:      preview,
+            });
+          }
+        } catch (sendErr) {
+          log.warn({ err: sendErr, bookingId }, "confirm-send failed (non-fatal)");
+        }
+      })();
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    log.error({ err }, "confirm booking failed");
+    return res.status(500).json({ error: "Failed to confirm booking" });
   }
 }
 
