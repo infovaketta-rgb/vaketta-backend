@@ -150,3 +150,23 @@ process.on("uncaughtException", (err) => {
   logger.fatal({ err }, "uncaught exception");
   shutdown("uncaughtException");
 });
+
+// Surface EventEmitter leak warnings in the structured log so they're visible
+// in Render's log drain instead of being swallowed by pino's default output.
+process.on("warning", (warning) => {
+  logger.warn({ name: warning.name, message: warning.message, stack: warning.stack }, "process warning");
+});
+
+// ── Memory usage logger ───────────────────────────────────────────────────────
+// Fires every 60 s. Watch for heapUsed trending upward across restarts to
+// confirm leaks are resolved. On Render Starter (~512 MB RAM) keep heapUsed
+// well below 350 MB; --max-old-space-size=400 triggers GC before the OS kills.
+setInterval(() => {
+  const m = process.memoryUsage();
+  logger.info({
+    heapUsed:  `${Math.round(m.heapUsed  / 1024 / 1024)}MB`,
+    heapTotal: `${Math.round(m.heapTotal / 1024 / 1024)}MB`,
+    rss:       `${Math.round(m.rss       / 1024 / 1024)}MB`,
+    external:  `${Math.round(m.external  / 1024 / 1024)}MB`,
+  }, "memory-usage");
+}, 60_000).unref();

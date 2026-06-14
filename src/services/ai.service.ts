@@ -98,7 +98,26 @@ async function checkAIRateLimit(hotelId: string, guestId: string): Promise<boole
 
 type CacheEntry = { prompt: string; builtAt: number };
 const promptCache = new Map<string, CacheEntry>();
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const CACHE_TTL_MS  = 10 * 60 * 1000; // 10 minutes
+const CACHE_MAX     = 50;              // hard cap — evict oldest entry when exceeded
+
+// Proactive eviction: sweep expired entries every 15 minutes.
+// Without this, stale entries from closed/inactive hotels sit in RAM forever.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of promptCache) {
+    if (now - entry.builtAt >= CACHE_TTL_MS) promptCache.delete(key);
+  }
+}, 15 * 60 * 1000).unref();
+
+function cachePrompt(hotelId: string, prompt: string): void {
+  if (promptCache.size >= CACHE_MAX) {
+    // Evict the oldest entry (Map iteration order = insertion order)
+    const oldestKey = promptCache.keys().next().value;
+    if (oldestKey !== undefined) promptCache.delete(oldestKey);
+  }
+  promptCache.set(hotelId, { prompt, builtAt: Date.now() });
+}
 
 async function getSystemPrompt(hotelId: string): Promise<string> {
   const cached = promptCache.get(hotelId);
@@ -146,7 +165,7 @@ async function getSystemPrompt(hotelId: string): Promise<string> {
 
   if (!hotel) {
     const fallback = "You are a hotel assistant. Answer guest questions helpfully and briefly.";
-    promptCache.set(hotelId, { prompt: fallback, builtAt: Date.now() });
+    cachePrompt(hotelId, fallback);
     return fallback;
   }
 
@@ -204,7 +223,7 @@ async function getSystemPrompt(hotelId: string): Promise<string> {
   }
 
   const prompt = lines.join("\n");
-  promptCache.set(hotelId, { prompt, builtAt: Date.now() });
+  cachePrompt(hotelId, prompt);
   return prompt;
 }
 

@@ -4,7 +4,7 @@ services:
     name: vaketta-backend
     runtime: node
     buildCommand: npm ci && npm run build
-    startCommand: npx prisma migrate deploy && node dist/server.js
+    startCommand: npx prisma migrate deploy && node --max-old-space-size=400 dist/server.js
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
@@ -18,7 +18,7 @@ services:
     name: vaketta-worker
     runtime: node
     buildCommand: npm ci && npm run build
-    startCommand: node dist/workers/whatsapp.worker.js
+    startCommand: node --max-old-space-size=400 dist/workers/whatsapp.worker.js
     envVars:
       - key: NODE_ENV
         value: production

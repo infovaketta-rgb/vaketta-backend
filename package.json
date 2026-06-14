@@ -8,7 +8,7 @@
     "dev": "nodemon src/server.ts",
     "worker": "ts-node src/workers/whatsapp.worker.ts",
     "build": "prisma generate && tsc",
-    "start": "node dist/server.js",
+    "start": "node --max-old-space-size=400 dist/server.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "killnode": "taskkill /IM node.exe /F",
