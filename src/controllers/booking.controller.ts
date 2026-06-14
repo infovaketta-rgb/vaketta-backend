@@ -406,25 +406,37 @@ export async function confirmBooking(req: Request, res: Response) {
     emitToHotel(hotelId, "booking:updated", { bookingId, status: BookingStatus.CONFIRMED });
 
     if (sendMessage) {
+      // Extract only primitives before the IIFE — the Prisma booking object (with
+      // joins) must not be captured in the closure or it stays pinned until the async
+      // chain resolves (which may never happen if Meta API hangs).
+      const guestId    = booking.guestId;
+      const guestPhone = booking.guest!.phone;
+      const sendVars   = buildVars(booking);
+
+      // Resolve the saved-reply body synchronously here (before the IIFE) so we
+      // don't carry a DB query and a Prisma result inside the closure either.
+      let savedReplyText: string | null = null;
+      if (savedReplyId) {
+        const savedReply = await prisma.savedReply.findFirst({ where: { id: savedReplyId, hotelId } });
+        if (!savedReply) return res.status(400).json({ error: "Saved reply not found" });
+        savedReplyText = interpolate(savedReply.body, sendVars);
+      }
+
       (async () => {
         try {
-          const channel = await getGuestChannel(booking.guestId, hotelId);
-          const vars    = buildVars(booking);
+          const channel = await getGuestChannel(guestId, hotelId);
 
           if (templateId) {
-            await sendTemplateMessage(hotelId, booking.guestId, templateId, variables ?? vars);
-          } else if (savedReplyId) {
-            const savedReply = await prisma.savedReply.findFirst({ where: { id: savedReplyId, hotelId } });
-            if (!savedReply) throw new Error("Saved reply not found");
-            const text  = interpolate(savedReply.body, vars);
+            await sendTemplateMessage(hotelId, guestId, templateId, variables ?? sendVars);
+          } else if (savedReplyText !== null) {
             const hotel = await prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } });
             await sendChannelMessage({
               channel,
-              toPhone:   booking.guest!.phone,
+              toPhone:   guestPhone,
               fromPhone: hotel?.phone ?? "",
               hotelId,
-              guestId:   booking.guestId,
-              text,
+              guestId,
+              text:      savedReplyText,
             });
           }
         } catch (sendErr) {
