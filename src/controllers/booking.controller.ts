@@ -233,6 +233,20 @@ function interpolateTemplateBody(bodyText: string, vars: Record<string, string>)
   );
 }
 
+// Extract unique variable names from a template body ({{varName}} or {{1}} patterns).
+function extractTemplateVars(components: any): string[] {
+  const bodyText = components?.body?.text ?? "";
+  const re = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
+  const seen = new Set<string>();
+  const names: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(bodyText)) !== null) {
+    const name = m[1]!;
+    if (!seen.has(name)) { seen.add(name); names.push(name); }
+  }
+  return names;
+}
+
 // ── GET /bookings/:id/confirm-options ─────────────────────────────────────────
 //
 // Returns available message options for the guest's channel:
@@ -269,11 +283,14 @@ export async function confirmBookingOptions(req: Request, res: Response) {
       const options = templates.map((t) => {
         const comps    = t.components as any;
         const bodyText = comps?.body?.text ?? t.name;
+        const varNames = extractTemplateVars(comps);
+        const variables = varNames.map((name) => ({ name, defaultValue: vars[name] ?? "" }));
         return {
           id:          t.id,
           name:        t.name,
           language:    t.language,
           bodyPreview: interpolateTemplateBody(bodyText, vars),
+          variables,
         };
       });
       const defaultId = botMsgs.defaultConfirmTemplateId || null;
@@ -358,12 +375,20 @@ export async function confirmBooking(req: Request, res: Response) {
   try {
     const hotelId     = (req as any).user.hotelId as string;
     const { bookingId } = req.params;
-    const { sendMessage, templateId, savedReplyId } =
-      req.body as { sendMessage?: boolean; templateId?: string; savedReplyId?: string };
+    const { sendMessage, templateId, savedReplyId, variables } =
+      req.body as { sendMessage?: boolean; templateId?: string; savedReplyId?: string; variables?: Record<string, string> };
 
     if (!bookingId) return res.status(400).json({ error: "bookingId required" });
     if (sendMessage && !templateId && !savedReplyId) {
       return res.status(400).json({ error: "templateId or savedReplyId required when sendMessage is true" });
+    }
+    if (sendMessage && templateId && variables) {
+      const empty = Object.entries(variables).filter(([, v]) => !v.trim());
+      if (empty.length > 0) {
+        return res.status(400).json({
+          error: `Template variable${empty.length > 1 ? "s" : ""} cannot be empty: ${empty.map(([k]) => k).join(", ")}`,
+        });
+      }
     }
 
     const booking = await prisma.booking.findFirst({
@@ -387,7 +412,7 @@ export async function confirmBooking(req: Request, res: Response) {
           const vars    = buildVars(booking);
 
           if (templateId) {
-            await sendTemplateMessage(hotelId, booking.guestId, templateId, vars);
+            await sendTemplateMessage(hotelId, booking.guestId, templateId, variables ?? vars);
           } else if (savedReplyId) {
             const savedReply = await prisma.savedReply.findFirst({ where: { id: savedReplyId, hotelId } });
             if (!savedReply) throw new Error("Saved reply not found");
