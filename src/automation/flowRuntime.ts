@@ -65,12 +65,11 @@ const MENU_FALLBACK = "Reply *MENU* to see our options.";
 
 const ACTION_TIMEOUT_MS = 10_000;
 function withActionTimeout<T>(promise: Promise<T>): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("Action timeout")), ACTION_TIMEOUT_MS)
-    ),
-  ]);
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("Action timeout")), ACTION_TIMEOUT_MS);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer!));
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
