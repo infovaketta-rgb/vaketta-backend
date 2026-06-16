@@ -213,21 +213,23 @@ export async function sendCarouselMessage(
       action: {
         cards: cards.slice(0, 10).map((c, i) => ({
           card_index: i,
+          // Card type must match button type — "quick_reply" for quick-reply buttons
+          type:       "quick_reply",
           header:     { type: "image", image: { link: c.imageUrl } },
           body:       { text: `*${c.title}*\n₹${c.price}/night\n${c.description}` },
           action: {
             buttons: [
               {
-                type: "reply",
-                reply: {
+                type: "quick_reply",
+                quick_reply: {
                   id:    c.buttonId,
-                  // Meta caps reply.title at 20 chars — slice defensively
+                  // Meta caps quick_reply.title at 20 chars — slice defensively
                   title: (c.buttonLabel ?? "Select Room").slice(0, 20),
                 },
               },
               {
-                type: "reply",
-                reply: {
+                type: "quick_reply",
+                quick_reply: {
                   // buttonId is "room_<roomId>"; derive "photos_<roomId>"
                   id:    `photos_${c.buttonId.replace(/^room_/, "")}`,
                   title: "View Photos",
