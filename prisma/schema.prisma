@@ -108,6 +108,7 @@ model Hotel {
   whatsappTemplates WhatsAppTemplate[]
   savedReplies      SavedReply[]
   pausedFlows       PausedFlow[]
+  confirmationSequences ConfirmationSequence[]
 }
 
 model HotelConfig {
@@ -707,4 +708,37 @@ model PausedFlow {
 
   @@index([guestId, hotelId])
   @@index([resumeAt])
+}
+
+// ── Confirmation Sequences ──────────────────────────────────────────────────────
+// An ordered list of messages (Templates and/or Saved Replies) a hotel sends when
+// staff confirm a booking — replaces the single fixed template/saved-reply selector
+// (which remains the legacy fallback). One sequence per (hotel, channel, scope).
+// roomTypeScope is a native TEXT[] of RoomType ids; empty = applies to all types.
+model ConfirmationSequence {
+  id            String   @id @default(uuid())
+  hotelId       String
+  channel       String   // "WHATSAPP" | "INSTAGRAM"
+  name          String
+  isDefault     Boolean  @default(false)
+  roomTypeScope String[] // empty array = applies to all room types
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  hotel Hotel @relation(fields: [hotelId], references: [id])
+  steps ConfirmationSequenceStep[]
+
+  @@index([hotelId, channel])
+}
+
+model ConfirmationSequenceStep {
+  id         String  @id @default(uuid())
+  sequenceId String
+  order      Int
+  refType    String  // "TEMPLATE" | "SAVED_REPLY"
+  refId      String  // FK to WhatsAppTemplate.id or SavedReply.id depending on refType
+
+  sequence ConfirmationSequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+
+  @@index([sequenceId, order])
 }

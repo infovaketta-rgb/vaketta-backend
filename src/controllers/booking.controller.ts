@@ -7,6 +7,13 @@ import { emitToHotel } from "../realtime/emit";
 import { sendTemplateMessage } from "../services/templates.service";
 import { sendChannelMessage } from "../services/channel.send.service";
 import { interpolate } from "../automation/interpolate";
+import { resolveConfirmationSequence } from "../services/confirmationSequence.service";
+import { confirmationSequenceQueue } from "../queue/confirmationSequence.queue";
+import { confirmationJobId, reconstructStatus } from "../services/confirmationStatus";
+import type {
+  ConfirmationStepJob,
+  ConfirmationSequenceJobData,
+} from "../workers/confirmationSequence.types";
 
 const log = logger.child({ service: "booking" });
 
@@ -449,6 +456,231 @@ export async function confirmBooking(req: Request, res: Response) {
   } catch (err) {
     log.error({ err }, "confirm booking failed");
     return res.status(500).json({ error: "Failed to confirm booking" });
+  }
+}
+
+// ── GET /bookings/:id/confirmation-preview ────────────────────────────────────
+//
+// Resolves the configured Confirmation Sequence for this booking's channel + room
+// type. If one exists, returns its hydrated steps as a checklist. If none is
+// configured, returns the LEGACY single message (the hotel's default confirm
+// template/saved-reply, else the first available) as a one-item checklist so the
+// frontend renders both paths through the same modal.
+//
+// Response: { channel, source: "sequence" | "legacy", sequenceId?, steps: [
+//   { stepId, refType, refId, title, body }
+// ] }
+
+export async function confirmationPreview(req: Request, res: Response) {
+  try {
+    const hotelId     = (req as any).user.hotelId as string;
+    const { bookingId } = req.params;
+    if (!bookingId) return res.status(400).json({ error: "bookingId required" });
+
+    const booking = await prisma.booking.findFirst({
+      where:   { id: bookingId, hotelId },
+      include: { guest: true, roomType: true, rooms: { include: { roomType: { select: { name: true } } } } },
+    });
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    const channel    = await getGuestChannel(booking.guestId, hotelId);
+    const roomTypeId = booking.roomTypeId ?? null;
+    const vars       = buildVars(booking);
+
+    // 1. Configured sequence?
+    const sequence = await resolveConfirmationSequence(hotelId, channel, roomTypeId);
+    if (sequence) {
+      const steps = sequence.steps.map((s) => ({
+        stepId:  s.id,
+        refType: s.refType,
+        refId:   s.refId,
+        title:   s.title ?? s.refId,
+        body:    s.body ? interpolateTemplateBody(s.body, vars) : "",
+      }));
+      return res.json({ channel, source: "sequence", sequenceId: sequence.id, steps });
+    }
+
+    // 2. Legacy fallback — single message rendered as a one-item checklist.
+    const hotelCfg = await prisma.hotelConfig.findUnique({
+      where:  { hotelId },
+      select: { botMessages: true },
+    });
+    const botMsgs = (hotelCfg?.botMessages ?? {}) as Record<string, string>;
+
+    if (channel === MessageChannel.WHATSAPP) {
+      const defaultId = botMsgs.defaultConfirmTemplateId || null;
+      const template =
+        (defaultId
+          ? await prisma.whatsAppTemplate.findFirst({ where: { id: defaultId, hotelId, status: "APPROVED" } })
+          : null) ??
+        (await prisma.whatsAppTemplate.findFirst({
+          where: { hotelId, status: "APPROVED" }, orderBy: { name: "asc" },
+        }));
+      if (!template) return res.json({ channel, source: "legacy", steps: [] });
+      const comps    = template.components as any;
+      const bodyText = comps?.body?.text ?? template.name;
+      return res.json({
+        channel, source: "legacy",
+        steps: [{
+          stepId:  template.id,
+          refType: "TEMPLATE",
+          refId:   template.id,
+          title:   template.name,
+          body:    interpolateTemplateBody(bodyText, vars),
+        }],
+      });
+    }
+
+    // Instagram legacy — saved reply.
+    const defaultId = botMsgs.defaultConfirmSavedReplyId || null;
+    const reply =
+      (defaultId
+        ? await prisma.savedReply.findFirst({ where: { id: defaultId, hotelId } })
+        : null) ??
+      (await prisma.savedReply.findFirst({ where: { hotelId }, orderBy: { name: "asc" } }));
+    if (!reply) return res.json({ channel, source: "legacy", steps: [] });
+    return res.json({
+      channel, source: "legacy",
+      steps: [{
+        stepId:  reply.id,
+        refType: "SAVED_REPLY",
+        refId:   reply.id,
+        title:   reply.name,
+        body:    interpolate(reply.body, vars),
+      }],
+    });
+  } catch (err) {
+    log.error({ err }, "confirmation-preview failed");
+    return res.status(500).json({ error: "Failed to load confirmation preview" });
+  }
+}
+
+// ── POST /bookings/:id/send-confirmation ──────────────────────────────────────
+//
+// Body: { steps: [{ stepId, refType, refId, skip }] }  (staff checklist, in order)
+// Confirms the booking, then enqueues ONE confirmation-sequence job that sends the
+// non-skipped steps sequentially. Returns a jobId immediately; per-step results are
+// surfaced over Socket.IO ("confirmation:step" / "confirmation:done").
+
+export async function sendConfirmation(req: Request, res: Response) {
+  try {
+    const hotelId     = (req as any).user.hotelId as string;
+    const { bookingId } = req.params;
+    const { steps: rawSteps } = req.body as {
+      steps?: { stepId?: string; refType?: string; refId?: string; skip?: boolean }[];
+    };
+
+    if (!bookingId) return res.status(400).json({ error: "bookingId required" });
+    if (!Array.isArray(rawSteps) || rawSteps.length === 0) {
+      return res.status(400).json({ error: "steps must be a non-empty array" });
+    }
+
+    const steps: ConfirmationStepJob[] = [];
+    for (const s of rawSteps) {
+      if (s?.refType !== "TEMPLATE" && s?.refType !== "SAVED_REPLY") {
+        return res.status(400).json({ error: `invalid step refType: ${s?.refType}` });
+      }
+      if (!s?.refId) return res.status(400).json({ error: "every step needs a refId" });
+      steps.push({
+        stepId:  String(s.stepId ?? s.refId),
+        refType: s.refType,
+        refId:   String(s.refId),
+        skip:    Boolean(s.skip),
+      });
+    }
+
+    const booking = await prisma.booking.findFirst({
+      where:   { id: bookingId, hotelId },
+      include: { guest: true, roomType: true, rooms: { include: { roomType: { select: { name: true } } } } },
+    });
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+    if (!booking.guest?.phone) return res.status(400).json({ error: "Guest has no contact number" });
+
+    // ── Double-submit guard ──────────────────────────────────────────────────
+    // Deterministic job id per booking. If a send is already waiting/active/delayed
+    // for this booking, reject rather than enqueue a second full sequence.
+    const jobId = confirmationJobId(bookingId);
+    const existing = await confirmationSequenceQueue.getJob(jobId);
+    if (existing) {
+      const state = await existing.getState();
+      if (state === "waiting" || state === "active" || state === "delayed" || state === "waiting-children") {
+        return res.status(409).json({
+          error: "A confirmation is already being sent for this booking.",
+          jobId,
+        });
+      }
+      // A finished job (completed/failed) still occupies the id — remove it so the
+      // staff can deliberately re-send (e.g. after a failed step).
+      await existing.remove().catch(() => {});
+    }
+
+    const channel = await getGuestChannel(booking.guestId, hotelId);
+    const vars    = buildVars(booking);
+    const hotel   = await prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } });
+
+    // Confirm the booking (idempotent) — mirrors the legacy /confirm behaviour.
+    await prisma.booking.updateMany({
+      where: { id: bookingId, hotelId },
+      data:  { status: BookingStatus.CONFIRMED },
+    });
+    emitToHotel(hotelId, "booking:updated", { bookingId, status: BookingStatus.CONFIRMED });
+
+    const jobData: ConfirmationSequenceJobData = {
+      hotelId,
+      bookingId,
+      guestId:    booking.guestId,
+      guestPhone: booking.guest.phone,
+      fromPhone:  hotel?.phone ?? "",
+      channel,
+      vars,
+      steps,
+    };
+
+    // jobId is deterministic so a racing duplicate add (same id) is a natural no-op.
+    const job = await confirmationSequenceQueue.add("send", jobData, { jobId });
+
+    return res.status(202).json({ jobId: job.id, stepCount: steps.filter((s) => !s.skip).length });
+  } catch (err) {
+    log.error({ err }, "send-confirmation failed");
+    return res.status(500).json({ error: "Failed to start confirmation send" });
+  }
+}
+
+// ── GET /bookings/:id/confirmation-status?jobId= ──────────────────────────────
+//
+// Returns the current per-step status of an in-flight or finished confirmation send
+// by reading the BullMQ job's state + persisted progress + return value. The modal
+// calls this on mount and on socket reconnect to recover any missed live events.
+// Reads only the deterministic per-booking job (the optional jobId must match it).
+
+export async function confirmationStatus(req: Request, res: Response) {
+  try {
+    const hotelId     = (req as any).user.hotelId as string;
+    const { bookingId } = req.params;
+    if (!bookingId) return res.status(400).json({ error: "bookingId required" });
+
+    // Tenant check — booking must belong to this hotel.
+    const booking = await prisma.booking.findFirst({ where: { id: bookingId, hotelId }, select: { id: true } });
+    if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+    const jobId = confirmationJobId(bookingId);
+    const job   = await confirmationSequenceQueue.getJob(jobId);
+
+    if (!job) {
+      return res.json(reconstructStatus(jobId, null)); // state: "not_found"
+    }
+
+    const state = await job.getState();
+    const snapshot = {
+      state:       state ?? null,
+      data:        (job.data ?? null) as any,
+      progress:    (job.progress ?? null) as any,
+      returnvalue: (job.returnvalue ?? null) as any,
+    };
+    return res.json(reconstructStatus(jobId, snapshot));
+  } catch (err) {
+    log.error({ err }, "confirmation-status failed");
+    return res.status(500).json({ error: "Failed to load confirmation status" });
   }
 }
 

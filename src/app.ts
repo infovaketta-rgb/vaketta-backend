@@ -21,6 +21,7 @@ import { publicRouter, adminLeadRouter } from "./routes/lead.routes";
 import pushRoutes from "./routes/push.routes";
 import templateRoutes from "./routes/templates.routes";
 import savedReplyRoutes from "./routes/savedReply.routes";
+import confirmationSequenceRoutes from "./routes/confirmationSequence.routes";
 import { logger } from "./utils/logger";
 import prisma from "./db/connect";
 import { redis } from "./queue/redis";
@@ -167,6 +168,7 @@ app.use("/dashboard",      auth, dashboardRoutes);
 app.use("/hotel-settings",  auth, settingsRoutes);
 app.use("/hotel-templates", auth, templateRoutes);
 app.use("/saved-replies",  auth, savedReplyRoutes);
+app.use("/confirmation-sequences", auth, confirmationSequenceRoutes);
 app.use("/api/instagram",  auth, instagramConnectRoutes);
 app.use("/guests",         auth, guestRoutes);
 

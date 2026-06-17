@@ -1,6 +1,6 @@
 // src/routes/booking.routes.ts
 import { Router } from "express";
-import { createBooking,getBookings,updateBookingStatus,getBookingSummary,editBooking,getBookingById,exportBookingsCsv,bulkUpdateBookingStatus,confirmBookingOptions,confirmBookingPreview,confirmBooking } from "../controllers/booking.controller";
+import { createBooking,getBookings,updateBookingStatus,getBookingSummary,editBooking,getBookingById,exportBookingsCsv,bulkUpdateBookingStatus,confirmBookingOptions,confirmBookingPreview,confirmBooking,confirmationPreview,sendConfirmation,confirmationStatus } from "../controllers/booking.controller";
 import { auth } from "../middleware/auth.middleware";
 import { requireRole } from "../middleware/role.middleware";
 import { UserRole } from "@prisma/client";
@@ -14,6 +14,9 @@ router.get("/", auth, getBookings);
 router.get("/summary", auth, getBookingSummary);
 router.get("/:bookingId/confirm-options",  auth, requireRole(UserRole.ADMIN, UserRole.MANAGER), confirmBookingOptions);
 router.get("/:bookingId/confirm-preview", auth, requireRole(UserRole.ADMIN, UserRole.MANAGER), confirmBookingPreview);
+router.get("/:bookingId/confirmation-preview", auth, requireRole(UserRole.ADMIN, UserRole.MANAGER), confirmationPreview);
+router.get("/:bookingId/confirmation-status",  auth, requireRole(UserRole.ADMIN, UserRole.MANAGER), confirmationStatus);
+router.post("/:bookingId/send-confirmation",   auth, requireRole(UserRole.ADMIN, UserRole.MANAGER), sendConfirmation);
 router.post("/:bookingId/confirm",         auth, requireRole(UserRole.ADMIN, UserRole.MANAGER), confirmBooking);
 router.patch("/:bookingId/status", auth,requireRole(UserRole.ADMIN, UserRole.MANAGER), updateBookingStatus);
 router.patch("/:bookingId", auth, requireRole(UserRole.ADMIN, UserRole.MANAGER), editBooking);
