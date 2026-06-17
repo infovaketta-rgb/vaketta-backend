@@ -137,6 +137,27 @@ function toDateStr(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
+/** Max stay the bot will accept (nights). Keeps loops and availability arrays bounded. */
+const MAX_BOOKING_NIGHTS = 60;
+/** How far in the future check-in can be (ms). 18 months ≈ 548 days. */
+const MAX_CHECKIN_ADVANCE_MS = 548 * 86_400_000;
+
+/**
+ * Validates a parsed check-in/check-out pair before any DB or availability call.
+ * Returns null when valid, or a guest-facing error string when not.
+ */
+function validateBookingDates(checkInDate: Date, checkOutDate: Date): string | null {
+  const nights = Math.ceil((checkOutDate.getTime() - checkInDate.getTime()) / 86_400_000);
+  if (nights > MAX_BOOKING_NIGHTS) {
+    return `⚠️ That booking duration looks unusual (${nights} nights) — please double check your dates, or contact us directly.`;
+  }
+  const now = Date.now();
+  if (checkInDate.getTime() > now + MAX_CHECKIN_ADVANCE_MS) {
+    return "⚠️ That check-in date is more than 18 months away — please double check your dates, or contact us directly.";
+  }
+  return null;
+}
+
 /** Midnight UTC today */
 function todayUTC(): Date {
   const d = new Date();
@@ -1177,6 +1198,16 @@ export async function executeFlowStep(
           const checkInParsed  = parseFlexDate(checkIn);
           const checkOutParsed = parseFlexDate(checkOut);
           if (checkInParsed && checkOutParsed && checkOutParsed > checkInParsed) {
+            const dateErr = validateBookingDates(checkInParsed, checkOutParsed);
+            if (dateErr) {
+              flowData.flowVars = { ...flowData.flowVars, availabilityResult: "unavailable", availabilityCount: "0" };
+              const handle   = "unavailable";
+              const fallback = nextNodeId(currentNodeId, adjacency);
+              const next     = nextNodeId(currentNodeId, adjacency, handle) ?? fallback;
+              if (!next) { await resetSession(guestId, hotelId); return dateErr; }
+              await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+              return advance(next);
+            }
             try {
               const result = await withActionTimeout(checkRoomAvailability(
                 hotelId, roomTypeId,
@@ -1245,6 +1276,15 @@ export async function executeFlowStep(
             const checkOut = d.checkOutVar ? vars[d.checkOutVar] : null;
 
             if (checkIn && checkOut) {
+              const ciParsed = parseFlexDate(checkIn);
+              const coParsed = parseFlexDate(checkOut);
+              if (ciParsed && coParsed && coParsed > ciParsed) {
+                const dateErr = validateBookingDates(ciParsed, coParsed);
+                if (dateErr) {
+                  await resetSession(guestId, hotelId);
+                  return dateErr;
+                }
+              }
               // Single bulk query instead of N×3 per-room queries
               const calendar = await getCalendarData(hotelId, checkIn, checkOut);
               displayRooms = allRooms
@@ -1542,6 +1582,10 @@ export async function executeFlowStep(
             if (!checkInDate || !checkOutDate || checkOutDate <= checkInDate) {
               return finishMulti("⚠️ Booking failed — invalid or reversed dates. Please contact us directly.");
             }
+            {
+              const dateErr = validateBookingDates(checkInDate, checkOutDate);
+              if (dateErr) return finishMulti(dateErr);
+            }
 
             // 4. Booking-enabled gate (same message as single-room).
             const cfg = await prisma.hotelConfig.findUnique({
@@ -1662,6 +1706,16 @@ export async function executeFlowStep(
             if (!next) { await resetSession(guestId, hotelId); return errMsg; }
             await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
             return advance(next);
+          }
+
+          {
+            const dateErr = validateBookingDates(checkInDate!, checkOutDate!);
+            if (dateErr) {
+              const next = nextNodeId(currentNodeId, adjacency);
+              if (!next) { await resetSession(guestId, hotelId); return dateErr; }
+              await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+              return advance(next);
+            }
           }
 
           const config = await prisma.hotelConfig.findUnique({

@@ -17,11 +17,15 @@ function addDays(d: Date, n: number): Date {
   return new Date(d.getTime() + n * 86_400_000);
 }
 
-/** Expand [start, end) into an array of UTC-midnight Dates (nights). */
+// Hard cap: no function in this service can process more than 366 nights.
+// Prevents unbounded heap growth if a caller passes an absurd date range.
+const MAX_NIGHTS = 366;
+
+/** Expand [start, end) into an array of UTC-midnight Dates (nights), capped at MAX_NIGHTS. */
 function nightRange(start: Date, end: Date): Date[] {
   const nights: Date[] = [];
   let cur = start;
-  while (cur < end) {
+  while (cur < end && nights.length < MAX_NIGHTS) {
     nights.push(cur);
     cur = addDays(cur, 1);
   }
