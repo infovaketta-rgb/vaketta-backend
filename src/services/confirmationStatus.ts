@@ -7,8 +7,9 @@ import type { StepProgress, StepRunStatus } from "../workers/confirmationSequenc
 // Deterministic BullMQ job id for a booking's confirmation send. Using the bookingId
 // makes "is a send already in flight?" answerable, and lets a duplicate enqueue be
 // detected (BullMQ rejects/ignores a second add with the same jobId while it exists).
+// Separator is "-" not ":" — BullMQ disallows ":" in custom job ids.
 export function confirmationJobId(bookingId: string): string {
-  return `confirm:${bookingId}`;
+  return `confirm-${bookingId}`;
 }
 
 export type OverallState =

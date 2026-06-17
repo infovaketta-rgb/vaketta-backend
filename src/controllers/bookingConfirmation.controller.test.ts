@@ -28,7 +28,7 @@ vi.mock("../services/channel.send.service", () => ({ sendChannelMessage: vi.fn()
 vi.mock("../services/confirmationSequence.service", () => ({ resolveConfirmationSequence: vi.fn() }));
 vi.mock("../queue/confirmationSequence.queue", () => ({
   confirmationSequenceQueue: {
-    add:    vi.fn(async () => ({ id: "confirm:b1" })),
+    add:    vi.fn(async () => ({ id: "confirm-b1" })),
     getJob: vi.fn(async () => null),  // default: no existing job
   },
 }));
@@ -71,7 +71,7 @@ beforeEach(() => {
   p.hotelConfig.findUnique.mockResolvedValue({ botMessages: {} });
   p.booking.updateMany.mockResolvedValue({ count: 1 });
   queueGetJob.mockResolvedValue(null);                       // no existing job by default
-  queueAdd.mockResolvedValue({ id: "confirm:b1" });
+  queueAdd.mockResolvedValue({ id: "confirm-b1" });
 });
 
 // ── confirmation-preview ─────────────────────────────────────────────────────────
@@ -182,7 +182,7 @@ describe("sendConfirmation", () => {
     await sendConfirmation(req({ params: { bookingId: "b1" }, body: { steps } }) as any, res);
 
     expect(res.statusCode).toBe(202);
-    expect(res.body).toMatchObject({ jobId: "confirm:b1", stepCount: 1 }); // 1 non-skipped
+    expect(res.body).toMatchObject({ jobId: "confirm-b1", stepCount: 1 }); // 1 non-skipped
 
     // Booking confirmed + event emitted.
     expect(p.booking.updateMany).toHaveBeenCalledWith({
@@ -198,7 +198,7 @@ describe("sendConfirmation", () => {
       { stepId: "st0", refType: "TEMPLATE",    refId: "tmpl1", skip: false },
       { stepId: "st1", refType: "SAVED_REPLY", refId: "sr1",   skip: true  },
     ]);
-    expect(opts).toEqual({ jobId: "confirm:b1" });
+    expect(opts).toEqual({ jobId: "confirm-b1" });
   });
 
   it("400s when the guest has no phone number", async () => {
