@@ -86,7 +86,9 @@ export async function runConfirmationSequence(
 
     try {
       if (step.refType === "TEMPLATE") {
-        await withStepTimeout(deps.sendTemplate(hotelId, guestId, step.refId, vars));
+        // Booking-level auto-fill is the base; per-step staff-filled values win.
+        const sendVars = { ...vars, ...(step.variables ?? {}) };
+        await withStepTimeout(deps.sendTemplate(hotelId, guestId, step.refId, sendVars));
       } else {
         const body = await deps.loadSavedReplyBody(hotelId, step.refId);
         if (body === null) throw new Error("Saved reply not found");

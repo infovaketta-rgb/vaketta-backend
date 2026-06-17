@@ -240,18 +240,29 @@ function interpolateTemplateBody(bodyText: string, vars: Record<string, string>)
   );
 }
 
-// Extract unique variable names from a template body ({{varName}} or {{1}} patterns).
-function extractTemplateVars(components: any): string[] {
-  const bodyText = components?.body?.text ?? "";
+// Extract unique variable names from template body text ({{varName}} or {{1}}).
+function extractVarsFromText(bodyText: string): string[] {
   const re = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
   const seen = new Set<string>();
   const names: string[] = [];
   let m: RegExpExecArray | null;
-  while ((m = re.exec(bodyText)) !== null) {
+  while ((m = re.exec(bodyText ?? "")) !== null) {
     const name = m[1]!;
     if (!seen.has(name)) { seen.add(name); names.push(name); }
   }
   return names;
+}
+
+// Extract unique variable names from a template's components (body text).
+function extractTemplateVars(components: any): string[] {
+  return extractVarsFromText(components?.body?.text ?? "");
+}
+
+// Build the {name, defaultValue} descriptor list staff see for a template step.
+// defaultValue is auto-derived from the booking (buildVars) where possible; "" means
+// the value must be supplied by staff before sending. Mirrors the legacy confirm flow.
+function buildStepVariables(bodyText: string, vars: Record<string, string>): { name: string; defaultValue: string }[] {
+  return extractVarsFromText(bodyText).map((name) => ({ name, defaultValue: vars[name] ?? "" }));
 }
 
 // ── GET /bookings/:id/confirm-options ─────────────────────────────────────────
@@ -490,13 +501,20 @@ export async function confirmationPreview(req: Request, res: Response) {
     // 1. Configured sequence?
     const sequence = await resolveConfirmationSequence(hotelId, channel, roomTypeId);
     if (sequence) {
-      const steps = sequence.steps.map((s) => ({
-        stepId:  s.id,
-        refType: s.refType,
-        refId:   s.refId,
-        title:   s.title ?? s.refId,
-        body:    s.body ? interpolateTemplateBody(s.body, vars) : "",
-      }));
+      const steps = sequence.steps.map((s) => {
+        const rawBody = s.body ?? "";
+        // Only TEMPLATE steps carry fillable variables (Meta named/positional params).
+        // Saved replies are interpolated server-side at send time, so no staff input.
+        const variables = s.refType === "TEMPLATE" ? buildStepVariables(rawBody, vars) : [];
+        return {
+          stepId:  s.id,
+          refType: s.refType,
+          refId:   s.refId,
+          title:   s.title ?? s.refId,
+          body:    rawBody ? interpolateTemplateBody(rawBody, vars) : "",
+          variables,
+        };
+      });
       return res.json({ channel, source: "sequence", sequenceId: sequence.id, steps });
     }
 
@@ -522,11 +540,12 @@ export async function confirmationPreview(req: Request, res: Response) {
       return res.json({
         channel, source: "legacy",
         steps: [{
-          stepId:  template.id,
-          refType: "TEMPLATE",
-          refId:   template.id,
-          title:   template.name,
-          body:    interpolateTemplateBody(bodyText, vars),
+          stepId:    template.id,
+          refType:   "TEMPLATE",
+          refId:     template.id,
+          title:     template.name,
+          body:      interpolateTemplateBody(bodyText, vars),
+          variables: buildStepVariables(bodyText, vars),
         }],
       });
     }
@@ -567,7 +586,7 @@ export async function sendConfirmation(req: Request, res: Response) {
     const hotelId     = (req as any).user.hotelId as string;
     const { bookingId } = req.params;
     const { steps: rawSteps } = req.body as {
-      steps?: { stepId?: string; refType?: string; refId?: string; skip?: boolean }[];
+      steps?: { stepId?: string; refType?: string; refId?: string; skip?: boolean; variables?: Record<string, unknown> }[];
     };
 
     if (!bookingId) return res.status(400).json({ error: "bookingId required" });
@@ -581,11 +600,30 @@ export async function sendConfirmation(req: Request, res: Response) {
         return res.status(400).json({ error: `invalid step refType: ${s?.refType}` });
       }
       if (!s?.refId) return res.status(400).json({ error: "every step needs a refId" });
+
+      const skip = Boolean(s.skip);
+      const variables = (s.variables && typeof s.variables === "object")
+        ? Object.fromEntries(Object.entries(s.variables).map(([k, v]) => [k, String(v ?? "")]))
+        : undefined;
+
+      // Block a TEMPLATE step that would send to Meta with an empty required value
+      // (Meta rejects with #131008). Mirrors the legacy confirm flow's check. Skipped
+      // steps aren't sent, so they're exempt.
+      if (!skip && s.refType === "TEMPLATE" && variables) {
+        const empty = Object.entries(variables).filter(([, v]) => !v.trim());
+        if (empty.length > 0) {
+          return res.status(400).json({
+            error: `Template variable${empty.length > 1 ? "s" : ""} cannot be empty: ${empty.map(([k]) => k).join(", ")}`,
+          });
+        }
+      }
+
       steps.push({
         stepId:  String(s.stepId ?? s.refId),
         refType: s.refType,
         refId:   String(s.refId),
-        skip:    Boolean(s.skip),
+        skip,
+        ...(variables ? { variables } : {}),
       });
     }
 

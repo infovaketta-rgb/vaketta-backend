@@ -63,6 +63,25 @@ describe("runConfirmationSequence", () => {
     expect(done.payload).toMatchObject({ sent: 2, failed: 0, skipped: 0 });
   });
 
+  it("merges per-step template variables over the booking-level vars (staff value wins)", async () => {
+    await runConfirmationSequence(job([
+      // booking vars give guestName=Sam; step overrides it + adds a non-derivable var.
+      { stepId: "s0", refType: "TEMPLATE", refId: "tmpl1", skip: false,
+        variables: { guestName: "Samuel", checkInTime: "2 PM" } },
+    ]), deps);
+
+    expect(deps.sendTemplate).toHaveBeenCalledWith("h1", "g1", "tmpl1", {
+      guestName: "Samuel", checkInTime: "2 PM",
+    });
+  });
+
+  it("a template step with no variables sends just the booking vars (unchanged behaviour)", async () => {
+    await runConfirmationSequence(job([
+      { stepId: "s0", refType: "TEMPLATE", refId: "tmpl1", skip: false },
+    ]), deps);
+    expect(deps.sendTemplate).toHaveBeenCalledWith("h1", "g1", "tmpl1", { guestName: "Sam" });
+  });
+
   it("persists a per-step progress snapshot at each transition (for reconnect recovery)", async () => {
     await runConfirmationSequence(job([
       { stepId: "s0", refType: "TEMPLATE",    refId: "tmpl1", skip: false },

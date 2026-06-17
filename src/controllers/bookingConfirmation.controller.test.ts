@@ -105,6 +105,39 @@ describe("confirmationPreview", () => {
     expect(res.body.steps[0]).toMatchObject({ stepId: "st0", refType: "TEMPLATE", title: "Confirmed", body: "Hi Sam" });
   });
 
+  it("exposes template variables with auto-derived defaults; saved-reply steps carry none", async () => {
+    p.booking.findFirst.mockResolvedValue(bookingRow);
+    resolveSeq.mockResolvedValue({
+      id: "seq1", channel: "WHATSAPP", name: "Std", isDefault: true, roomTypeScope: [],
+      steps: [
+        // guestName auto-derives (Sam); checkInTime is NOT in buildVars → empty default.
+        { id: "st0", order: 0, refType: "TEMPLATE",    refId: "tmpl1", title: "Confirmed",
+          body: "Hi {{guestName}}, check-in {{checkInTime}}" },
+        { id: "st1", order: 1, refType: "SAVED_REPLY", refId: "sr1", title: "Directions", body: "See you" },
+      ],
+    });
+    const res = mockRes();
+    await confirmationPreview(req({ params: { bookingId: "b1" } }) as any, res);
+
+    expect(res.body.steps[0].variables).toEqual([
+      { name: "guestName",   defaultValue: "Sam" },
+      { name: "checkInTime", defaultValue: "" },
+    ]);
+    // Saved-reply step has no fillable variables.
+    expect(res.body.steps[1].variables).toEqual([]);
+  });
+
+  it("a template with no variables yields an empty variables array (no spurious form)", async () => {
+    p.booking.findFirst.mockResolvedValue(bookingRow);
+    resolveSeq.mockResolvedValue({
+      id: "seq1", channel: "WHATSAPP", name: "Std", isDefault: true, roomTypeScope: [],
+      steps: [{ id: "st0", order: 0, refType: "TEMPLATE", refId: "tmpl1", title: "Static", body: "Welcome aboard!" }],
+    });
+    const res = mockRes();
+    await confirmationPreview(req({ params: { bookingId: "b1" } }) as any, res);
+    expect(res.body.steps[0].variables).toEqual([]);
+  });
+
   it("falls back to the legacy default template as a one-item checklist (no sequence)", async () => {
     p.booking.findFirst.mockResolvedValue(bookingRow);
     resolveSeq.mockResolvedValue(null);
@@ -199,6 +232,57 @@ describe("sendConfirmation", () => {
       { stepId: "st1", refType: "SAVED_REPLY", refId: "sr1",   skip: true  },
     ]);
     expect(opts).toEqual({ jobId: "confirm-b1" });
+  });
+
+  it("passes per-step template variables through to the job", async () => {
+    p.booking.findFirst.mockResolvedValue(bookingRow);
+    const res = mockRes();
+    await sendConfirmation(req({
+      params: { bookingId: "b1" },
+      body: { steps: [
+        { stepId: "st0", refType: "TEMPLATE", refId: "tmpl1", skip: false,
+          variables: { guestName: "Samuel", checkInTime: "2 PM" } },
+      ] },
+    }) as any, res);
+
+    expect(res.statusCode).toBe(202);
+    const [, jobData] = queueAdd.mock.calls[0]!;
+    expect(jobData.steps[0]).toEqual({
+      stepId: "st0", refType: "TEMPLATE", refId: "tmpl1", skip: false,
+      variables: { guestName: "Samuel", checkInTime: "2 PM" },
+    });
+  });
+
+  it("400s when a non-skipped TEMPLATE step has an empty required variable (blocks #131008)", async () => {
+    p.booking.findFirst.mockResolvedValue(bookingRow);
+    const res = mockRes();
+    await sendConfirmation(req({
+      params: { bookingId: "b1" },
+      body: { steps: [
+        { stepId: "st0", refType: "TEMPLATE", refId: "tmpl1", skip: false,
+          variables: { guestName: "Sam", checkInTime: "  " } }, // blank
+      ] },
+    }) as any, res);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body.error).toMatch(/cannot be empty: checkInTime/i);
+    expect(queueAdd).not.toHaveBeenCalled();
+  });
+
+  it("does NOT block an empty variable on a SKIPPED template step (not sent)", async () => {
+    p.booking.findFirst.mockResolvedValue(bookingRow);
+    const res = mockRes();
+    await sendConfirmation(req({
+      params: { bookingId: "b1" },
+      body: { steps: [
+        { stepId: "st0", refType: "TEMPLATE",    refId: "tmpl1", skip: true,
+          variables: { checkInTime: "" } },              // skipped → exempt
+        { stepId: "st1", refType: "SAVED_REPLY", refId: "sr1", skip: false },
+      ] },
+    }) as any, res);
+
+    expect(res.statusCode).toBe(202);
+    expect(queueAdd).toHaveBeenCalled();
   });
 
   it("400s when the guest has no phone number", async () => {

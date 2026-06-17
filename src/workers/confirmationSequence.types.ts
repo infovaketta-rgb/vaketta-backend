@@ -9,6 +9,9 @@ export interface ConfirmationStepJob {
   refType: "TEMPLATE" | "SAVED_REPLY";
   refId:   string;
   skip:    boolean;
+  // Staff-filled / auto-derived template variable values. Only meaningful for
+  // TEMPLATE steps; merged over the booking-level vars at send time.
+  variables?: Record<string, string>;
 }
 
 export interface ConfirmationSequenceJobData {
