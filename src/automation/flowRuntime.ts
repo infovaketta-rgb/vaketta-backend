@@ -47,6 +47,7 @@ import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
 import { getHotelConfigCached } from "../services/settings.service";
+import { getWatchedFlowVarNames, pickWatchedFlowVars } from "../services/templateVariableMapping.service";
 import { extractDateWithAI, classifyBookingIntent, interpretAllocationModification, extractChildrenAgesAI } from "../services/ai.service";
 import { handleAdvancedRoomAllocation, type AllocationRoomInput, type SendRoomCarouselFn } from "./nodes/advancedRoomAllocation";
 import { trySendPlanList } from "./nodes/planList";
@@ -1570,6 +1571,17 @@ export async function executeFlowStep(
             const grandTotal = allocRooms.reduce((s: number, r: any) => s + (Number(r.totalPrice) || 0), 0);
             const firstRoom  = allocRooms[0];
             const lockKey    = `${hotelId}:${new Date().getFullYear()}`;
+
+            // Snapshot watched flow-builder vars (same as single-room path). Read
+            // outside the advisory lock; never blocks/aborts the booking.
+            let flowVarsSnapshot: Record<string, string> | null = null;
+            try {
+              const watched = await getWatchedFlowVarNames(hotelId);
+              flowVarsSnapshot = pickWatchedFlowVars(flowData.flowVars, watched);
+            } catch (snapErr) {
+              log.warn({ snapErr, hotelId, guestId }, "create_booking(multi): watched flowVars snapshot failed (non-fatal)");
+            }
+
             let booking: Awaited<ReturnType<typeof prisma.booking.create>>;
             try {
               booking = await withActionTimeout(prisma.$transaction(async (tx) => {
@@ -1587,6 +1599,7 @@ export async function executeFlowStep(
                     totalPrice:   grandTotal,
                     advancePaid:  0,
                     referenceNumber,
+                    ...(flowVarsSnapshot ? { flowVars: flowVarsSnapshot } : {}),
                     rooms: {
                       create: allocRooms.map((r: any) => ({
                         roomTypeId:   r.roomTypeId,
@@ -1696,6 +1709,17 @@ export async function executeFlowStep(
           const advancePaid   = advancePaidRaw ? Math.round(parseFloat(advancePaidRaw)) : 0;
           const lockKey = `${hotelId}:${new Date().getFullYear()}`;
 
+          // Snapshot watched flow-builder vars so FLOW_VAR-mapped template variables
+          // can resolve after the session is wiped. Read OUTSIDE the advisory lock;
+          // never blocks/aborts a booking (failure → no snapshot). Purely additive.
+          let flowVarsSnapshot: Record<string, string> | null = null;
+          try {
+            const watched = await getWatchedFlowVarNames(hotelId);
+            flowVarsSnapshot = pickWatchedFlowVars(flowData.flowVars, watched);
+          } catch (snapErr) {
+            log.warn({ snapErr, hotelId, guestId }, "create_booking: watched flowVars snapshot failed (non-fatal)");
+          }
+
           let booking: Awaited<ReturnType<typeof prisma.booking.create>>;
           try {
             booking = await withActionTimeout(prisma.$transaction(async (tx) => {
@@ -1707,6 +1731,7 @@ export async function executeFlowStep(
                   checkIn: checkInDate, checkOut: checkOutDate,
                   status: BookingStatus.PENDING, pricePerNight, totalPrice, advancePaid,
                   referenceNumber,
+                  ...(flowVarsSnapshot ? { flowVars: flowVarsSnapshot } : {}),
                 },
               });
             }));

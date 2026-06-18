@@ -26,6 +26,9 @@ vi.mock("../realtime/emit", () => ({ emitToHotel: vi.fn() }));
 vi.mock("../services/templates.service", () => ({ sendTemplateMessage: vi.fn() }));
 vi.mock("../services/channel.send.service", () => ({ sendChannelMessage: vi.fn() }));
 vi.mock("../services/confirmationSequence.service", () => ({ resolveConfirmationSequence: vi.fn() }));
+// Default: no variable mappings → confirm-time resolution behaves exactly as before
+// this feature (booking-field name match or blank). Part-4 resolution tests override.
+vi.mock("../services/templateVariableMapping.service", () => ({ getTemplateMappings: vi.fn(async () => []) }));
 vi.mock("../queue/confirmationSequence.queue", () => ({
   confirmationSequenceQueue: {
     add:    vi.fn(async () => ({ id: "confirm-b1" })),
@@ -36,11 +39,13 @@ vi.mock("../queue/confirmationSequence.queue", () => ({
 import prisma from "../db/connect";
 import { emitToHotel } from "../realtime/emit";
 import { resolveConfirmationSequence } from "../services/confirmationSequence.service";
+import { getTemplateMappings } from "../services/templateVariableMapping.service";
 import { confirmationSequenceQueue } from "../queue/confirmationSequence.queue";
 import { confirmationPreview, sendConfirmation, confirmationStatus } from "./booking.controller";
 
 const p = prisma as any;
 const resolveSeq = resolveConfirmationSequence as ReturnType<typeof vi.fn>;
+const getMappings = getTemplateMappings as ReturnType<typeof vi.fn>;
 const queueAdd   = confirmationSequenceQueue.add as ReturnType<typeof vi.fn>;
 const queueGetJob = confirmationSequenceQueue.getJob as ReturnType<typeof vi.fn>;
 
@@ -72,6 +77,7 @@ beforeEach(() => {
   p.booking.updateMany.mockResolvedValue({ count: 1 });
   queueGetJob.mockResolvedValue(null);                       // no existing job by default
   queueAdd.mockResolvedValue({ id: "confirm-b1" });
+  getMappings.mockResolvedValue([]);                         // no variable mappings by default
 });
 
 // ── confirmation-preview ─────────────────────────────────────────────────────────
@@ -136,6 +142,59 @@ describe("confirmationPreview", () => {
     const res = mockRes();
     await confirmationPreview(req({ params: { bookingId: "b1" } }) as any, res);
     expect(res.body.steps[0].variables).toEqual([]);
+  });
+
+  // ── Variable-mapping resolution (Part 4) ──────────────────────────────────────
+  // A single-template sequence with one {{arrival}} variable, varied per test.
+  function seqWithArrival() {
+    resolveSeq.mockResolvedValue({
+      id: "seq1", channel: "WHATSAPP", name: "Std", isDefault: true, roomTypeScope: [],
+      steps: [{ id: "st0", order: 0, refType: "TEMPLATE", refId: "tmpl1", title: "T", body: "Arrive {{arrival}}" }],
+    });
+  }
+
+  it("BOOKING_FIELD mapping resolves the default via the mapped booking field", async () => {
+    p.booking.findFirst.mockResolvedValue(bookingRow);
+    seqWithArrival();
+    // {{arrival}} → BOOKING_FIELD guestName → "Sam"
+    getMappings.mockResolvedValue([{ variableName: "arrival", sourceType: "BOOKING_FIELD", sourceKey: "guestName" }]);
+    const res = mockRes();
+    await confirmationPreview(req({ params: { bookingId: "b1" } }) as any, res);
+    expect(res.body.steps[0].variables).toEqual([{ name: "arrival", defaultValue: "Sam" }]);
+  });
+
+  it("FLOW_VAR mapping resolves from booking.flowVars when present", async () => {
+    p.booking.findFirst.mockResolvedValue({ ...bookingRow, flowVars: { arrivalTime: "2 PM" } });
+    seqWithArrival();
+    getMappings.mockResolvedValue([{ variableName: "arrival", sourceType: "FLOW_VAR", sourceKey: "arrivalTime" }]);
+    const res = mockRes();
+    await confirmationPreview(req({ params: { bookingId: "b1" } }) as any, res);
+    expect(res.body.steps[0].variables).toEqual([{ name: "arrival", defaultValue: "2 PM" }]);
+  });
+
+  it("FLOW_VAR mapping with no snapshot value falls through to blank (manual input)", async () => {
+    p.booking.findFirst.mockResolvedValue({ ...bookingRow, flowVars: null });   // no snapshot
+    seqWithArrival();
+    getMappings.mockResolvedValue([{ variableName: "arrival", sourceType: "FLOW_VAR", sourceKey: "arrivalTime" }]);
+    const res = mockRes();
+    await confirmationPreview(req({ params: { bookingId: "b1" } }) as any, res);
+    expect(res.body.steps[0].variables).toEqual([{ name: "arrival", defaultValue: "" }]);
+  });
+
+  it("no mapping row → unchanged behavior (booking-field name match or blank)", async () => {
+    p.booking.findFirst.mockResolvedValue(bookingRow);
+    // body references guestName (matches buildVars) + arrival (no match, no mapping)
+    resolveSeq.mockResolvedValue({
+      id: "seq1", channel: "WHATSAPP", name: "Std", isDefault: true, roomTypeScope: [],
+      steps: [{ id: "st0", order: 0, refType: "TEMPLATE", refId: "tmpl1", title: "T", body: "Hi {{guestName}} {{arrival}}" }],
+    });
+    getMappings.mockResolvedValue([]);   // no mappings
+    const res = mockRes();
+    await confirmationPreview(req({ params: { bookingId: "b1" } }) as any, res);
+    expect(res.body.steps[0].variables).toEqual([
+      { name: "guestName", defaultValue: "Sam" },  // name match via buildVars
+      { name: "arrival",   defaultValue: "" },      // no match, no mapping → blank
+    ]);
   });
 
   it("falls back to the legacy default template as a one-item checklist (no sequence)", async () => {

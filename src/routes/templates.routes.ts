@@ -14,6 +14,11 @@ import {
 import { uploadToR2 } from "../services/r2.service";
 import prisma from "../db/connect";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
+import {
+  listTemplateVariableMappings,
+  replaceTemplateVariableMappings,
+  listHotelFlowVarNames,
+} from "../controllers/templateVariableMapping.controller";
 
 const mediaUpload = multer({
   storage: multer.memoryStorage(),
@@ -295,6 +300,14 @@ router.post("/:id/sync", async (req: Request, res: Response) => {
     res.status(err.status ?? 500).json({ error: err.message });
   }
 });
+
+// ── Template Variable Mapping (BOOKING_FIELD / FLOW_VAR) ──────────────────────────
+// Distinct from the legacy `variable-mapping` (single JSON column, context-field
+// only). These persist to the TemplateVariableMapping table and drive confirm-time
+// resolution + the create_booking flowVars snapshot.
+router.get("/flow-var-names",                       listHotelFlowVarNames);
+router.get("/:templateId/variable-mappings",        listTemplateVariableMappings);
+router.put("/:templateId/variable-mappings",        replaceTemplateVariableMappings);
 
 // PATCH /hotel-templates/:id/variable-mapping  — set which context field each {{n}} maps to
 router.patch("/:id/variable-mapping", async (req: Request, res: Response) => {

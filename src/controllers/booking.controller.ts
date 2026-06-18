@@ -10,6 +10,7 @@ import { interpolate } from "../automation/interpolate";
 import { resolveConfirmationSequence } from "../services/confirmationSequence.service";
 import { confirmationSequenceQueue } from "../queue/confirmationSequence.queue";
 import { confirmationJobId, reconstructStatus } from "../services/confirmationStatus";
+import { getTemplateMappings } from "../services/templateVariableMapping.service";
 import type {
   ConfirmationStepJob,
   ConfirmationSequenceJobData,
@@ -259,10 +260,32 @@ function extractTemplateVars(components: any): string[] {
 }
 
 // Build the {name, defaultValue} descriptor list staff see for a template step.
-// defaultValue is auto-derived from the booking (buildVars) where possible; "" means
-// the value must be supplied by staff before sending. Mirrors the legacy confirm flow.
-function buildStepVariables(bodyText: string, vars: Record<string, string>): { name: string; defaultValue: string }[] {
-  return extractVarsFromText(bodyText).map((name) => ({ name, defaultValue: vars[name] ?? "" }));
+// Resolution priority per variable:
+//   1. A TemplateVariableMapping row for this variable:
+//        BOOKING_FIELD → vars[sourceKey]  (the buildVars value for the mapped field)
+//        FLOW_VAR      → bookingFlowVars[sourceKey]  (snapshot captured at booking)
+//      A mapped value that resolves to nothing falls through to "" (manual input).
+//   2. No mapping row → today's behavior: vars[name] (booking-field name match) or "".
+// Mirrors the legacy confirm flow; "" = staff must supply before sending.
+function buildStepVariables(
+  bodyText:       string,
+  vars:           Record<string, string>,
+  mappings:       Record<string, { sourceType: string; sourceKey: string }> = {},
+  bookingFlowVars: Record<string, string> = {}
+): { name: string; defaultValue: string }[] {
+  return extractVarsFromText(bodyText).map((name) => {
+    const map = mappings[name];
+    let defaultValue: string;
+    if (map) {
+      defaultValue =
+        map.sourceType === "FLOW_VAR"
+          ? (bookingFlowVars[map.sourceKey] ?? "")
+          : (vars[map.sourceKey] ?? "");
+    } else {
+      defaultValue = vars[name] ?? "";
+    }
+    return { name, defaultValue };
+  });
 }
 
 // ── GET /bookings/:id/confirm-options ─────────────────────────────────────────
@@ -497,15 +520,25 @@ export async function confirmationPreview(req: Request, res: Response) {
     const channel    = await getGuestChannel(booking.guestId, hotelId);
     const roomTypeId = booking.roomTypeId ?? null;
     const vars       = buildVars(booking);
+    // Snapshot captured at create_booking time (Part 2). Drives FLOW_VAR resolution.
+    const bookingFlowVars = (booking.flowVars ?? {}) as Record<string, string>;
 
     // 1. Configured sequence?
     const sequence = await resolveConfirmationSequence(hotelId, channel, roomTypeId);
     if (sequence) {
-      const steps = sequence.steps.map((s) => {
+      const steps = await Promise.all(sequence.steps.map(async (s) => {
         const rawBody = s.body ?? "";
         // Only TEMPLATE steps carry fillable variables (Meta named/positional params).
         // Saved replies are interpolated server-side at send time, so no staff input.
-        const variables = s.refType === "TEMPLATE" ? buildStepVariables(rawBody, vars) : [];
+        let variables: { name: string; defaultValue: string }[] = [];
+        if (s.refType === "TEMPLATE") {
+          // refId is the WhatsAppTemplate id — look up its variable mappings.
+          const mappingRows = await getTemplateMappings(hotelId, s.refId);
+          const mappings = Object.fromEntries(
+            mappingRows.map((m) => [m.variableName, { sourceType: m.sourceType, sourceKey: m.sourceKey }])
+          );
+          variables = buildStepVariables(rawBody, vars, mappings, bookingFlowVars);
+        }
         return {
           stepId:  s.id,
           refType: s.refType,
@@ -514,7 +547,7 @@ export async function confirmationPreview(req: Request, res: Response) {
           body:    rawBody ? interpolateTemplateBody(rawBody, vars) : "",
           variables,
         };
-      });
+      }));
       return res.json({ channel, source: "sequence", sequenceId: sequence.id, steps });
     }
 
@@ -537,6 +570,10 @@ export async function confirmationPreview(req: Request, res: Response) {
       if (!template) return res.json({ channel, source: "legacy", steps: [] });
       const comps    = template.components as any;
       const bodyText = comps?.body?.text ?? template.name;
+      const mappingRows = await getTemplateMappings(hotelId, template.id);
+      const mappings = Object.fromEntries(
+        mappingRows.map((m) => [m.variableName, { sourceType: m.sourceType, sourceKey: m.sourceKey }])
+      );
       return res.json({
         channel, source: "legacy",
         steps: [{
@@ -545,7 +582,7 @@ export async function confirmationPreview(req: Request, res: Response) {
           refId:     template.id,
           title:     template.name,
           body:      interpolateTemplateBody(bodyText, vars),
-          variables: buildStepVariables(bodyText, vars),
+          variables: buildStepVariables(bodyText, vars, mappings, bookingFlowVars),
         }],
       });
     }

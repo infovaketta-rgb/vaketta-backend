@@ -109,6 +109,7 @@ model Hotel {
   savedReplies      SavedReply[]
   pausedFlows       PausedFlow[]
   confirmationSequences ConfirmationSequence[]
+  templateVariableMappings TemplateVariableMapping[]
 }
 
 model HotelConfig {
@@ -264,6 +265,12 @@ model Booking {
   // Links rooms booked together as one reservation (multi-room allocation).
   // Null = single-room booking.
   bookingGroupId String?
+
+  // Snapshot of watched flow-builder variables captured at create_booking time,
+  // so template variables mapped to FLOW_VAR can still resolve after the session
+  // (and its transient flowVars) is wiped. Only the names registered in
+  // TemplateVariableMapping (sourceType=FLOW_VAR) are persisted here. Null = none.
+  flowVars Json?
 
   hotel Hotel @relation(fields: [hotelId], references: [id])
   guest Guest @relation(fields: [guestId], references: [id])
@@ -741,4 +748,23 @@ model ConfirmationSequenceStep {
   sequence ConfirmationSequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
 
   @@index([sequenceId, order])
+}
+
+// ── Template variable mapping ────────────────────────────────────────────────────
+// One row per mapped {{var}} in a template. Maps the variable to either a fixed
+// booking field (BOOKING_FIELD) or a flow-builder variable name (FLOW_VAR) whose
+// value is snapshotted onto Booking.flowVars at create_booking time. Unmapped
+// variables have no row and fall through to manual staff input.
+model TemplateVariableMapping {
+  id           String @id @default(uuid())
+  hotelId      String
+  templateId   String  // WhatsAppTemplate.id
+  variableName String  // the {{var}} name inside the template body
+  sourceType   String  // "BOOKING_FIELD" | "FLOW_VAR"
+  sourceKey    String  // booking-field key or flow-var name
+
+  hotel Hotel @relation(fields: [hotelId], references: [id])
+
+  @@unique([templateId, variableName])
+  @@index([hotelId, templateId])
 }
