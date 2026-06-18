@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   nightsBetween,
   exceedsMaxStay,
+  clampMaxStayNights,
   DEFAULT_MAX_STAY_NIGHTS,
   HARD_MAX_STAY_NIGHTS,
   STAY_TOO_LONG_MESSAGE,
@@ -54,10 +55,54 @@ describe("exceedsMaxStay", () => {
     expect(exceedsMaxStay(401, 400)).toBe(true);
   });
 
-  it("never lets a misconfigured cap exceed the hard 10-year ceiling", () => {
+  it("never lets a misconfigured cap exceed the hard 10-year fallback ceiling", () => {
     expect(HARD_MAX_STAY_NIGHTS).toBe(3650);
-    // Even with a config above the ceiling, an absurd range is rejected.
+    // No platform ceiling passed → falls back to HARD_MAX_STAY_NIGHTS.
     expect(exceedsMaxStay(HARD_MAX_STAY_NIGHTS + 1, 999_999)).toBe(true);
+  });
+
+  it("uses the live platform ceiling as the upper bound when provided", () => {
+    // Hotel config 400, platform ceiling 100 → effective cap is 100.
+    expect(exceedsMaxStay(150, 400, 100)).toBe(true);
+    expect(exceedsMaxStay(100, 400, 100)).toBe(false);
+    // Hotel config below the ceiling still governs (min of the two).
+    expect(exceedsMaxStay(70, 60, 5000)).toBe(true);
+    expect(exceedsMaxStay(60, 60, 5000)).toBe(false);
+  });
+
+  it("a higher platform ceiling lets a hotel honour a long configured cap", () => {
+    // Houseboat at 4000 nights with a raised platform ceiling of 5000.
+    expect(exceedsMaxStay(4000, 4000, 5000)).toBe(false);
+    expect(exceedsMaxStay(4001, 4000, 5000)).toBe(true);
+  });
+
+  it("falls back to HARD_MAX_STAY_NIGHTS when platform ceiling is invalid", () => {
+    expect(exceedsMaxStay(HARD_MAX_STAY_NIGHTS + 1, 999_999, NaN)).toBe(true);
+    expect(exceedsMaxStay(HARD_MAX_STAY_NIGHTS + 1, 999_999, 0)).toBe(true);
+  });
+});
+
+describe("clampMaxStayNights (shared write-path clamp)", () => {
+  it("pins a value into [1, platformCeiling]", () => {
+    expect(clampMaxStayNights(60, 3650)).toBe(60);
+    expect(clampMaxStayNights(0, 3650)).toBe(1);
+    expect(clampMaxStayNights(-100, 3650)).toBe(1);
+    expect(clampMaxStayNights(99_999, 3650)).toBe(3650);
+  });
+
+  it("a superadmin's request above the ceiling is clamped to the ceiling", () => {
+    // Superadmin tries 10000 with platform ceiling 3650 → stored as 3650.
+    expect(clampMaxStayNights(10_000, 3650)).toBe(3650);
+  });
+
+  it("clamp-on-write: lowering the platform ceiling clamps the NEXT write", () => {
+    // Existing hotel value 400 is unchanged in the DB (not re-clamped here).
+    // But the next superadmin write of 400 against a lowered ceiling of 90
+    // is clamped to 90 — this is the clamp-on-write behaviour we chose.
+    const loweredCeiling = 90;
+    expect(clampMaxStayNights(400, loweredCeiling)).toBe(90);
+    // A request already under the new ceiling is preserved.
+    expect(clampMaxStayNights(45, loweredCeiling)).toBe(45);
   });
 });
 

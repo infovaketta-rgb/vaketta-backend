@@ -27,7 +27,7 @@ import {
 } from "../controllers/plan.controller";
 import { getAnalytics, listHotelsWithBilling } from "../controllers/analytics.controller";
 import { getTrialConfigHandler, updateTrialConfigHandler } from "../controllers/trialConfig.controller";
-import { getPlatformSettingsHandler, patchPlatformSettingsHandler } from "../controllers/settings.controller";
+import { getPlatformSettingsHandler, patchPlatformSettingsHandler, setHotelMaxStayHandler } from "../controllers/settings.controller";
 import {
   adminListFlowsHandler,
   adminGetFlowHandler,
@@ -78,6 +78,8 @@ router.patch("/plans/:id",       vakettaAdminAuth, updatePlanHandler);
 router.patch("/hotels/:id/plan",  vakettaAdminAuth, assignPlanHandler);
 // Start trial for hotel
 router.post("/hotels/:id/trial",  vakettaAdminAuth, startTrialHandler);
+// Superadmin sets a hotel's max-stay override (clamped to platform ceiling)
+router.patch("/hotels/:hotelId/max-stay", vakettaAdminAuth, setHotelMaxStayHandler);
 
 // Analytics / MRR dashboard
 router.get("/analytics",         vakettaAdminAuth, getAnalytics);

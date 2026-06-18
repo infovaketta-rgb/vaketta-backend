@@ -46,7 +46,7 @@ import { sendCarouselMessage, sendMediaMessage, sendListMessage, sendTextMessage
 import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
-import { getHotelConfigCached } from "../services/settings.service";
+import { getHotelConfigCached, getPlatformMaxStayCeiling } from "../services/settings.service";
 import { getWatchedFlowVarNames, pickWatchedFlowVars } from "../services/templateVariableMapping.service";
 import { extractDateWithAI, classifyBookingIntent, interpretAllocationModification, extractChildrenAgesAI } from "../services/ai.service";
 import { handleAdvancedRoomAllocation, type AllocationRoomInput, type SendRoomCarouselFn } from "./nodes/advancedRoomAllocation";
@@ -1556,8 +1556,10 @@ export async function executeFlowStep(
 
             // Max-stay gate — MUST run before any availability query. An absurd
             // checkout date expands into a huge per-night array downstream (OOM).
+            // Ceiling is the live platform-wide cap (superadmin-controlled).
             const multiNights = nightsBetween(checkInDate, checkOutDate);
-            if (exceedsMaxStay(multiNights, cfg?.maxStayNights)) {
+            const multiCeiling = await getPlatformMaxStayCeiling();
+            if (exceedsMaxStay(multiNights, cfg?.maxStayNights, multiCeiling)) {
               return finishMulti(STAY_TOO_LONG_MESSAGE);
             }
 
@@ -1700,8 +1702,10 @@ export async function executeFlowStep(
 
           // Max-stay gate — MUST run before checkRoomAvailability. An absurd
           // checkout date expands into a huge per-night array downstream (OOM).
+          // Ceiling is the live platform-wide cap (superadmin-controlled).
           const stayNights = nightsBetween(checkInDate, checkOutDate);
-          if (exceedsMaxStay(stayNights, config?.maxStayNights)) {
+          const stayCeiling = await getPlatformMaxStayCeiling();
+          if (exceedsMaxStay(stayNights, config?.maxStayNights, stayCeiling)) {
             const next = nextNodeId(currentNodeId, adjacency);
             if (!next) { await resetSession(guestId, hotelId); return STAY_TOO_LONG_MESSAGE; }
             await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });

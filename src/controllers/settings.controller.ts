@@ -21,6 +21,8 @@ import {
   getPlatformSettings,
   updatePlatformSettings,
   invalidateHotelConfigCache,
+  invalidatePlatformCeilingCache,
+  setHotelMaxStayNights,
 } from "../services/settings.service";
 import { invalidatePromptCache } from "../services/ai.service";
 import prisma from "../db/connect";
@@ -40,8 +42,13 @@ export async function getSettings(req: Request, res: Response) {
 
 export async function patchSettings(req: Request, res: Response) {
   try {
+    // NOTE: maxStayNights is intentionally NOT accepted here. It is now
+    // superadmin-controlled (PATCH /admin/hotels/:hotelId/max-stay). If a hotel
+    // admin still sends it, it is silently ignored — same convention as other
+    // non-whitelisted fields in this controller (e.g. updateHotelHandler drops
+    // an unrecognised `config`).
     const {
-      autoReplyEnabled, bookingEnabled, maxStayNights, bookingFlowId, menuFlowId, aiEnabled,
+      autoReplyEnabled, bookingEnabled, bookingFlowId, menuFlowId, aiEnabled,
       businessStartHour, businessEndHour,
       timezone, defaultLanguage,
       welcomeMessage, nightMessage,
@@ -49,14 +56,9 @@ export async function patchSettings(req: Request, res: Response) {
       allDay, aiInstructions,
     } = req.body;
 
-    // Clamp to 1–3650 nights. 3650 (10y) is a hard crash ceiling, not a realistic
-    // stay — keeps an absurd value from re-opening the OOM hole, server-side.
-    const clampMaxStay = (n: number) => Math.min(3650, Math.max(1, Math.round(n)));
-
     const config = await updateHotelConfig(hotelId(req), {
       ...(autoReplyEnabled     !== undefined && { autoReplyEnabled }),
       ...(bookingEnabled       !== undefined && { bookingEnabled }),
-      ...(maxStayNights        !== undefined && Number.isFinite(Number(maxStayNights)) && { maxStayNights: clampMaxStay(Number(maxStayNights)) }),
       ...(bookingFlowId        !== undefined && { bookingFlowId: bookingFlowId || null }),
       ...(menuFlowId           !== undefined && { menuFlowId:    menuFlowId    || null }),
       ...(aiEnabled            !== undefined && { aiEnabled }),
@@ -295,11 +297,43 @@ export async function getPlatformSettingsHandler(_req: Request, res: Response) {
 
 export async function patchPlatformSettingsHandler(req: Request, res: Response) {
   try {
-    const { instagramEmbedUrl, whatsappEmbedSignupUrl } = req.body;
-    res.json(await updatePlatformSettings({
+    const { instagramEmbedUrl, whatsappEmbedSignupUrl, maxStayNightsCeiling } = req.body;
+    const ceilingValid =
+      maxStayNightsCeiling !== undefined && Number.isFinite(Number(maxStayNightsCeiling));
+    const result = await updatePlatformSettings({
       ...(instagramEmbedUrl       !== undefined && { instagramEmbedUrl:      String(instagramEmbedUrl).trim() }),
       ...(whatsappEmbedSignupUrl  !== undefined && { whatsappEmbedSignupUrl: String(whatsappEmbedSignupUrl).trim() }),
-    }));
+      // Floor at 1, no hard ceiling here — this IS the crash cap. (UI shows a soft
+      // warning above 3650.) Existing hotel rows are NOT retroactively re-clamped;
+      // a lowered ceiling takes effect on each hotel's next write + at booking time.
+      ...(ceilingValid && { maxStayNightsCeiling: Math.max(1, Math.round(Number(maxStayNightsCeiling))) }),
+    });
+    if (ceilingValid) invalidatePlatformCeilingCache();
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+/**
+ * Superadmin-only: set a single hotel's maxStayNights override.
+ * Guarded by vakettaAdminAuth at the route. hotelId comes ONLY from the route
+ * param — never from the body. Clamped to the live platform ceiling so even a
+ * superadmin can't exceed it (clamp happens in setHotelMaxStayNights).
+ */
+export async function setHotelMaxStayHandler(req: Request, res: Response) {
+  try {
+    const targetHotelId = req.params.hotelId;
+    if (!targetHotelId) return res.status(400).json({ error: "hotelId required" });
+
+    const { maxStayNights } = req.body;
+    const n = Number(maxStayNights);
+    if (!Number.isFinite(n)) {
+      return res.status(400).json({ error: "maxStayNights must be a number" });
+    }
+
+    const config = await setHotelMaxStayNights(targetHotelId, n);
+    res.json({ hotelId: targetHotelId, maxStayNights: config.maxStayNights });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

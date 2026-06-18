@@ -8,6 +8,7 @@ import {
   decryptWhatsAppToken,
 } from "../utils/encryption.utils";
 import { invalidateCredentialsCache } from "./whatsapp.send.service";
+import { HARD_MAX_STAY_NIGHTS, clampMaxStayNights } from "../automation/stayDuration";
 
 const log = logger.child({ service: "settings-service" });
 
@@ -73,7 +74,8 @@ export async function updateHotelConfig(
   data: {
     autoReplyEnabled?: boolean;
     bookingEnabled?: boolean;
-    maxStayNights?: number;
+    // maxStayNights is intentionally absent — superadmin-only, set via
+    // setHotelMaxStayNights (PATCH /admin/hotels/:hotelId/max-stay).
     bookingFlowId?: string | null;
     menuFlowId?: string | null;
     aiEnabled?: boolean;
@@ -484,10 +486,79 @@ export async function getPlatformSettings() {
   });
 }
 
-export async function updatePlatformSettings(data: { instagramEmbedUrl?: string; whatsappEmbedSignupUrl?: string }) {
+export async function updatePlatformSettings(data: {
+  instagramEmbedUrl?: string;
+  whatsappEmbedSignupUrl?: string;
+  maxStayNightsCeiling?: number;
+}) {
   return prisma.platformSettings.upsert({
     where:  { id: "global" },
     update: data,
     create: { id: "global", ...data },
   });
+}
+
+// ── Platform max-stay ceiling (cached, read on every booking) ────────────────
+
+const PLATFORM_CEILING_TTL = 300; // 5 minutes
+const platformCeilingKey   = "platformSettings:maxStayNightsCeiling";
+
+/**
+ * Live platform-wide max-stay ceiling, read-through cached (booking hot path).
+ * Falls back to HARD_MAX_STAY_NIGHTS if the singleton row is missing or any read
+ * fails — never throws, so it can't break a booking.
+ */
+export async function getPlatformMaxStayCeiling(): Promise<number> {
+  try {
+    const raw = await redis.get(platformCeilingKey);
+    if (raw !== null) {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  } catch (err) {
+    log.warn({ err }, "platform ceiling cache GET failed — falling back to Postgres");
+  }
+
+  let ceiling = HARD_MAX_STAY_NIGHTS;
+  try {
+    const row = await prisma.platformSettings.findUnique({
+      where: { id: "global" },
+      select: { maxStayNightsCeiling: true },
+    });
+    if (row && Number.isFinite(row.maxStayNightsCeiling) && row.maxStayNightsCeiling > 0) {
+      ceiling = row.maxStayNightsCeiling;
+    }
+  } catch (err) {
+    log.warn({ err }, "platform ceiling DB read failed — using HARD_MAX_STAY_NIGHTS fallback");
+    return HARD_MAX_STAY_NIGHTS;
+  }
+
+  redis.set(platformCeilingKey, String(ceiling), "EX", PLATFORM_CEILING_TTL).catch((err) =>
+    log.warn({ err }, "platform ceiling cache SET failed")
+  );
+  return ceiling;
+}
+
+/** Call after any write that changes PlatformSettings.maxStayNightsCeiling. */
+export function invalidatePlatformCeilingCache(): void {
+  redis.del(platformCeilingKey).catch((err) =>
+    log.warn({ err }, "platform ceiling cache DEL failed")
+  );
+}
+
+/**
+ * Superadmin-only: set a single hotel's maxStayNights override, clamped against
+ * the LIVE platform ceiling so a superadmin can't exceed it either. Clamp-on-
+ * write (existing rows are not retroactively re-clamped when the ceiling drops).
+ */
+export async function setHotelMaxStayNights(hotelId: string, requested: number) {
+  const ceiling = await getPlatformMaxStayCeiling();
+  const value = clampMaxStayNights(Math.round(requested), ceiling);
+  const config = await prisma.hotelConfig.upsert({
+    where:  { hotelId },
+    update: { maxStayNights: value },
+    create: { hotelId, maxStayNights: value },
+  });
+  invalidateHotelConfigCache(hotelId);
+  return config;
 }
