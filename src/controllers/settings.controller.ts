@@ -41,7 +41,7 @@ export async function getSettings(req: Request, res: Response) {
 export async function patchSettings(req: Request, res: Response) {
   try {
     const {
-      autoReplyEnabled, bookingEnabled, bookingFlowId, menuFlowId, aiEnabled,
+      autoReplyEnabled, bookingEnabled, maxStayNights, bookingFlowId, menuFlowId, aiEnabled,
       businessStartHour, businessEndHour,
       timezone, defaultLanguage,
       welcomeMessage, nightMessage,
@@ -49,9 +49,14 @@ export async function patchSettings(req: Request, res: Response) {
       allDay, aiInstructions,
     } = req.body;
 
+    // Clamp to 1–3650 nights. 3650 (10y) is a hard crash ceiling, not a realistic
+    // stay — keeps an absurd value from re-opening the OOM hole, server-side.
+    const clampMaxStay = (n: number) => Math.min(3650, Math.max(1, Math.round(n)));
+
     const config = await updateHotelConfig(hotelId(req), {
       ...(autoReplyEnabled     !== undefined && { autoReplyEnabled }),
       ...(bookingEnabled       !== undefined && { bookingEnabled }),
+      ...(maxStayNights        !== undefined && Number.isFinite(Number(maxStayNights)) && { maxStayNights: clampMaxStay(Number(maxStayNights)) }),
       ...(bookingFlowId        !== undefined && { bookingFlowId: bookingFlowId || null }),
       ...(menuFlowId           !== undefined && { menuFlowId:    menuFlowId    || null }),
       ...(aiEnabled            !== undefined && { aiEnabled }),

@@ -1,5 +1,6 @@
 import prisma from "../db/connect";
 import { BookingStatus } from "@prisma/client";
+import { HARD_MAX_STAY_NIGHTS } from "../automation/stayDuration";
 
 // ── Date helpers ───────────────────────────────────────────────────────────────
 
@@ -17,11 +18,19 @@ function addDays(d: Date, n: number): Date {
   return new Date(d.getTime() + n * 86_400_000);
 }
 
-/** Expand [start, end) into an array of UTC-midnight Dates (nights). */
+/**
+ * Expand [start, end) into an array of UTC-midnight Dates (nights).
+ *
+ * Hard-capped at HARD_MAX_STAY_NIGHTS (10 years) regardless of any hotel config
+ * — belt-and-suspenders crash guard. flowRuntime already rejects over-long stays
+ * before reaching here, but an absurd range hitting this directly (e.g. the
+ * calendar API) must not build an unbounded array and OOM the server. The cap
+ * sits far above any legitimate stay, so it never truncates a real booking.
+ */
 function nightRange(start: Date, end: Date): Date[] {
   const nights: Date[] = [];
   let cur = start;
-  while (cur < end) {
+  while (cur < end && nights.length < HARD_MAX_STAY_NIGHTS) {
     nights.push(cur);
     cur = addDays(cur, 1);
   }

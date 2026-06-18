@@ -53,6 +53,7 @@ import { handleAdvancedRoomAllocation, type AllocationRoomInput, type SendRoomCa
 import { trySendPlanList } from "./nodes/planList";
 import { trySendRoomMenuList, trySendMoveToRoomList, trySendManualModeList, trySendChangeRoomTypeList } from "./nodes/modifyLists";
 import { aggregateRoomQuantities } from "./bookingAllocation";
+import { nightsBetween, exceedsMaxStay, STAY_TOO_LONG_MESSAGE } from "./stayDuration";
 import { interpolate } from "./interpolate";
 // randomUUID removed — no longer needed after multi-room booking refactor
 
@@ -1544,13 +1545,20 @@ export async function executeFlowStep(
               return finishMulti("⚠️ Booking failed — invalid or reversed dates. Please contact us directly.");
             }
 
-            // 4. Booking-enabled gate (same message as single-room).
+            // 4. Booking-enabled gate + max-stay gate (same messages as single-room).
             const cfg = await prisma.hotelConfig.findUnique({
               where: { hotelId },
-              select: { bookingEnabled: true, availabilityEnabled: true },
+              select: { bookingEnabled: true, availabilityEnabled: true, maxStayNights: true },
             });
             if (cfg && !cfg.bookingEnabled) {
               return finishMulti("⚠️ Online booking is currently unavailable. Please contact us directly to make a reservation.");
+            }
+
+            // Max-stay gate — MUST run before any availability query. An absurd
+            // checkout date expands into a huge per-night array downstream (OOM).
+            const multiNights = nightsBetween(checkInDate, checkOutDate);
+            if (exceedsMaxStay(multiNights, cfg?.maxStayNights)) {
+              return finishMulti(STAY_TOO_LONG_MESSAGE);
             }
 
             // 5. Availability — aggregate by room type; require N rooms of each type.
@@ -1679,13 +1687,23 @@ export async function executeFlowStep(
 
           const config = await prisma.hotelConfig.findUnique({
             where: { hotelId },
-            select: { bookingEnabled: true, availabilityEnabled: true },
+            select: { bookingEnabled: true, availabilityEnabled: true, maxStayNights: true },
           });
 
           if (config && !config.bookingEnabled) {
             const errMsg = "⚠️ Online booking is currently unavailable. Please contact us directly to make a reservation.";
             const next = nextNodeId(currentNodeId, adjacency);
             if (!next) { await resetSession(guestId, hotelId); return errMsg; }
+            await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
+            return advance(next);
+          }
+
+          // Max-stay gate — MUST run before checkRoomAvailability. An absurd
+          // checkout date expands into a huge per-night array downstream (OOM).
+          const stayNights = nightsBetween(checkInDate, checkOutDate);
+          if (exceedsMaxStay(stayNights, config?.maxStayNights)) {
+            const next = nextNodeId(currentNodeId, adjacency);
+            if (!next) { await resetSession(guestId, hotelId); return STAY_TOO_LONG_MESSAGE; }
             await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
             return advance(next);
           }
@@ -1704,7 +1722,7 @@ export async function executeFlowStep(
 
           const roomType    = await prisma.roomType.findFirst({ where: { id: roomTypeId, hotelId } });
           const pricePerNight = roomType ? roomType.basePrice : 0;
-          const nights        = Math.max(1, Math.ceil((checkOutDate.getTime() - checkInDate.getTime()) / 86_400_000));
+          const nights        = stayNights; // already validated against maxStayNights above
           const totalPrice    = pricePerNight * nights;
           const advancePaid   = advancePaidRaw ? Math.round(parseFloat(advancePaidRaw)) : 0;
           const lockKey = `${hotelId}:${new Date().getFullYear()}`;

@@ -73,6 +73,7 @@ export async function updateHotelConfig(
   data: {
     autoReplyEnabled?: boolean;
     bookingEnabled?: boolean;
+    maxStayNights?: number;
     bookingFlowId?: string | null;
     menuFlowId?: string | null;
     aiEnabled?: boolean;

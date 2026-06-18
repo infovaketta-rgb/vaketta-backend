@@ -119,6 +119,10 @@ model HotelConfig {
   autoReplyEnabled      Boolean  @default(true)
   bookingEnabled        Boolean  @default(true)
   availabilityEnabled   Boolean  @default(false)
+  // Max nights a guest may book in one stay. Gates create_booking BEFORE any
+  // availability query — an absurd checkout date (e.g. ~2000 years out) used to
+  // OOM the server. Admin-configurable (1–3650); 3650 is a hard crash ceiling.
+  maxStayNights         Int      @default(60)
   bookingFlowId         String?  // when set, custom flow handles BOOKING menu items
   menuFlowId            String?  // when set, this flow IS the main menu (replaces hardcoded buildMenuMessage)
   aiEnabled             Boolean  @default(false)  // AI fallback for unrecognised guest messages
