@@ -146,9 +146,13 @@ router.post("/sync-from-meta", async (req: Request, res: Response) => {
     const VALID_CATEGORIES = new Set(["MARKETING", "UTILITY", "AUTHENTICATION"]);
 
     // Fetch all pages from Meta
+    const platformRow = await prisma.platformSettings.findUnique({ where: { id: "global" } }) as
+      { metaApiVersion?: string | null } | null;
+    const apiVersion = platformRow?.metaApiVersion ?? "v25.0";
+
     const allTemplates: any[] = [];
     let url: string | null =
-      `https://graph.facebook.com/v25.0/${wabaId}/message_templates` +
+      `https://graph.facebook.com/${apiVersion}/${wabaId}/message_templates` +
       `?limit=100&fields=id,name,language,category,status,quality_score,components,rejected_reason`;
 
     while (url) {

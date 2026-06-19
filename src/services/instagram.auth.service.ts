@@ -1,7 +1,22 @@
 import prisma from "../db/connect";
 import { encryptInstagramToken } from "./instagram.service";
 
-const META_VERSION = "v25.0";
+const VERSION_TTL_MS = 300_000;
+let _cachedVersion: { value: string; expiresAt: number } | null = null;
+
+async function getMetaVersion(): Promise<string> {
+  const now = Date.now();
+  if (_cachedVersion && now < _cachedVersion.expiresAt) return _cachedVersion.value;
+  try {
+    const row = await prisma.platformSettings.findUnique({ where: { id: "global" } }) as
+      { metaApiVersion?: string | null } | null;
+    const v = row?.metaApiVersion ?? "v25.0";
+    _cachedVersion = { value: v, expiresAt: now + VERSION_TTL_MS };
+    return v;
+  } catch {
+    return _cachedVersion?.value ?? "v25.0";
+  }
+}
 
 export interface FacebookPage {
   id: string;
@@ -15,6 +30,7 @@ export async function exchangeForLongLivedToken(shortLivedToken: string): Promis
   const appSecret = process.env.FACEBOOK_APP_SECRET ?? "";
   if (!appId || !appSecret) throw new Error("Facebook app credentials not configured");
 
+  const META_VERSION = await getMetaVersion();
   const url = new URL(`https://graph.facebook.com/${META_VERSION}/oauth/access_token`);
   url.searchParams.set("grant_type",       "fb_exchange_token");
   url.searchParams.set("client_id",        appId);
@@ -30,6 +46,7 @@ export async function exchangeForLongLivedToken(shortLivedToken: string): Promis
 }
 
 export async function getPagesWithInstagram(userToken: string): Promise<FacebookPage[]> {
+  const META_VERSION = await getMetaVersion();
   const url = new URL(`https://graph.facebook.com/${META_VERSION}/me/accounts`);
   url.searchParams.set("fields",       "id,name,access_token,instagram_business_account{id,name}");
   url.searchParams.set("access_token", userToken);
@@ -60,6 +77,7 @@ export async function connectInstagramViaPage(
   pageId: string,
   pageAccessToken: string
 ): Promise<{ instagramBusinessAccountId: string }> {
+  const META_VERSION = await getMetaVersion();
   const url = new URL(`https://graph.facebook.com/${META_VERSION}/${pageId}`);
   url.searchParams.set("fields",       "instagram_business_account");
   url.searchParams.set("access_token", pageAccessToken);
@@ -102,6 +120,7 @@ export async function subscribePageToWebhook(
   pageId: string,
   pageAccessToken: string
 ): Promise<void> {
+  const META_VERSION = await getMetaVersion();
   const res = await fetch(
     `https://graph.facebook.com/${META_VERSION}/${pageId}/subscribed_apps`,
     {

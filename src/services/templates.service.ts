@@ -7,6 +7,25 @@ import { withMetaRetry } from "./whatsapp.send.service";
 
 const log = logger.child({ service: "templates" });
 
+// ── Meta API version (cached 5 min) ──────────────────────────────────────────
+
+const VERSION_TTL_MS = 300_000;
+let _cachedVersion: { value: string; expiresAt: number } | null = null;
+
+async function getMetaApiVersion(): Promise<string> {
+  const now = Date.now();
+  if (_cachedVersion && now < _cachedVersion.expiresAt) return _cachedVersion.value;
+  try {
+    const row = await prisma.platformSettings.findUnique({ where: { id: "global" } }) as
+      { metaApiVersion?: string | null } | null;
+    const v = row?.metaApiVersion ?? "v25.0";
+    _cachedVersion = { value: v, expiresAt: now + VERSION_TTL_MS };
+    return v;
+  } catch {
+    return _cachedVersion?.value ?? "v25.0";
+  }
+}
+
 // ── Credentials helper ────────────────────────────────────────────────────────
 
 async function getWaCredentials(hotelId: string) {
@@ -170,13 +189,14 @@ export async function getTemplates(
 
 export async function createTemplate(hotelId: string, data: any) {
   const { wabaId, accessToken } = await getWaCredentials(hotelId);
+  const apiVersion = await getMetaApiVersion();
 
   const metaPayload = buildMetaPayload(data);
   log.info({ metaPayload }, "submitting template to Meta API");
   console.log("[templates] Meta submission payload:", JSON.stringify(metaPayload, null, 2));
 
   const metaRes = await fetch(
-    `https://graph.facebook.com/v25.0/${wabaId}/message_templates`,
+    `https://graph.facebook.com/${apiVersion}/${wabaId}/message_templates`,
     {
       method:  "POST",
       headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
@@ -251,10 +271,11 @@ export async function updateTemplate(hotelId: string, templateId: string, data: 
   }
 
   const { accessToken } = await getWaCredentials(hotelId);
+  const apiVersion = await getMetaApiVersion();
 
   if (existing.metaTemplateId) {
     const metaRes = await fetch(
-      `https://graph.facebook.com/v25.0/${existing.metaTemplateId}`,
+      `https://graph.facebook.com/${apiVersion}/${existing.metaTemplateId}`,
       {
         method:  "POST",
         headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
@@ -283,9 +304,10 @@ export async function deleteTemplate(hotelId: string, templateId: string) {
   if (!existing) throw Object.assign(new Error("Template not found"), { status: 404 });
 
   const { wabaId, accessToken } = await getWaCredentials(hotelId);
+  const apiVersion = await getMetaApiVersion();
 
   await fetch(
-    `https://graph.facebook.com/v25.0/${wabaId}/message_templates?name=${encodeURIComponent(existing.name)}`,
+    `https://graph.facebook.com/${apiVersion}/${wabaId}/message_templates?name=${encodeURIComponent(existing.name)}`,
     { method: "DELETE", headers: { Authorization: `Bearer ${accessToken}` } }
   );
 
@@ -299,9 +321,10 @@ export async function syncTemplate(hotelId: string, templateId: string) {
   if (!existing.metaTemplateId) throw Object.assign(new Error("Template has no Meta ID yet"), { status: 400 });
 
   const { accessToken } = await getWaCredentials(hotelId);
+  const apiVersion = await getMetaApiVersion();
 
   const metaRes = await fetch(
-    `https://graph.facebook.com/v25.0/${existing.metaTemplateId}?fields=status,quality_score,rejected_reason,components`,
+    `https://graph.facebook.com/${apiVersion}/${existing.metaTemplateId}?fields=status,quality_score,rejected_reason,components`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   const data = await metaRes.json() as any;
@@ -361,6 +384,7 @@ export async function uploadHeaderMediaToMeta(
   if (!template) throw Object.assign(new Error("Template not found"), { status: 404 });
 
   const { accessToken, phoneNumberId } = await getWaCredentials(hotelId);
+  const apiVersion = await getMetaApiVersion();
 
   const form = new FormData();
   form.append("messaging_product", "whatsapp");
@@ -370,7 +394,7 @@ export async function uploadHeaderMediaToMeta(
   form.append("file", new Blob([new Uint8Array(fileBuffer)], { type: mimeType }), "header-media");
 
   const metaRes = await fetch(
-    `https://graph.facebook.com/v25.0/${phoneNumberId}/media`,
+    `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/media`,
     { method: "POST", headers: { Authorization: `Bearer ${accessToken}` }, body: form }
   );
   const data = await metaRes.json() as any;
@@ -412,6 +436,7 @@ export async function reattachHeaderMediaFromSample(hotelId: string, templateId:
   }
 
   const { accessToken, phoneNumberId } = await getWaCredentials(hotelId);
+  const apiVersion = await getMetaApiVersion();
 
   log.info({ templateName: template.name, sampleUrl: candidate }, "[templates] fetching header sample from scontent");
 
@@ -438,7 +463,7 @@ export async function reattachHeaderMediaFromSample(hotelId: string, templateId:
   form.append("file", new Blob([new Uint8Array(fileBuffer)], { type: mimeType }), "header-media");
 
   const metaRes = await fetch(
-    `https://graph.facebook.com/v25.0/${phoneNumberId}/media`,
+    `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/media`,
     { method: "POST", headers: { Authorization: `Bearer ${accessToken}` }, body: form }
   );
   const data = await metaRes.json() as any;
@@ -479,9 +504,10 @@ export async function sendTemplateMessage(
   }
   if (!guest) throw Object.assign(new Error("Guest not found"), { status: 404 });
 
-  const [{ phoneNumberId, accessToken }, hotel] = await Promise.all([
+  const [{ phoneNumberId, accessToken }, hotel, apiVersion] = await Promise.all([
     getWaCredentials(hotelId),
     prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } }),
+    getMetaApiVersion(),
   ]);
 
   const components = template.components as any;
@@ -606,7 +632,7 @@ export async function sendTemplateMessage(
 
   const metaData = await withMetaRetry(async () => {
     const res = await fetch(
-      `https://graph.facebook.com/v25.0/${phoneNumberId}/messages`,
+      `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`,
       {
         method:  "POST",
         headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
@@ -679,17 +705,20 @@ export async function sendTemplateMessage(
 
 export async function syncPendingTemplates() {
   const cutoff = new Date(Date.now() - 30 * 60 * 1000); // older than 30 min
-  const pending = await prisma.whatsAppTemplate.findMany({
-    where: { status: "PENDING", createdAt: { lt: cutoff } },
-    include: { hotel: { include: { config: true } } },
-  });
+  const [pending, apiVersion] = await Promise.all([
+    prisma.whatsAppTemplate.findMany({
+      where: { status: "PENDING", createdAt: { lt: cutoff } },
+      include: { hotel: { include: { config: true } } },
+    }),
+    getMetaApiVersion(),
+  ]);
 
   for (const t of pending) {
     try {
       if (!t.metaTemplateId || !t.hotel.config?.metaAccessTokenEncrypted) continue;
       const accessToken = decryptWhatsAppToken(t.hotel.config.metaAccessTokenEncrypted);
       const res = await fetch(
-        `https://graph.facebook.com/v25.0/${t.metaTemplateId}?fields=status,quality_score,rejected_reason,components`,
+        `https://graph.facebook.com/${apiVersion}/${t.metaTemplateId}?fields=status,quality_score,rejected_reason,components`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       const data = await res.json() as any;

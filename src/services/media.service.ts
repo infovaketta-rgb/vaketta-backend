@@ -14,7 +14,22 @@ import { decryptWhatsAppToken } from "../utils/encryption.utils";
 
 const log = logger.child({ service: "media" });
 
-const META_API_VERSION = "v25.0";
+const VERSION_TTL_MS = 300_000;
+let _cachedVersion: { value: string; expiresAt: number } | null = null;
+
+async function getMetaApiVersion(): Promise<string> {
+  const now = Date.now();
+  if (_cachedVersion && now < _cachedVersion.expiresAt) return _cachedVersion.value;
+  try {
+    const row = await prisma.platformSettings.findUnique({ where: { id: "global" } }) as
+      { metaApiVersion?: string | null } | null;
+    const v = row?.metaApiVersion ?? "v25.0";
+    _cachedVersion = { value: v, expiresAt: now + VERSION_TTL_MS };
+    return v;
+  } catch {
+    return _cachedVersion?.value ?? "v25.0";
+  }
+}
 
 export type DownloadedMedia = {
   localUrl:  string;   // R2 public URL
@@ -46,6 +61,7 @@ export async function downloadMetaMedia(
     return null;
   }
 
+  const META_API_VERSION = await getMetaApiVersion();
   try {
     // Step 1: Get download URL from Meta
     const infoRes = await fetch(

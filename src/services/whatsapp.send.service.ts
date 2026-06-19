@@ -113,6 +113,25 @@ export async function withMetaRetry<T>(
   throw lastErr;
 }
 
+// ── Meta API version (cached, 5-min TTL) ────────────────────────────────────
+
+const VERSION_TTL_MS = 300_000;
+let cachedVersion: { value: string; expiresAt: number } | null = null;
+
+async function getMetaApiVersion(): Promise<string> {
+  const now = Date.now();
+  if (cachedVersion && now < cachedVersion.expiresAt) return cachedVersion.value;
+  try {
+    const row = await prisma.platformSettings.findUnique({ where: { id: "global" } }) as
+      { metaApiVersion?: string | null } | null;
+    const version = row?.metaApiVersion ?? "v25.0";
+    cachedVersion = { value: version, expiresAt: now + VERSION_TTL_MS };
+    return version;
+  } catch {
+    return cachedVersion?.value ?? "v25.0";
+  }
+}
+
 // ── Low-level Meta POST ───────────────────────────────────────────────────────
 
 async function metaPost(
@@ -120,7 +139,8 @@ async function metaPost(
   body:        object,
   accessToken: string,
 ): Promise<any> {
-  const res  = await fetch(`https://graph.facebook.com/v25.0/${endpoint}`, {
+  const version = await getMetaApiVersion();
+  const res  = await fetch(`https://graph.facebook.com/${version}/${endpoint}`, {
     method:  "POST",
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     body:    JSON.stringify(body),

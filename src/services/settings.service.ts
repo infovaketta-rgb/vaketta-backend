@@ -10,6 +10,19 @@ import {
 import { invalidateCredentialsCache } from "./whatsapp.send.service";
 import { HARD_MAX_STAY_NIGHTS, clampMaxStayNights } from "../automation/stayDuration";
 
+// Explicit type for the PlatformSettings singleton row. Mirrors the Prisma model
+// and avoids TS errors when the generated client cache is stale after a migration.
+type PlatformRow = {
+  id:                    string;
+  instagramEmbedUrl:     string;
+  whatsappEmbedSignupUrl:string;
+  metaApiVersion:        string;
+  whatsappConfigId:      string;
+  instagramAppId:        string;
+  maxStayNightsCeiling:  number;
+  updatedAt:             Date;
+} | null;
+
 const log = logger.child({ service: "settings-service" });
 
 const CONFIG_TTL   = 300; // 5 minutes
@@ -164,7 +177,7 @@ export async function updateMenuTitle(hotelId: string, title: string) {
 export async function getWhatsAppConfig(hotelId: string) {
   const [config, platform] = await Promise.all([
     prisma.hotelConfig.findUnique({ where: { hotelId } }),
-    prisma.platformSettings.findUnique({ where: { id: "global" } }),
+    prisma.platformSettings.findUnique({ where: { id: "global" } }) as Promise<PlatformRow>,
   ]);
 
   let maskedToken: string | null = null;
@@ -182,7 +195,9 @@ export async function getWhatsAppConfig(hotelId: string) {
     metaAccessToken:   maskedToken,
     metaWabaId:        config?.metaWabaId        ?? null,
     connected: !!(config?.metaPhoneNumberId && config?.metaAccessTokenEncrypted),
-    embedUrl: platform?.whatsappEmbedSignupUrl ?? "",
+    embedUrl:        platform?.whatsappEmbedSignupUrl ?? "",
+    configId:        platform?.whatsappConfigId       ?? "",
+    metaApiVersion:  platform?.metaApiVersion         ?? "v25.0",
   };
 }
 
@@ -199,7 +214,8 @@ export async function testWhatsAppConnection(hotelId: string): Promise<{ ok: boo
     return { ok: false, detail: "Credentials not configured" };
   }
 
-  const version = "v25.0";
+  const platform = await prisma.platformSettings.findUnique({ where: { id: "global" } }) as PlatformRow;
+  const version = platform?.metaApiVersion ?? "v25.0";
   try {
     const res = await fetch(
       `https://graph.facebook.com/${version}/${phoneNumberId}?fields=id,display_phone_number`,
@@ -251,9 +267,12 @@ export async function connectWhatsAppEmbeddedSignup(
   const appSecret = process.env.FACEBOOK_APP_SECRET ?? "";
   if (!appId || !appSecret) throw new Error("Facebook app credentials not configured");
 
+  const platformRow = await prisma.platformSettings.findUnique({ where: { id: "global" } }) as PlatformRow;
+  const apiVersion  = platformRow?.metaApiVersion ?? "v25.0";
+
   // 1. Exchange authorisation code for access token
   console.log("[embedded-signup] Exchanging code for token...");
-  const tokenRes = await fetch("https://graph.facebook.com/v25.0/oauth/access_token", {
+  const tokenRes = await fetch(`https://graph.facebook.com/${apiVersion}/oauth/access_token`, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
     body:    JSON.stringify({
@@ -274,7 +293,7 @@ export async function connectWhatsAppEmbeddedSignup(
   // 2. Subscribe the WABA to the app so webhook events are delivered
   console.log("[webhook-sub] Subscribing WABA to webhook fields...");
   const subRes = await fetch(
-    `https://graph.facebook.com/v25.0/${wabaId}/subscribed_apps`,
+    `https://graph.facebook.com/${apiVersion}/${wabaId}/subscribed_apps`,
     { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } }
   );
   const subData = await subRes.json() as any;
@@ -286,7 +305,7 @@ export async function connectWhatsAppEmbeddedSignup(
   // 2b. Subscribe to Coexistence history fields — best-effort, never throws
   try {
     const coexRes = await fetch(
-      `https://graph.facebook.com/v25.0/${wabaId}/subscribed_apps` +
+      `https://graph.facebook.com/${apiVersion}/${wabaId}/subscribed_apps` +
       `?subscribed_fields=messages,message_status_updates,history,smb_message_echoes,smb_app_state_sync`,
       { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } }
     );
@@ -320,7 +339,7 @@ export async function connectWhatsAppEmbeddedSignup(
   try {
     console.log("[history] Calling smb_app_data for phoneNumberId:", phoneNumberId);
     const smbRes = await fetch(
-      `https://graph.facebook.com/v25.0/${phoneNumberId}/smb_app_data`,
+      `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/smb_app_data`,
       {
         method:  "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
@@ -389,14 +408,16 @@ export async function updateHotelProfile(
 export async function getInstagramConfig(hotelId: string) {
   const [config, platform] = await Promise.all([
     prisma.hotelConfig.findUnique({ where: { hotelId } }),
-    prisma.platformSettings.findUnique({ where: { id: "global" } }),
+    prisma.platformSettings.findUnique({ where: { id: "global" } }) as Promise<PlatformRow>,
   ]);
 
   return {
-    igAccountId: config?.instagramBusinessAccountId ?? null,
-    accessToken: config?.instagramAccessTokenEncrypted ? "••••••••••••••••" : null,
-    connected: !!(config?.instagramBusinessAccountId && config?.instagramAccessTokenEncrypted),
-    embedUrl: platform?.instagramEmbedUrl ?? "",
+    igAccountId:    config?.instagramBusinessAccountId ?? null,
+    accessToken:    config?.instagramAccessTokenEncrypted ? "••••••••••••••••" : null,
+    connected:      !!(config?.instagramBusinessAccountId && config?.instagramAccessTokenEncrypted),
+    embedUrl:       platform?.instagramEmbedUrl  ?? "",
+    appId:          platform?.instagramAppId     ?? "",
+    metaApiVersion: platform?.metaApiVersion     ?? "v25.0",
   };
 }
 
@@ -426,20 +447,25 @@ export async function updateInstagramConfig(
 
 // ── Instagram webhook subscription ──────────────────────────────────────────
 
-const META_VERSION = "v25.0";
-
 async function getIgCredentials(hotelId: string) {
-  const config = await prisma.hotelConfig.findUnique({ where: { hotelId } });
+  const [config, platform] = await Promise.all([
+    prisma.hotelConfig.findUnique({ where: { hotelId } }),
+    prisma.platformSettings.findUnique({ where: { id: "global" } }) as Promise<PlatformRow>,
+  ]);
   const accountId = config?.instagramBusinessAccountId;
   const encrypted = config?.instagramAccessTokenEncrypted;
   if (!accountId || !encrypted) throw new Error("Instagram not connected");
-  return { accountId, token: decryptInstagramToken(encrypted) };
+  return {
+    accountId,
+    token:      decryptInstagramToken(encrypted),
+    apiVersion: platform?.metaApiVersion ?? "v25.0",
+  };
 }
 
 export async function getIgSubscriptionStatus(hotelId: string): Promise<{ subscribed: boolean }> {
-  const { accountId, token } = await getIgCredentials(hotelId);
+  const { accountId, token, apiVersion } = await getIgCredentials(hotelId);
   const res = await fetch(
-    `https://graph.facebook.com/${META_VERSION}/${accountId}/subscribed_apps?access_token=${token}`
+    `https://graph.facebook.com/${apiVersion}/${accountId}/subscribed_apps?access_token=${token}`
   );
   const data = await res.json() as any;
   if (!res.ok) throw new Error(data?.error?.message ?? "Failed to check subscription status");
@@ -448,9 +474,9 @@ export async function getIgSubscriptionStatus(hotelId: string): Promise<{ subscr
 }
 
 export async function subscribeIgWebhook(hotelId: string): Promise<{ success: boolean }> {
-  const { accountId, token } = await getIgCredentials(hotelId);
+  const { accountId, token, apiVersion } = await getIgCredentials(hotelId);
   const res = await fetch(
-    `https://graph.facebook.com/${META_VERSION}/${accountId}/subscribed_apps`,
+    `https://graph.facebook.com/${apiVersion}/${accountId}/subscribed_apps`,
     {
       method:  "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -466,9 +492,9 @@ export async function subscribeIgWebhook(hotelId: string): Promise<{ success: bo
 }
 
 export async function unsubscribeIgWebhook(hotelId: string): Promise<{ success: boolean }> {
-  const { accountId, token } = await getIgCredentials(hotelId);
+  const { accountId, token, apiVersion } = await getIgCredentials(hotelId);
   const res = await fetch(
-    `https://graph.facebook.com/${META_VERSION}/${accountId}/subscribed_apps?access_token=${token}`,
+    `https://graph.facebook.com/${apiVersion}/${accountId}/subscribed_apps?access_token=${token}`,
     { method: "DELETE" }
   );
   const data = await res.json() as any;
@@ -487,15 +513,18 @@ export async function getPlatformSettings() {
 }
 
 export async function updatePlatformSettings(data: {
-  instagramEmbedUrl?: string;
+  instagramEmbedUrl?:      string;
   whatsappEmbedSignupUrl?: string;
-  maxStayNightsCeiling?: number;
+  metaApiVersion?:         string;
+  whatsappConfigId?:       string;
+  instagramAppId?:         string;
+  maxStayNightsCeiling?:   number;
 }) {
   return prisma.platformSettings.upsert({
     where:  { id: "global" },
     update: data,
     create: { id: "global", ...data },
-  });
+  }) as unknown as PlatformRow & { updatedAt: Date };
 }
 
 // ── Platform max-stay ceiling (cached, read on every booking) ────────────────

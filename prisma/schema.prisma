@@ -530,6 +530,14 @@ model PlatformSettings {
   id                     String   @id @default("global")
   instagramEmbedUrl      String   @default("")
   whatsappEmbedSignupUrl String   @default("")
+  // Meta API version used for all Graph API calls (e.g. "v25.0"). Superadmin-editable
+  // so we can bump without a code deploy. Defaults to "v25.0".
+  metaApiVersion         String   @default("v25.0")
+  // WhatsApp Embedded Signup config_id (extracted from the signup URL, but can be
+  // set explicitly so hotel users can connect without the full URL being configured).
+  whatsappConfigId       String   @default("")
+  // Instagram / Facebook app_id used in FB.login() for Instagram OAuth.
+  instagramAppId         String   @default("")
   // Platform-wide max-stay ceiling. The live source of truth for the OOM crash
   // cap — no per-hotel maxStayNights (and no superadmin write) may exceed it.
   // Superadmin-editable. HARD_MAX_STAY_NIGHTS (stayDuration.ts) is the in-code

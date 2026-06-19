@@ -2,6 +2,23 @@ import prisma from "../db/connect";
 import { decryptInstagramToken } from "./instagram.service";
 import { logger } from "../utils/logger";
 
+const VERSION_TTL_MS = 300_000;
+let _cachedVersion: { value: string; expiresAt: number } | null = null;
+
+async function getMetaVersion(): Promise<string> {
+  const now = Date.now();
+  if (_cachedVersion && now < _cachedVersion.expiresAt) return _cachedVersion.value;
+  try {
+    const row = await prisma.platformSettings.findUnique({ where: { id: "global" } }) as
+      { metaApiVersion?: string | null } | null;
+    const v = row?.metaApiVersion ?? "v25.0";
+    _cachedVersion = { value: v, expiresAt: now + VERSION_TTL_MS };
+    return v;
+  } catch {
+    return _cachedVersion?.value ?? "v25.0";
+  }
+}
+
 const log = logger.child({ service: "instagram-send" });
 
 async function resolveInstagramCredentials(hotelId:string){
@@ -63,8 +80,9 @@ async function metaPost(
  body:any,
  accessToken:string
 ){
+ const version = await getMetaVersion();
  const res=await fetch(
- `https://graph.facebook.com/v25.0/${igAccountId}/messages`,
+ `https://graph.facebook.com/${version}/${igAccountId}/messages`,
  {
    method:"POST",
    headers:{
