@@ -27,32 +27,42 @@ export interface FacebookPage {
 
 /**
  * Exchange a Facebook-Login-for-Business authorisation `code` (returned by the
- * config_id-based FB.login() popup) for a user access token. Mirrors WhatsApp's
- * embedded-signup exchange (`connectWhatsAppEmbeddedSignup`, settings.service.ts):
- * same `grant_type: "authorization_code"` POST to `/oauth/access_token`.
+ * config_id-based FB.login() popup) for a user access token.
+ *
+ * **redirect_uri is OMITTED for the JS-SDK popup code flow.** Unlike a manual
+ * server-side OAuth dialog (where redirect_uri must exactly match the one used to
+ * obtain the code), `FB.login({ config_id, response_type: "code" })` performs a
+ * popup login with no real redirect — so there is no redirect_uri to match. Sending
+ * a non-empty (or SDK-internal) redirect_uri here makes Meta reject the exchange with
+ * "Error validating verification code… redirect_uri is identical to the one used in
+ * the OAuth dialog request". We therefore only include redirect_uri when a non-empty
+ * one is explicitly provided (e.g. a future manual-redirect flow).
  *
  * Returns the user access token; the caller continues into the existing
  * /me/accounts → instagram_business_account lookup unchanged.
  */
 export async function exchangeInstagramCodeForToken(
   code: string,
-  redirectUri: string,
+  redirectUri = "",
 ): Promise<string> {
   const appId     = process.env.FACEBOOK_APP_ID     ?? "";
   const appSecret = process.env.FACEBOOK_APP_SECRET ?? "";
   if (!appId || !appSecret) throw new Error("Facebook app credentials not configured");
 
   const META_VERSION = await getMetaVersion();
+  const body: Record<string, string> = {
+    client_id:     appId,
+    client_secret: appSecret,
+    grant_type:    "authorization_code",
+    code,
+  };
+  // Only send redirect_uri for a real manual-redirect flow; omit it for SDK popups.
+  if (redirectUri) body.redirect_uri = redirectUri;
+
   const res = await fetch(`https://graph.facebook.com/${META_VERSION}/oauth/access_token`, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify({
-      client_id:     appId,
-      client_secret: appSecret,
-      grant_type:    "authorization_code",
-      redirect_uri:  redirectUri,
-      code,
-    }),
+    body:    JSON.stringify(body),
   });
   const data = await res.json() as any;
   if (!res.ok || !data.access_token) {

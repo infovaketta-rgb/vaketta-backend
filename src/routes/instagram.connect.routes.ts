@@ -35,6 +35,10 @@ async function finishConnect(hId: string, page: { id: string; accessToken: strin
  * makes it long-lived, then runs the existing /me/accounts →
  * instagram_business_account lookup.
  *
+ * `redirectUri` is normally empty/absent for the SDK popup flow — the exchange omits
+ * it in that case (see exchangeInstagramCodeForToken). It is forwarded only if a
+ * non-empty value is sent (a future manual-redirect flow).
+ *
  * - Exactly one qualifying page → connects it immediately and returns
  *   `{ success: true, instagramBusinessAccountId }`.
  * - Multiple pages → returns `{ needsSelection: true, pages, longLivedToken }` so the
