@@ -59,6 +59,13 @@ export async function exchangeInstagramCodeForToken(
   // Only send redirect_uri for a real manual-redirect flow; omit it for SDK popups.
   if (redirectUri) body.redirect_uri = redirectUri;
 
+  // TEMP DIAGNOSTIC (remove after debugging): log exactly what we send to Meta,
+  // redacting secrets. Confirms whether redirect_uri is truly absent on the live path.
+  console.log("[ig-exchange] redirectUri arg:", JSON.stringify(redirectUri),
+    "| redirect_uri in body:", Object.prototype.hasOwnProperty.call(body, "redirect_uri"),
+    "| body keys:", Object.keys(body).join(","),
+    "| code len:", code.length, "| version:", META_VERSION);
+
   const res = await fetch(`https://graph.facebook.com/${META_VERSION}/oauth/access_token`, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
@@ -66,8 +73,11 @@ export async function exchangeInstagramCodeForToken(
   });
   const data = await res.json() as any;
   if (!res.ok || !data.access_token) {
+    // TEMP DIAGNOSTIC: log Meta's raw error so we see the real rejection reason.
+    console.log("[ig-exchange] Meta rejected:", res.status, JSON.stringify(data?.error ?? data));
     throw new Error(data?.error?.message ?? "Failed to exchange code for access token");
   }
+  console.log("[ig-exchange] token exchanged OK");
   return String(data.access_token);
 }
 
