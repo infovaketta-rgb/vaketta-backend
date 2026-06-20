@@ -303,7 +303,7 @@ export async function patchPlatformSettingsHandler(req: Request, res: Response) 
       maxStayNightsCeiling,
       metaApiVersion,
       whatsappConfigId,
-      instagramAppId,
+      instagramConfigId,
     } = req.body;
     const ceilingValid =
       maxStayNightsCeiling !== undefined && Number.isFinite(Number(maxStayNightsCeiling));
@@ -312,7 +312,7 @@ export async function patchPlatformSettingsHandler(req: Request, res: Response) 
       ...(whatsappEmbedSignupUrl !== undefined && { whatsappEmbedSignupUrl: String(whatsappEmbedSignupUrl).trim() }),
       ...(metaApiVersion         !== undefined && { metaApiVersion:         String(metaApiVersion).trim() }),
       ...(whatsappConfigId       !== undefined && { whatsappConfigId:       String(whatsappConfigId).trim() }),
-      ...(instagramAppId         !== undefined && { instagramAppId:         String(instagramAppId).trim() }),
+      ...(instagramConfigId      !== undefined && { instagramConfigId:      String(instagramConfigId).trim() }),
       // Floor at 1, no hard ceiling here — this IS the crash cap. (UI shows a soft
       // warning above 3650.) Existing hotel rows are NOT retroactively re-clamped;
       // a lowered ceiling takes effect on each hotel's next write + at booking time.

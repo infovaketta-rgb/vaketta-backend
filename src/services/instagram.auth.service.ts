@@ -25,6 +25,42 @@ export interface FacebookPage {
   igAccount: { id: string; name: string } | null;
 }
 
+/**
+ * Exchange a Facebook-Login-for-Business authorisation `code` (returned by the
+ * config_id-based FB.login() popup) for a user access token. Mirrors WhatsApp's
+ * embedded-signup exchange (`connectWhatsAppEmbeddedSignup`, settings.service.ts):
+ * same `grant_type: "authorization_code"` POST to `/oauth/access_token`.
+ *
+ * Returns the user access token; the caller continues into the existing
+ * /me/accounts → instagram_business_account lookup unchanged.
+ */
+export async function exchangeInstagramCodeForToken(
+  code: string,
+  redirectUri: string,
+): Promise<string> {
+  const appId     = process.env.FACEBOOK_APP_ID     ?? "";
+  const appSecret = process.env.FACEBOOK_APP_SECRET ?? "";
+  if (!appId || !appSecret) throw new Error("Facebook app credentials not configured");
+
+  const META_VERSION = await getMetaVersion();
+  const res = await fetch(`https://graph.facebook.com/${META_VERSION}/oauth/access_token`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({
+      client_id:     appId,
+      client_secret: appSecret,
+      grant_type:    "authorization_code",
+      redirect_uri:  redirectUri,
+      code,
+    }),
+  });
+  const data = await res.json() as any;
+  if (!res.ok || !data.access_token) {
+    throw new Error(data?.error?.message ?? "Failed to exchange code for access token");
+  }
+  return String(data.access_token);
+}
+
 export async function exchangeForLongLivedToken(shortLivedToken: string): Promise<string> {
   const appId     = process.env.FACEBOOK_APP_ID     ?? "";
   const appSecret = process.env.FACEBOOK_APP_SECRET ?? "";
