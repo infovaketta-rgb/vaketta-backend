@@ -29,14 +29,15 @@ export interface FacebookPage {
  * Exchange a Facebook-Login-for-Business authorisation `code` (returned by the
  * config_id-based FB.login() popup) for a user access token.
  *
- * **redirect_uri is OMITTED for the JS-SDK popup code flow.** Unlike a manual
- * server-side OAuth dialog (where redirect_uri must exactly match the one used to
- * obtain the code), `FB.login({ config_id, response_type: "code" })` performs a
- * popup login with no real redirect — so there is no redirect_uri to match. Sending
- * a non-empty (or SDK-internal) redirect_uri here makes Meta reject the exchange with
- * "Error validating verification code… redirect_uri is identical to the one used in
- * the OAuth dialog request". We therefore only include redirect_uri when a non-empty
- * one is explicitly provided (e.g. a future manual-redirect flow).
+ * **redirect_uri is ALWAYS sent (even when empty) — mirroring WhatsApp's working
+ * embedded-signup exchange.** For the FB JS SDK popup flow there is no real redirect,
+ * so the SDK uses an empty redirect_uri and reports it in `authResponse.redirect_uri`.
+ * Meta requires the exchange's redirect_uri to *match* the one used to mint the code:
+ * a present-but-empty `redirect_uri: ""` matches the popup; OMITTING the key entirely
+ * makes Meta fall back to the app's configured OAuth redirect URI, which does NOT match
+ * the popup's empty one → "Error validating verification code… redirect_uri is
+ * identical" (OAuthException 100 / subcode 36008). So we forward whatever the client
+ * captured and always include the key.
  *
  * Returns the user access token; the caller continues into the existing
  * /me/accounts → instagram_business_account lookup unchanged.
@@ -50,17 +51,17 @@ export async function exchangeInstagramCodeForToken(
   if (!appId || !appSecret) throw new Error("Facebook app credentials not configured");
 
   const META_VERSION = await getMetaVersion();
+  // Always include redirect_uri (present-but-empty matches the SDK popup). Mirrors
+  // connectWhatsAppEmbeddedSignup, which sends redirect_uri and succeeds.
   const body: Record<string, string> = {
     client_id:     appId,
     client_secret: appSecret,
     grant_type:    "authorization_code",
+    redirect_uri:  redirectUri,
     code,
   };
-  // Only send redirect_uri for a real manual-redirect flow; omit it for SDK popups.
-  if (redirectUri) body.redirect_uri = redirectUri;
 
-  // TEMP DIAGNOSTIC (remove after debugging): log exactly what we send to Meta,
-  // redacting secrets. Confirms whether redirect_uri is truly absent on the live path.
+  // TEMP DIAGNOSTIC (remove after debugging): log exactly what we send to Meta.
   console.log("[ig-exchange] redirectUri arg:", JSON.stringify(redirectUri),
     "| redirect_uri in body:", Object.prototype.hasOwnProperty.call(body, "redirect_uri"),
     "| body keys:", Object.keys(body).join(","),
