@@ -46,9 +46,15 @@ export async function exchangeInstagramCodeForToken(
   code: string,
   redirectUri = "",
 ): Promise<string> {
-  const appId     = process.env.FACEBOOK_APP_ID     ?? "";
-  const appSecret = process.env.FACEBOOK_APP_SECRET ?? "";
-  if (!appId || !appSecret) throw new Error("Facebook app credentials not configured");
+  // Use the dedicated Instagram-product app credentials for the exchange (the
+  // config_id is minted under the Instagram product, App ID 850762578056255), not
+  // the main Facebook app id/secret. NOTE: this is a diagnostic attempt — the code
+  // here is minted by FB.login() (the Facebook app), so a Facebook-issued code may
+  // still be rejected by this endpoint when exchanged against a different app's
+  // identity. Falls back to the Facebook app creds if the IG ones aren't set.
+  const appId     = process.env.INSTAGRAM_APP_ID     || process.env.FACEBOOK_APP_ID     || "";
+  const appSecret = process.env.INSTAGRAM_APP_SECRET || process.env.FACEBOOK_APP_SECRET || "";
+  if (!appId || !appSecret) throw new Error("Instagram app credentials not configured");
 
   const META_VERSION = await getMetaVersion();
   // Always include redirect_uri (present-but-empty matches the SDK popup). Mirrors
@@ -62,7 +68,11 @@ export async function exchangeInstagramCodeForToken(
   };
 
   // TEMP DIAGNOSTIC (remove after debugging): log exactly what we send to Meta.
-  console.log("[ig-exchange] redirectUri arg:", JSON.stringify(redirectUri),
+  // App ID is safe to log; the secret is NEVER logged.
+  const usingIgCreds = !!process.env.INSTAGRAM_APP_ID;
+  console.log("[ig-exchange] using appId:", appId,
+    "| creds source:", usingIgCreds ? "INSTAGRAM_APP_*" : "FACEBOOK_APP_*",
+    "| redirectUri arg:", JSON.stringify(redirectUri),
     "| redirect_uri in body:", Object.prototype.hasOwnProperty.call(body, "redirect_uri"),
     "| body keys:", Object.keys(body).join(","),
     "| code len:", code.length, "| version:", META_VERSION);

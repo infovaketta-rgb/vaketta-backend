@@ -33,6 +33,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   process.env.FACEBOOK_APP_ID     = "app-id";
   process.env.FACEBOOK_APP_SECRET = "app-secret";
+  // Default: no Instagram-specific creds → exchange falls back to FACEBOOK_APP_*.
+  delete process.env.INSTAGRAM_APP_ID;
+  delete process.env.INSTAGRAM_APP_SECRET;
 });
 
 afterEach(() => {
@@ -95,5 +98,34 @@ describe("exchangeInstagramCodeForToken — redirect_uri handling", () => {
     await expect(exchangeInstagramCodeForToken("bad-code", "")).rejects.toThrow(
       /Error validating verification code/,
     );
+  });
+});
+
+describe("exchangeInstagramCodeForToken — credential source", () => {
+  it("uses INSTAGRAM_APP_ID / INSTAGRAM_APP_SECRET when set (not the Facebook app creds)", async () => {
+    process.env.INSTAGRAM_APP_ID     = "ig-app-id";
+    process.env.INSTAGRAM_APP_SECRET = "ig-app-secret";
+    const fetchMock = mockFetchOnce(OK_TOKEN);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await exchangeInstagramCodeForToken("auth-code", "");
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    const body = JSON.parse((init as any).body);
+    expect(body.client_id).toBe("ig-app-id");
+    expect(body.client_secret).toBe("ig-app-secret");
+  });
+
+  it("falls back to FACEBOOK_APP_* when Instagram creds are absent", async () => {
+    // (INSTAGRAM_APP_* are deleted in beforeEach)
+    const fetchMock = mockFetchOnce(OK_TOKEN);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await exchangeInstagramCodeForToken("auth-code", "");
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    const body = JSON.parse((init as any).body);
+    expect(body.client_id).toBe("app-id");
+    expect(body.client_secret).toBe("app-secret");
   });
 });
