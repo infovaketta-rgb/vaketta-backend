@@ -14,7 +14,6 @@ import { HARD_MAX_STAY_NIGHTS, clampMaxStayNights } from "../automation/stayDura
 // and avoids TS errors when the generated client cache is stale after a migration.
 type PlatformRow = {
   id:                    string;
-  instagramEmbedUrl:     string;
   whatsappEmbedSignupUrl:string;
   metaApiVersion:        string;
   whatsappConfigId:      string;
@@ -415,12 +414,7 @@ export async function getInstagramConfig(hotelId: string) {
     igAccountId:    config?.instagramBusinessAccountId ?? null,
     accessToken:    config?.instagramAccessTokenEncrypted ? "••••••••••••••••" : null,
     connected:      !!(config?.instagramBusinessAccountId && config?.instagramAccessTokenEncrypted),
-    embedUrl:       platform?.instagramEmbedUrl  ?? "",
-    // config_id for the Facebook-Login-for-Business "Instagram onboarding" flow.
-    // Empty when unset — the frontend must surface a clear error, not call FB.login()
-    // with an undefined config_id (there is no agreed fallback constant for Instagram).
-    configId:       platform?.instagramConfigId  ?? "",
-    metaApiVersion: platform?.metaApiVersion     ?? "v25.0",
+    metaApiVersion: platform?.metaApiVersion ?? "v25.0",
   };
 }
 
@@ -516,11 +510,9 @@ export async function getPlatformSettings() {
 }
 
 export async function updatePlatformSettings(data: {
-  instagramEmbedUrl?:      string;
   whatsappEmbedSignupUrl?: string;
   metaApiVersion?:         string;
   whatsappConfigId?:       string;
-  instagramConfigId?:      string;
   maxStayNightsCeiling?:   number;
 }) {
   return prisma.platformSettings.upsert({
