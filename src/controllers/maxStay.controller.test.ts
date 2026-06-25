@@ -30,7 +30,6 @@ vi.mock("../services/settings.service", () => ({
   getWhatsAppConfig: vi.fn(), updateWhatsAppConfig: vi.fn(),
   testWhatsAppConnection: vi.fn(), connectWhatsAppEmbeddedSignup: vi.fn(),
   getInstagramConfig: vi.fn(), updateInstagramConfig: vi.fn(),
-  getIgSubscriptionStatus: vi.fn(), subscribeIgWebhook: vi.fn(), unsubscribeIgWebhook: vi.fn(),
   getPlatformSettings: vi.fn(), updatePlatformSettings: vi.fn(),
 }));
 vi.mock("../services/ai.service", () => ({ invalidatePromptCache: vi.fn() }));

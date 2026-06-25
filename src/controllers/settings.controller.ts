@@ -15,9 +15,6 @@ import {
   connectWhatsAppEmbeddedSignup,
   getInstagramConfig,
   updateInstagramConfig,
-  getIgSubscriptionStatus,
-  subscribeIgWebhook,
-  unsubscribeIgWebhook,
   getPlatformSettings,
   updatePlatformSettings,
   invalidateHotelConfigCache,
@@ -243,34 +240,6 @@ export async function patchInstagramHandler(req: Request, res: Response) {
   }
 }
 
-// ── Instagram webhook subscription ───────────────────────────────────────────
-
-export async function getIgSubscriptionStatusHandler(req: Request, res: Response) {
-  try {
-    res.json(await getIgSubscriptionStatus(hotelId(req)));
-  } catch (err: any) {
-    const status = err.message === "Instagram not connected" ? 400 : 500;
-    res.status(status).json({ error: err.message });
-  }
-}
-
-export async function subscribeIgWebhookHandler(req: Request, res: Response) {
-  try {
-    res.json(await subscribeIgWebhook(hotelId(req)));
-  } catch (err: any) {
-    const status = err.message === "Instagram not connected" ? 400 : 502;
-    res.status(status).json({ error: err.message });
-  }
-}
-
-export async function unsubscribeIgWebhookHandler(req: Request, res: Response) {
-  try {
-    res.json(await unsubscribeIgWebhook(hotelId(req)));
-  } catch (err: any) {
-    const status = err.message === "Instagram not connected" ? 400 : 502;
-    res.status(status).json({ error: err.message });
-  }
-}
 
 // ── Danger Zone ───────────────────────────────────────────────────────────────
 

@@ -20,9 +20,6 @@ import {
   embeddedSignupHandler,
   getInstagramHandler,
   patchInstagramHandler,
-  getIgSubscriptionStatusHandler,
-  subscribeIgWebhookHandler,
-  unsubscribeIgWebhookHandler,
   deleteAllChatsHandler,
 } from "../controllers/settings.controller";
 import {
@@ -58,9 +55,6 @@ router.post("/whatsapp/embedded-signup",  embeddedSignupHandler);
 
 router.get("/instagram",                       getInstagramHandler);
 router.patch("/instagram",                     patchInstagramHandler);
-router.get("/instagram/subscribe/status",      getIgSubscriptionStatusHandler);
-router.post("/instagram/subscribe",            subscribeIgWebhookHandler);
-router.delete("/instagram/subscribe",          unsubscribeIgWebhookHandler);
 
 // Billing / subscription (hotel-side, JWT-protected via auth middleware in app.ts)
 router.get("/billing/subscription", getSubscription);

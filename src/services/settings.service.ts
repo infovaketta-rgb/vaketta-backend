@@ -3,7 +3,6 @@ import { redis } from "../queue/redis";
 import { logger } from "../utils/logger";
 import {
   encryptInstagramToken,
-  decryptInstagramToken,
   encryptWhatsAppToken,
   decryptWhatsAppToken,
 } from "../utils/encryption.utils";
@@ -442,62 +441,12 @@ export async function updateInstagramConfig(
   return getInstagramConfig(hotelId);
 }
 
-// ── Instagram webhook subscription ──────────────────────────────────────────
-
-async function getIgCredentials(hotelId: string) {
-  const [config, platform] = await Promise.all([
-    prisma.hotelConfig.findUnique({ where: { hotelId } }),
-    prisma.platformSettings.findUnique({ where: { id: "global" } }) as Promise<PlatformRow>,
-  ]);
-  const accountId = config?.instagramBusinessAccountId;
-  const encrypted = config?.instagramAccessTokenEncrypted;
-  if (!accountId || !encrypted) throw new Error("Instagram not connected");
-  return {
-    accountId,
-    token:      decryptInstagramToken(encrypted),
-    apiVersion: platform?.metaApiVersion ?? "v25.0",
-  };
-}
-
-export async function getIgSubscriptionStatus(hotelId: string): Promise<{ subscribed: boolean }> {
-  const { accountId, token, apiVersion } = await getIgCredentials(hotelId);
-  const res = await fetch(
-    `https://graph.facebook.com/${apiVersion}/${accountId}/subscribed_apps?access_token=${token}`
-  );
-  const data = await res.json() as any;
-  if (!res.ok) throw new Error(data?.error?.message ?? "Failed to check subscription status");
-  const subscribed = Array.isArray(data.data) && data.data.length > 0;
-  return { subscribed };
-}
-
-export async function subscribeIgWebhook(hotelId: string): Promise<{ success: boolean }> {
-  const { accountId, token, apiVersion } = await getIgCredentials(hotelId);
-  const res = await fetch(
-    `https://graph.facebook.com/${apiVersion}/${accountId}/subscribed_apps`,
-    {
-      method:  "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body:    new URLSearchParams({
-        subscribed_fields: "messages,messaging_postbacks",
-        access_token:      token,
-      }),
-    }
-  );
-  const data = await res.json() as any;
-  if (!res.ok) throw new Error(data?.error?.message ?? "Failed to subscribe");
-  return { success: true };
-}
-
-export async function unsubscribeIgWebhook(hotelId: string): Promise<{ success: boolean }> {
-  const { accountId, token, apiVersion } = await getIgCredentials(hotelId);
-  const res = await fetch(
-    `https://graph.facebook.com/${apiVersion}/${accountId}/subscribed_apps?access_token=${token}`,
-    { method: "DELETE" }
-  );
-  const data = await res.json() as any;
-  if (!res.ok) throw new Error(data?.error?.message ?? "Failed to unsubscribe");
-  return { success: true };
-}
+// NOTE: Instagram webhook subscription is automatic at connect time —
+// `subscribePageToWebhook` (instagram.auth.service.ts) is called from `finishConnect`
+// in instagram.connect.routes.ts, hitting the correct `/{pageId}/subscribed_apps`
+// Page-node endpoint. The old manual `subscribeIgWebhook`/`getIgSubscriptionStatus`/
+// `unsubscribeIgWebhook` functions (which wrongly used the IG-account node and caused
+// the `(#3) Application does not have the capability` error) were removed.
 
 // ── Platform settings (admin-level) ─────────────────────────────────────────
 
