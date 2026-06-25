@@ -82,30 +82,37 @@ export function verifyWebhookSignature(
         expectedBuffer
       )
     ){
-      // TEMP DIAGNOSTIC (remove after debugging recurring "Invalid signature").
-      // Identifies the SOURCE of each failed request (path, UA, IP) and confirms
-      // which secret env var was used — values are NEVER logged, only the
-      // first/last few hex chars of each signature so we can eyeball a mismatch.
+      // TEMP DIAGNOSTIC — remove once signature mismatch is resolved.
       const recvPreview =
         signature.length > 20
           ? `${signature.slice(0, 14)}…${signature.slice(-6)}`
           : signature;
       const expPreview = `${expected.slice(0, 14)}…${expected.slice(-6)}`;
+      // First 32 + last 16 bytes of raw body as hex — enough to see if body is
+      // compressed, double-encoded, or truncated without logging sensitive content.
+      const bodyHead = rawBody.subarray(0, 32).toString("hex");
+      const bodyTail = rawBody.subarray(-16).toString("hex");
+      const bodyStr  = rawBody.toString("utf8", 0, 48); // first 48 chars as text
       console.warn(
         "[Webhook] Invalid signature",
         JSON.stringify({
-          path:        req.originalUrl,
-          method:      req.method,
-          userAgent:   req.get("user-agent") ?? "(none)",
-          ip:          req.ip,
+          path:          req.originalUrl,
+          method:        req.method,
+          userAgent:     req.get("user-agent") ?? "(none)",
+          ip:            req.ip,
           xForwardedFor: req.get("x-forwarded-for") ?? "(none)",
-          secretEnv:       secretEnvName,       // which env var — NOT the value
-          secretLen:       secret.length,      // trimmed length
-          secretLenRaw:    appSecret.length,   // pre-trim (diff = trailing whitespace)
-          rawBodyLen:  rawBody.length,
-          received:    recvPreview,
-          computed:    expPreview,
-          lenMatch:    sigBuffer.length === expectedBuffer.length,
+          contentType:   req.get("content-type") ?? "(none)",
+          contentEncoding: req.get("content-encoding") ?? "(none)",
+          secretEnv:     secretEnvName,
+          secretLen:     secret.length,
+          secretLenRaw:  appSecret.length,
+          rawBodyLen:    rawBody.length,
+          bodyHead,      // first 32 bytes as hex
+          bodyTail,      // last 16 bytes as hex
+          bodyStr,       // first 48 chars as text (shows if body is readable JSON or garbled)
+          received:      recvPreview,
+          computed:      expPreview,
+          lenMatch:      sigBuffer.length === expectedBuffer.length,
         })
       );
 
