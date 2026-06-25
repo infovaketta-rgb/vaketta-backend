@@ -12,8 +12,10 @@ export function verifyWebhookSignature(
   appSecret:string,
   secretEnvName = "FACEBOOK_APP_SECRET"
 ){
+  // Trim in case env var was copy-pasted with trailing whitespace/newline in Render dashboard
+  const secret = appSecret.trim();
 
-  if(!appSecret){
+  if(!secret){
     throw new Error(
       "Webhook app secret missing"
     );
@@ -56,7 +58,7 @@ export function verifyWebhookSignature(
       crypto
        .createHmac(
          "sha256",
-         appSecret
+         secret
        )
        .update(rawBody)
        .digest("hex");
@@ -97,8 +99,9 @@ export function verifyWebhookSignature(
           userAgent:   req.get("user-agent") ?? "(none)",
           ip:          req.ip,
           xForwardedFor: req.get("x-forwarded-for") ?? "(none)",
-          secretEnv:   secretEnvName,        // which env var — NOT the value
-          secretLen:   appSecret.length,     // length only
+          secretEnv:       secretEnvName,       // which env var — NOT the value
+          secretLen:       secret.length,      // trimmed length
+          secretLenRaw:    appSecret.length,   // pre-trim (diff = trailing whitespace)
           rawBodyLen:  rawBody.length,
           received:    recvPreview,
           computed:    expPreview,

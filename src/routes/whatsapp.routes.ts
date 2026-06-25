@@ -38,7 +38,7 @@ router.post(
   },
 
   verifyWebhookSignature(
-    process.env.FACEBOOK_APP_SECRET!,
+    process.env.FACEBOOK_APP_SECRET!.trim(),
     "FACEBOOK_APP_SECRET"
   ),
 

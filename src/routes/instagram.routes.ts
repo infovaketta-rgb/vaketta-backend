@@ -24,7 +24,7 @@ router.get(
  * Signature verification is enforced when FACEBOOK_APP_SECRET is set;
  * if missing, the request is accepted but a warning is logged.
  */
-const instagramAppSecret = process.env.FACEBOOK_APP_SECRET;
+const instagramAppSecret = process.env.FACEBOOK_APP_SECRET?.trim();
 
 if (!instagramAppSecret) {
   logger.warn(
@@ -38,15 +38,9 @@ router.post(
 
   express.raw({ type: "application/json", limit: "1mb" }),
 
-  // Parse raw body → JSON, keep rawBody for signature check
-  (req: any, res: any, next: any) => {
+  // Save raw buffer BEFORE any parsing — HMAC must run on the exact bytes Meta sent.
+  (req: any, _res: any, next: any) => {
     req.rawBody = req.body;
-    try {
-      req.body = JSON.parse(req.body.toString());
-    } catch {
-      logger.warn("[Instagram] Invalid JSON payload — ACKing to prevent Meta retries");
-      return res.sendStatus(200);
-    }
     next();
   },
 
@@ -54,6 +48,18 @@ router.post(
   (req: any, res: any, next: any) => {
     if (!instagramAppSecret) return next();
     return verifyWebhookSignature(instagramAppSecret, "FACEBOOK_APP_SECRET")(req, res, next);
+  },
+
+  // Parse JSON after signature is confirmed. ACK Meta on malformed payloads
+  // so it does not retry — malformed but signed bodies are Meta bugs, not ours.
+  (req: any, res: any, next: any) => {
+    try {
+      req.body = JSON.parse(req.rawBody.toString());
+    } catch {
+      logger.warn("[Instagram] Signed but invalid JSON payload — ACKing to stop retries");
+      return res.sendStatus(200);
+    }
+    next();
   },
 
   handleInstagramWebhook
