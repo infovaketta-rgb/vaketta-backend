@@ -53,7 +53,7 @@ router.post(
   // Signature verification — skip only when secret is not configured (dev/unconfigured)
   (req: any, res: any, next: any) => {
     if (!instagramAppSecret) return next();
-    return verifyWebhookSignature(instagramAppSecret)(req, res, next);
+    return verifyWebhookSignature(instagramAppSecret, "FACEBOOK_APP_SECRET")(req, res, next);
   },
 
   handleInstagramWebhook

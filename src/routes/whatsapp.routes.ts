@@ -38,7 +38,8 @@ router.post(
   },
 
   verifyWebhookSignature(
-    process.env.FACEBOOK_APP_SECRET!
+    process.env.FACEBOOK_APP_SECRET!,
+    "FACEBOOK_APP_SECRET"
   ),
 
   // Parse JSON after signature is confirmed. ACK Meta on malformed payloads
