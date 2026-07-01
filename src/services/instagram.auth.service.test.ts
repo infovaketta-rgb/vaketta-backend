@@ -69,7 +69,7 @@ describe("exchangeInstagramCode", () => {
     expect(result).toEqual({ accessToken: "short-token", userId: "12345678" });
 
     // Confirm POSTed to the correct endpoint
-    const [url, opts] = mockFetch.mock.calls[0];
+    const [url, opts] = mockFetch.mock.calls[0]!;
     expect(url).toBe("https://api.instagram.com/oauth/access_token");
     expect((opts as RequestInit).method).toBe("POST");
     const body = new URLSearchParams((opts as RequestInit).body as string);
@@ -111,7 +111,7 @@ describe("getInstagramAccountInfo", () => {
 
     expect(result).toEqual({ id: "17841400123456789", username: "maadathilresort" });
 
-    const [url] = mockFetch.mock.calls[0];
+    const [url] = mockFetch.mock.calls[0]!;
     const parsed = new URL(url as string);
     expect(parsed.hostname).toBe("graph.instagram.com");
     expect(parsed.pathname).toBe("/me");
@@ -132,7 +132,7 @@ describe("subscribeInstagramWebhook", () => {
 
     await subscribeInstagramWebhook("17841400123456789", "short-token");
 
-    const [url, opts] = mockFetch.mock.calls[0];
+    const [url, opts] = mockFetch.mock.calls[0]!;
     const parsed = new URL(url as string);
     expect(parsed.hostname).toBe("graph.instagram.com");
     expect(parsed.pathname).toContain("17841400123456789");
