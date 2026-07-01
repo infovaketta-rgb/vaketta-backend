@@ -21,14 +21,14 @@ router.get(
 
 /**
  * Incoming Instagram webhook events — always registered.
- * Signature verification is enforced when FACEBOOK_APP_SECRET is set;
- * if missing, the request is accepted but a warning is logged.
+ * Business Login for Instagram: Meta signs deliveries with INSTAGRAM_APP_SECRET,
+ * not FACEBOOK_APP_SECRET. Verification is enforced when the secret is set.
  */
-const instagramAppSecret = process.env.FACEBOOK_APP_SECRET?.trim();
+const instagramAppSecret = process.env.INSTAGRAM_APP_SECRET?.trim();
 
 if (!instagramAppSecret) {
   logger.warn(
-    "FACEBOOK_APP_SECRET not set — Instagram webhook signature verification is DISABLED. " +
+    "INSTAGRAM_APP_SECRET not set — Instagram webhook signature verification is DISABLED. " +
     "Set the env var in production to secure the endpoint."
   );
 }
@@ -47,7 +47,7 @@ router.post(
   // Signature verification — skip only when secret is not configured (dev/unconfigured)
   (req: any, res: any, next: any) => {
     if (!instagramAppSecret) return next();
-    return verifyWebhookSignature(instagramAppSecret, "FACEBOOK_APP_SECRET")(req, res, next);
+    return verifyWebhookSignature(instagramAppSecret, "INSTAGRAM_APP_SECRET")(req, res, next);
   },
 
   // Parse JSON after signature is confirmed. ACK Meta on malformed payloads
