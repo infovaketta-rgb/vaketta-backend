@@ -271,6 +271,7 @@ export async function patchPlatformSettingsHandler(req: Request, res: Response) 
       maxStayNightsCeiling,
       metaApiVersion,
       whatsappConfigId,
+      instagramEmbedUrl,
     } = req.body;
     const ceilingValid =
       maxStayNightsCeiling !== undefined && Number.isFinite(Number(maxStayNightsCeiling));
@@ -278,6 +279,7 @@ export async function patchPlatformSettingsHandler(req: Request, res: Response) 
       ...(whatsappEmbedSignupUrl !== undefined && { whatsappEmbedSignupUrl: String(whatsappEmbedSignupUrl).trim() }),
       ...(metaApiVersion         !== undefined && { metaApiVersion:         String(metaApiVersion).trim() }),
       ...(whatsappConfigId       !== undefined && { whatsappConfigId:       String(whatsappConfigId).trim() }),
+      ...(instagramEmbedUrl      !== undefined && { instagramEmbedUrl:      String(instagramEmbedUrl).trim() }),
       // Floor at 1, no hard ceiling here — this IS the crash cap. (UI shows a soft
       // warning above 3650.) Existing hotel rows are NOT retroactively re-clamped;
       // a lowered ceiling takes effect on each hotel's next write + at booking time.
@@ -286,7 +288,9 @@ export async function patchPlatformSettingsHandler(req: Request, res: Response) 
     if (ceilingValid) invalidatePlatformCeilingCache();
     res.json(result);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    // Validation errors from updatePlatformSettings are user-facing (400), not 500
+    const status = err.message?.startsWith("Invalid Instagram Embed URL") ? 400 : 500;
+    res.status(status).json({ error: err.message });
   }
 }
 

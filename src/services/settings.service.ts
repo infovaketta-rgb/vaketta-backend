@@ -17,6 +17,7 @@ type PlatformRow = {
   metaApiVersion:        string;
   whatsappConfigId:      string;
   instagramConfigId:     string;
+  instagramEmbedUrl:     string;
   maxStayNightsCeiling:  number;
   updatedAt:             Date;
 } | null;
@@ -403,17 +404,60 @@ export async function updateHotelProfile(
 
 // ── Instagram ────────────────────────────────────────────────────────────────
 
+const IG_SCOPE       = "instagram_business_basic,instagram_business_manage_messages";
+const IG_REDIRECT_URI = "https://vaketta.com/dashboard/configuration";
+
+/**
+ * Validate a candidate instagramEmbedUrl:
+ *   - well-formed URL
+ *   - host is www.instagram.com
+ *   - path is /oauth/authorize
+ *   - has client_id, redirect_uri, response_type=code, scope query params
+ * Returns null if valid, an error string if not.
+ */
+export function validateInstagramEmbedUrl(raw: string): string | null {
+  let url: URL;
+  try { url = new URL(raw); } catch { return "Not a valid URL"; }
+  if (url.hostname !== "www.instagram.com") return "Host must be www.instagram.com";
+  if (url.pathname !== "/oauth/authorize")   return "Path must be /oauth/authorize";
+  if (!url.searchParams.get("client_id"))    return "Missing client_id parameter";
+  if (!url.searchParams.get("redirect_uri")) return "Missing redirect_uri parameter";
+  if (url.searchParams.get("response_type") !== "code") return "response_type must be 'code'";
+  if (!url.searchParams.get("scope"))        return "Missing scope parameter";
+  return null;
+}
+
+/**
+ * Build the correct Instagram authorize URL from server-side env/constants.
+ * Used as the default when no valid saved override exists.
+ */
+function buildDefaultInstagramEmbedUrl(): string {
+  const appId = process.env.INSTAGRAM_APP_ID ?? "";
+  const url   = new URL("https://www.instagram.com/oauth/authorize");
+  url.searchParams.set("client_id",     appId);
+  url.searchParams.set("redirect_uri",  IG_REDIRECT_URI);
+  url.searchParams.set("scope",         IG_SCOPE);
+  url.searchParams.set("response_type", "code");
+  return url.toString();
+}
+
 export async function getInstagramConfig(hotelId: string) {
   const [config, platform] = await Promise.all([
     prisma.hotelConfig.findUnique({ where: { hotelId } }),
     prisma.platformSettings.findUnique({ where: { id: "global" } }) as Promise<PlatformRow>,
   ]);
 
+  const saved = platform?.instagramEmbedUrl?.trim() ?? "";
+  const instagramEmbedUrl = (saved && validateInstagramEmbedUrl(saved) === null)
+    ? saved
+    : buildDefaultInstagramEmbedUrl();
+
   return {
-    igAccountId:    config?.instagramBusinessAccountId ?? null,
-    accessToken:    config?.instagramAccessTokenEncrypted ? "••••••••••••••••" : null,
-    connected:      !!(config?.instagramBusinessAccountId && config?.instagramAccessTokenEncrypted),
-    metaApiVersion: platform?.metaApiVersion ?? "v25.0",
+    igAccountId:       config?.instagramBusinessAccountId ?? null,
+    accessToken:       config?.instagramAccessTokenEncrypted ? "••••••••••••••••" : null,
+    connected:         !!(config?.instagramBusinessAccountId && config?.instagramAccessTokenEncrypted),
+    metaApiVersion:    platform?.metaApiVersion ?? "v25.0",
+    instagramEmbedUrl,
   };
 }
 
@@ -463,7 +507,13 @@ export async function updatePlatformSettings(data: {
   metaApiVersion?:         string;
   whatsappConfigId?:       string;
   maxStayNightsCeiling?:   number;
+  instagramEmbedUrl?:      string;
 }) {
+  // Validate instagramEmbedUrl if provided and non-empty
+  if (data.instagramEmbedUrl !== undefined && data.instagramEmbedUrl !== "") {
+    const err = validateInstagramEmbedUrl(data.instagramEmbedUrl);
+    if (err) throw new Error(`Invalid Instagram Embed URL: ${err}`);
+  }
   return prisma.platformSettings.upsert({
     where:  { id: "global" },
     update: data,
