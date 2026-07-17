@@ -1,14 +1,15 @@
 # Dependencies
 node_modules
 
-# Build output
+# Build output / caches
 dist
 .next
+coverage
+*.tsbuildinfo
 
-# Environment files
+# Environment files — never ship secrets in the image or build context
 .env
 .env.*
-!.env.example
 
 # Git
 .git
@@ -18,7 +19,14 @@ dist
 *.log
 npm-debug.log*
 
+# Tests — not needed at runtime; excluding shrinks the build context and keeps
+# the builder stage from compiling them into dist/
+src/**/*.test.ts
+src/**/*.spec.ts
+vitest.config.ts
 
+# Orchestration files — not needed inside the image
+docker-compose*.yml
 
 # Editor files
 .vscode
@@ -28,6 +36,5 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
-# Documentation (optional)
-README.md
+# Documentation — never copied into the image
 *.md

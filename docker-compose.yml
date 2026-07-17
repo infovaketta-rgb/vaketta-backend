@@ -10,8 +10,15 @@
 # Only the app port is published to the host — put a reverse proxy (nginx/Caddy)
 # in front for TLS. Redis stays on the internal network, never exposed.
 #
-# Secrets: provide them via a .env file next to this compose file (chmod 600) or
-# your orchestrator's secret store. Never bake secrets into the image.
+# Secrets: .env.production is the ONLY production env file on the VPS. Both
+# services load it via `env_file:` and read REDIS_PASSWORD from it at container
+# runtime — there is no second .env file and no Compose ${VAR} substitution:
+#   • redis  runs docker/redis-entrypoint.sh, which execs
+#            `redis-server --requirepass "$REDIS_PASSWORD"`
+#   • app    runs docker-entrypoint.sh, which derives
+#            REDIS_URL=redis://:$REDIS_PASSWORD@redis:6379 before starting node,
+#            overriding the external REDIS_URL that's also in .env.production
+#            (that value is for non-compose environments, e.g. Render).
 
 services:
   app:
@@ -24,35 +31,60 @@ services:
     environment:
       NODE_ENV: production
       PORT: "5000"
-      # Redis reachable on the internal compose network by service name.
-      REDIS_URL: redis://redis:6379
       # V8 heap cap — raise on a larger VPS.
       NODE_MAX_OLD_SPACE_MB: "400"
+      # REDIS_URL is intentionally NOT set here. docker-entrypoint.sh derives it
+      # from REDIS_PASSWORD (already in .env.production, loaded via env_file
+      # above) at container start, pointing at the compose-local `redis` service
+      # and overriding the external REDIS_URL that's also in .env.production.
     ports:
       - "5000:5000"          # host:container — front this with nginx/Caddy for TLS
     depends_on:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5000/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:5000/ready"]
       interval: 30s
       timeout: 5s
       start_period: 20s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     networks:
       - vaketta
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    env_file:
+      - .env.production
+    # Reads REDIS_PASSWORD from the container's own env (injected by env_file
+    # above) at runtime — see docker/redis-entrypoint.sh. Requiring auth matters
+    # even on an internal compose network: it's defense-in-depth if the network
+    # is ever misconfigured or another container joins it.
+    # Invoked via `sh` explicitly (not relying on the script's exec bit) — bind
+    # mounts from a Windows host don't reliably preserve +x permissions.
+    entrypoint: ["sh", "/redis-entrypoint.sh"]
     volumes:
       - redis-data:/data
+      - ./docker/redis-entrypoint.sh:/redis-entrypoint.sh:ro
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # $$ escapes Compose's own ${VAR} substitution pass (which runs over every
+      # string in this file, including CMD-SHELL strings, and would otherwise
+      # silently blank this out since there's no top-level .env). The container's
+      # shell sees a single $ and expands REDIS_PASSWORD from its own env.
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping"]
       interval: 10s
       timeout: 3s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     networks:
       - vaketta
     # No `ports:` — internal only. Do not expose Redis to the host/internet.
