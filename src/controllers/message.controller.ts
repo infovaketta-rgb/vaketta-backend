@@ -235,8 +235,8 @@ export async function undoSend(req: Request, res: Response) {
     });
     if (!msg) return res.status(404).json({ error: "Message not found" });
 
-    // Cancel the in-memory timer first (no-op if it already fired).
-    cancelPendingSend(messageId);
+    // Remove the delayed BullMQ job first (no-op if it already fired).
+    await cancelPendingSend(messageId);
 
     // Atomic guard: only delete while still PENDING. If the timer already
     // claimed the row (set status → SENT), deleteMany returns count=0 and

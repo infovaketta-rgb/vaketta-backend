@@ -12,8 +12,6 @@ node_modules/
 dist/
 .next/
 
-# Uploads (user files)
-uploads/
 
 # Logs
 *.log
@@ -22,5 +20,15 @@ uploads/
 .DS_Store
 Thumbs.db
 
-# Claude Code
-CLAUDE.md
+# Claude Code / docs — keep Markdown local, never commit
+*.md
+
+# Docker
+docker-compose.override.yml
+
+# IDE
+.vscode/
+.idea/
+
+# npm
+npm-debug.log*

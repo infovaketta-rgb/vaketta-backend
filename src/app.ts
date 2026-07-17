@@ -181,7 +181,11 @@ app.use("/public", publicRouter);
 // ── Admin leads ───────────────────────────────────────────────────────────────
 app.use("/admin/leads", adminLeadRouter);
 
-// ── Health check ──────────────────────────────────────────────────────────────
+// ── Liveness (/health) ──────────────────────────────────────────────────────────
+// Always 200 while the process is responsive. Includes dependency status fields
+// for observability, but never fails the probe on a dependency blip — a liveness
+// failure tells the orchestrator to RESTART the container, which a transient DB /
+// Redis hiccup should not trigger. Backwards-compatible with the previous shape.
 app.get("/health", async (_req, res) => {
   const [dbResult, redisResult] = await Promise.allSettled([
     prisma.$queryRaw`SELECT 1`,
@@ -194,6 +198,28 @@ app.get("/health", async (_req, res) => {
     db:      dbOk,
     redis:   redisOk,
     uptime:  process.uptime(),
+    service: "vaketta-backend",
+    time:    new Date().toISOString(),
+  });
+});
+
+// ── Readiness (/ready) ──────────────────────────────────────────────────────────
+// 200 only when the app can actually serve traffic (DB + Redis reachable), else
+// 503 so the orchestrator / load balancer stops routing requests to this instance
+// without restarting it. This is the probe to wire into Docker/compose depends_on
+// health gating and any reverse-proxy upstream check.
+app.get("/ready", async (_req, res) => {
+  const [dbResult, redisResult] = await Promise.allSettled([
+    prisma.$queryRaw`SELECT 1`,
+    redis.ping(),
+  ]);
+  const dbOk    = dbResult.status    === "fulfilled";
+  const redisOk = redisResult.status === "fulfilled";
+  const ready   = dbOk && redisOk;
+  res.status(ready ? 200 : 503).json({
+    status:  ready ? "ready" : "not-ready",
+    db:      dbOk,
+    redis:   redisOk,
     service: "vaketta-backend",
     time:    new Date().toISOString(),
   });

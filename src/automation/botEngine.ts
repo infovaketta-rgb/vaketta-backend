@@ -36,7 +36,8 @@ export { isZeroExempt } from "./zeroExempt";
 export async function processMessage(
   hotelId: string,
   guestId: string,
-  body: string | null
+  body: string | null,
+  channel: MessageChannel = MessageChannel.WHATSAPP
 ): Promise<string | null> {
   const input = (body ?? "").trim();
   const upper = input.toUpperCase();
@@ -57,18 +58,18 @@ export async function processMessage(
   const zeroBlocked = upper === "0" && isZeroExempt(session.state, data);
   if (RESET_KEYWORDS.has(upper) && !["IDLE", "AWAITING_SELECTION"].includes(session.state) && !zeroBlocked) {
     await resetSession(guestId, hotelId);
-    return showMenu(hotelId, guestId, {}, input);
+    return showMenu(hotelId, guestId, {}, input, channel);
   }
 
   // Delegate to flow runtime when inside a visual flow
   if (session.state.startsWith("FLOW:")) {
-    return executeFlowStep(hotelId, guestId, session.state, data, input);
+    return executeFlowStep(hotelId, guestId, session.state, data, input, channel);
   }
 
   switch (session.state) {
     case "IDLE":
     case "AWAITING_SELECTION":
-      return handleSelection(hotelId, guestId, input, session.state === "IDLE", data);
+      return handleSelection(hotelId, guestId, input, session.state === "IDLE", data, channel);
 
     case "ENQUIRY_OPEN":
       // Staff handles this; bot stays silent
@@ -77,7 +78,7 @@ export async function processMessage(
     default:
       // Unknown state — reset and show menu
       await resetSession(guestId, hotelId);
-      return showMenu(hotelId, guestId, {}, input);
+      return showMenu(hotelId, guestId, {}, input, channel);
   }
 }
 
@@ -89,7 +90,8 @@ async function showMenu(
   hotelId: string,
   guestId: string,
   sessionData: SessionData,
-  input: string
+  input: string,
+  channel: MessageChannel = MessageChannel.WHATSAPP
 ): Promise<string | null> {
   const cfg = await getHotelConfigCached(hotelId);
   const menuFlowId = (cfg as any)?.menuFlowId as string | null | undefined;
@@ -102,7 +104,7 @@ async function showMenu(
       const initState = `FLOW:${flow.id}:${startNode.id}`;
       const initData: SessionData = { flow: { flowId: flow.id, flowVars: {} } };
       await updateSession(guestId, hotelId, initState, initData);
-      return executeFlowStep(hotelId, guestId, initState, initData, input);
+      return executeFlowStep(hotelId, guestId, initState, initData, input, channel);
     }
   }
 
@@ -160,7 +162,8 @@ async function handleSelection(
   guestId: string,
   input: string,
   isFirstContact = false,
-  sessionData: SessionData = {}
+  sessionData: SessionData = {},
+  channel: MessageChannel = MessageChannel.WHATSAPP
 ): Promise<string | null> {
   const upper = input.toUpperCase();
 
@@ -171,7 +174,7 @@ async function handleSelection(
   if (!item) {
     // First contact or reset keyword → show menu (flow-driven or hardcoded)
     if (!input || isFirstContact || RESET_KEYWORDS.has(upper)) {
-      return showMenu(hotelId, guestId, sessionData, input);
+      return showMenu(hotelId, guestId, sessionData, input, channel);
     }
 
     // Unknown input — try AI fallback if enabled
@@ -196,7 +199,7 @@ async function handleSelection(
       await updateSession(guestId, hotelId, "AWAITING_SELECTION", {});
       return `Sorry, that option isn't recognised.\n\n${menu}`;
     }
-    return showMenu(hotelId, guestId, sessionData, input);
+    return showMenu(hotelId, guestId, sessionData, input, channel);
   }
 
   const type = item.type ?? "INFO";
@@ -225,7 +228,7 @@ async function handleSelection(
         const initState = `FLOW:${flow.id}:${startNode.id}`;
         const initData: SessionData = { flow: { flowId: flow.id, flowVars: {} } };
         await updateSession(guestId, hotelId, initState, initData);
-        return executeFlowStep(hotelId, guestId, initState, initData, input);
+        return executeFlowStep(hotelId, guestId, initState, initData, input, channel);
       }
     }
 
@@ -239,19 +242,19 @@ async function handleSelection(
   if (type === "FLOW") {
     if (!item.flowId) {
       await resetSession(guestId, hotelId);
-      return showMenu(hotelId, guestId, sessionData, input);
+      return showMenu(hotelId, guestId, sessionData, input, channel);
     }
     const flow = await prisma.flowDefinition.findUnique({ where: { id: item.flowId } });
     const nodes = Array.isArray(flow?.nodes) ? (flow!.nodes as any[]) : [];
     const startNode = nodes.find((n: any) => n.type === "start");
     if (!flow?.isActive || !startNode) {
       await resetSession(guestId, hotelId);
-      return showMenu(hotelId, guestId, sessionData, input);
+      return showMenu(hotelId, guestId, sessionData, input, channel);
     }
     const initState = `FLOW:${flow.id}:${startNode.id}`;
     const initData: SessionData = { flow: { flowId: flow.id, flowVars: {} } };
     await updateSession(guestId, hotelId, initState, initData);
-    return executeFlowStep(hotelId, guestId, initState, initData, input);
+    return executeFlowStep(hotelId, guestId, initState, initData, input, channel);
   }
 
   // ── INFO (default) ──

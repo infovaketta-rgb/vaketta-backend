@@ -20,71 +20,36 @@ import { emitToHotel } from "./realtime/emit";
 import prisma from "./db/connect";
 import { logger } from "./utils/logger";
 import { MessageStatus } from "@prisma/client";
-import "./workers/instagram.worker";
-import "./workers/flowResumeWorker";
-import "./workers/whatsappInbound.worker"; // inbound WhatsApp bot pipeline (web process — see file header)
-import "./workers/confirmationSequence.worker"; // staff-confirmed booking confirmation sequence sender
 
-// ── Startup environment validation ────────────────────────────────────────────
+import { validateEnv } from "./bootstrap/env";
+import { startWorkers } from "./bootstrap/workers";
+import { startCrons } from "./bootstrap/crons";
+import { registerShutdown } from "./bootstrap/shutdown";
 
-const REQUIRED_ENV: string[] = [
-  "JWT_SECRET",
-  "DATABASE_URL",
-  "FACEBOOK_APP_SECRET", // HMAC verification of Meta webhook payloads
-];
+const APP_VERSION = process.env.npm_package_version ?? "1.0.0";
 
-function validateEnv() {
-  const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
-  if (missing.length) {
-    logger.fatal({ missing }, "missing required env vars — aborting");
-    process.exit(1);
-  }
-
-  // Warn about vars that degrade functionality when absent
-  if (!process.env.REDIS_URL) {
-    logger.warn("REDIS_URL not set — using redis://127.0.0.1:6379");
-  }
-  if (!process.env.ANTHROPIC_API_KEY && !process.env.OPENAI_API_KEY) {
-    logger.warn("no AI API key set — AI fallback will be disabled");
-  }
-  if (!process.env.FRONTEND_ORIGIN) {
-    logger.warn("FRONTEND_ORIGIN not set — defaulting to http://localhost:3000");
-  }
-  if (!process.env.R2_BUCKET_NAME || !process.env.R2_PUBLIC_URL) {
-    logger.warn("R2_BUCKET_NAME / R2_PUBLIC_URL not set — media uploads will fall back to local disk");
-  }
-  if (!process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY) {
-    logger.warn("R2 credentials not set — media uploads will fall back to local disk");
-  }
-}
-
+// ── 1. Environment validation (exits(1) on missing required vars) ──────────────
 validateEnv();
 
-// ── Startup sweep: resolve PENDING messages orphaned by a prior crash/restart ─
-// The delayed-send timer (setTimeout in message.service.ts) lives in process
-// memory. If the process dies while a timer is active, the message stays PENDING
-// forever. Max configured delay is 60 s, so anything older than 2 min is stale.
+// ── 2. Stale-message sweep ─────────────────────────────────────────────────────
+// Delayed sends are durable BullMQ jobs now, but a job can still fail terminally
+// and leave a message PENDING. Max configured delay is 60 s, so anything OUT +
+// PENDING older than 2 min is stale → mark FAILED.
 async function sweepStalePendingMessages() {
   const cutoff = new Date(Date.now() - 2 * 60 * 1000);
   const result = await prisma.message.updateMany({
-    where: {
-      direction: "OUT",
-      status:    MessageStatus.PENDING,
-      timestamp: { lt: cutoff },
-    },
-    data: { status: MessageStatus.FAILED },
+    where: { direction: "OUT", status: MessageStatus.PENDING, timestamp: { lt: cutoff } },
+    data:  { status: MessageStatus.FAILED },
   });
   if (result.count > 0) {
-    logger.warn({ count: result.count }, "swept stale PENDING→FAILED messages on startup");
+    logger.warn({ count: result.count }, "swept stale PENDING→FAILED messages");
   }
 }
 
 sweepStalePendingMessages().catch((err) =>
-  logger.warn({ err }, "startup PENDING sweep failed — DB may not be ready yet")
+  logger.warn({ err }, "startup PENDING sweep failed — DB may not be ready yet"),
 );
 
-// Recurring sweep — catches any messages that slip through after startup.
-// Wrapped in try/catch so a DB hiccup never crashes the process or blocks the health check.
 const pendingSweepInterval = setInterval(async () => {
   try {
     await sweepStalePendingMessages();
@@ -93,75 +58,35 @@ const pendingSweepInterval = setInterval(async () => {
   }
 }, 5 * 60 * 1000).unref();
 
-// ── Server setup ──────────────────────────────────────────────────────────────
-
+// ── 3. HTTP + Socket.IO ─────────────────────────────────────────────────────────
 const server = http.createServer(app);
 export const io = initSocket(server);
+logger.info("Socket.IO initialised");
 
 // Bridge: worker publishes status updates to Redis → forward to Socket.IO
 const unsubscribeStatus = subscribeMessageStatus(({ hotelId, messageId, status }) => {
   emitToHotel(hotelId, "message:status", { messageId, status });
 });
 
-const PORT = Number(process.env.PORT) || 5000;
+// ── 4. Background workers + crons ───────────────────────────────────────────────
+startWorkers();
+const stopCrons = startCrons();
 
-server.listen(PORT, () => {
-  logger.info({ port: PORT, env: process.env.NODE_ENV ?? "development", aiProvider: process.env.AI_PROVIDER ?? "anthropic" }, "Vaketta backend started");
+// ── 5. Graceful shutdown ─────────────────────────────────────────────────────────
+registerShutdown({
+  httpServer: server,
+  io,
+  prisma,
+  cleanups: [
+    () => clearInterval(pendingSweepInterval),
+    () => stopCrons(),
+    () => unsubscribeStatus(),
+  ],
 });
 
-// ── Graceful shutdown ─────────────────────────────────────────────────────────
-
-let isShuttingDown = false;
-
-async function shutdown(signal: string) {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-
-  logger.info({ signal }, "shutdown signal received — closing gracefully");
-
-  clearInterval(pendingSweepInterval);
-  unsubscribeStatus();
-
-  server.close(async () => {
-    try {
-      await prisma.$disconnect();
-      logger.info("database connection closed");
-    } catch (err) {
-      logger.error({ err }, "error closing database connection");
-    }
-    logger.info("server closed — exiting");
-    process.exit(0);
-  });
-
-  setTimeout(() => {
-    logger.error("forced shutdown after timeout");
-    process.exit(1);
-  }, 15_000).unref();
-}
-
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT",  () => shutdown("SIGINT"));
-
-// Log unhandled promise rejections instead of crashing silently
-process.on("unhandledRejection", (reason) => {
-  logger.error({ reason }, "unhandled promise rejection");
-});
-
-process.on("uncaughtException", (err) => {
-  logger.fatal({ err }, "uncaught exception");
-  shutdown("uncaughtException");
-});
-
-// Surface EventEmitter leak warnings in the structured log so they're visible
-// in Render's log drain instead of being swallowed by pino's default output.
-process.on("warning", (warning) => {
-  logger.warn({ name: warning.name, message: warning.message, stack: warning.stack }, "process warning");
-});
-
-// ── Memory usage logger ───────────────────────────────────────────────────────
-// Fires every 60 s. Watch for heapUsed trending upward across restarts to
-// confirm leaks are resolved. On Render Starter (~512 MB RAM) keep heapUsed
-// well below 350 MB; --max-old-space-size=400 triggers GC before the OS kills.
+// ── 6. Memory usage logger ───────────────────────────────────────────────────────
+// heapUsed trending upward across restarts would indicate a leak. Keep well below
+// the container limit; --max-old-space-size triggers GC before the OS OOM-kills.
 setInterval(() => {
   const m = process.memoryUsage();
   logger.info({
@@ -171,3 +96,34 @@ setInterval(() => {
     external:  `${Math.round(m.external  / 1024 / 1024)}MB`,
   }, "memory-usage");
 }, 60_000).unref();
+
+// ── 7. Listen ────────────────────────────────────────────────────────────────────
+const PORT = Number(process.env.PORT) || 5000;
+
+async function start() {
+  // Eagerly connect Prisma so a bad DATABASE_URL fails loudly at boot instead of
+  // on the first request. Redis connection status is logged by queue/redis.ts.
+  try {
+    await prisma.$connect();
+    logger.info("Prisma connected");
+  } catch (err) {
+    logger.fatal({ err }, "failed to connect to database — aborting startup");
+    process.exit(1);
+  }
+
+  server.listen(PORT, () => {
+    logger.info(
+      {
+        version:    APP_VERSION,
+        env:        process.env.NODE_ENV ?? "development",
+        port:       PORT,
+        aiProvider: process.env.AI_PROVIDER ?? "anthropic",
+        redis:      process.env.REDIS_URL ? "configured" : "default(127.0.0.1:6379)",
+        node:       process.version,
+      },
+      "Vaketta backend started",
+    );
+  });
+}
+
+start();

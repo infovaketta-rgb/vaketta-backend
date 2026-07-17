@@ -43,6 +43,7 @@ import { cancelBooking } from "../services/booking.service";
 import { BookingStatus, MessageChannel, MessageStatus } from "@prisma/client";
 import { shouldAutoReply } from "./shouldAutoReply";
 import { sendCarouselMessage, sendMediaMessage, sendListMessage, sendTextMessage, sendButtonMessage, type CarouselCard } from "../services/whatsapp.send.service";
+import { sendChannelMessage } from "../services/channel.send.service";
 import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
@@ -713,7 +714,8 @@ export async function executeFlowStep(
   guestId:     string,
   state:       string,    // "FLOW:{flowId}:{nodeId}"
   sessionData: SessionData,
-  input:       string
+  input:       string,
+  channel:     MessageChannel = MessageChannel.WHATSAPP
 ): Promise<string | null> {
   // Prevent abuse — very long inputs waste AI tokens and can exhaust session storage.
   input = input.slice(0, 500);
@@ -817,6 +819,58 @@ export async function executeFlowStep(
   }
   return reply;
 
+  // Sends one node's text immediately instead of returning it for concatenation
+  // with the rest of the walk. Mirrors trySendOccupancyNotice's pattern: resolve
+  // hotel/guest contact info, dispatch via the channel-aware sender, persist the
+  // OUT message row, and emit so the dashboard chat list/window update live.
+  // Never throws — a failed send must not break the rest of the flow walk.
+  async function sendNow(text: string): Promise<void> {
+    if (!text?.trim()) return;
+    try {
+      const [hotel, guest] = await Promise.all([
+        prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } }),
+        prisma.guest.findUnique({ where: { id: guestId }, select: { phone: true } }),
+      ]);
+      if (!hotel || !guest) return;
+
+      let wamid: string | undefined;
+      try {
+        const result = await sendChannelMessage({
+          channel,
+          toPhone:   guest.phone,
+          fromPhone: hotel.phone,
+          hotelId,
+          guestId,
+          text,
+        });
+        wamid = channel === MessageChannel.INSTAGRAM
+          ? ((result as any)?.message_id ?? (result as any)?.recipient_id ?? undefined)
+          : (result as any)?.messages?.[0]?.id;
+      } catch (err) {
+        log.warn({ err, hotelId, guestId, channel }, "sendNow: channel send failed");
+      }
+
+      const saved = await prisma.message.create({
+        data: {
+          direction:   "OUT",
+          fromPhone:   hotel.phone,
+          toPhone:     guest.phone,
+          body:        text,
+          messageType: "text",
+          hotelId,
+          guestId,
+          channel,
+          status:      MessageStatus.SENT,
+          ...(wamid ? { wamid } : {}),
+        },
+      });
+      const { emitToHotel } = await import("../realtime/emit");
+      emitToHotel(hotelId, "message:new", { message: saved });
+    } catch (err) {
+      log.warn({ err, hotelId, guestId }, "sendNow: failed to send/persist node message");
+    }
+  }
+
   async function advance(currentNodeId: string): Promise<string | null> {
     if (++hops > MAX_HOPS) {
       log.error({ flowId, guestId, lastNode: currentNodeId }, `MAX_HOPS(${MAX_HOPS}) exceeded — likely infinite loop`);
@@ -881,10 +935,8 @@ export async function executeFlowStep(
         }
 
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
-        const rest = await advance(next);
-        if (!text) return rest;
-        if (!rest) return text;
-        return `${text}\n\n${rest}`;
+        await sendNow(text);
+        return await advance(next);
       }
 
       // ── question ────────────────────────────────────────────────────────────
@@ -1098,14 +1150,13 @@ export async function executeFlowStep(
           }
 
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
-          const rest = await advance(next);
 
-          // Prepend the review link if positive rating
+          // Send the review link (if positive rating) as its own message.
           if (isPositive && d.reviewUrl) {
             const reviewMsg = `Thank you for your *${score}★* rating! 🌟\n\nWe'd love your review: ${d.reviewUrl}`;
-            return rest ? `${reviewMsg}\n\n${rest}` : reviewMsg;
+            await sendNow(reviewMsg);
           }
-          return rest;
+          return await advance(next);
         }
 
         // ── text (default) ─────────────────────────────────────────────────────
@@ -1218,8 +1269,8 @@ export async function executeFlowStep(
 
         if (!available && d.unavailableMessage) {
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
-          const rest = await advance(next);
-          return rest ? `${d.unavailableMessage}\n\n${rest}` : d.unavailableMessage;
+          await sendNow(d.unavailableMessage);
+          return await advance(next);
         }
 
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
@@ -1863,8 +1914,8 @@ export async function executeFlowStep(
             return fullMsg;
           }
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
-          const rest = await advance(next);
-          return rest ? `${fullMsg}\n\n${rest}` : fullMsg;
+          await sendNow(fullMsg);
+          return await advance(next);
         }
 
         // ── notify_staff ───────────────────────────────────────────────────────
@@ -1891,12 +1942,10 @@ export async function executeFlowStep(
         : "Our team has been notified and will be in touch shortly.";
         }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
-        const rest = await advance(next);
         if (d.message) {
-          const note = interpolate(d.message, flowData.flowVars);
-          return rest ? `${note}\n\n${rest}` : note;
+          await sendNow(interpolate(d.message, flowData.flowVars));
         }
-        return rest;
+        return await advance(next);
         }
 
         // ── start_booking_flow (removed — booking state machine is gone) ──────────
@@ -1962,8 +2011,8 @@ export async function executeFlowStep(
             return reply;
           }
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
-          const rest = await advance(next);
-          return rest ? `${reply}\n\n${rest}` : reply;
+          await sendNow(reply);
+          return await advance(next);
         }
 
         // ── cancel_booking ─────────────────────────────────────────────────────
@@ -2149,9 +2198,8 @@ export async function executeFlowStep(
         }
 
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
-        const rest = await advance(next);
-        if (!rest) return text;
-        return `${text}\n\n${rest}`;
+        await sendNow(text);
+        return await advance(next);
       }
 
       // ── show_menu ─────────────────────────────────────────────────────────────
@@ -2167,10 +2215,8 @@ export async function executeFlowStep(
         }
 
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
-        const rest = await advance(next);
-        if (!menuText) return rest;
-        if (!rest)     return menuText;
-        return `${menuText}\n\n${rest}`;
+        if (menuText) await sendNow(menuText);
+        return await advance(next);
       }
 
       // ── delay ─────────────────────────────────────────────────────────────────

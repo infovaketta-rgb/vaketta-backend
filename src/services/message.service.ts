@@ -10,6 +10,7 @@ import { logger } from "../utils/logger";
 import { MessageChannel } from "@prisma/client";
 
 import { sendChannelMessage } from "./channel.send.service";
+import { whatsappQueue } from "../queue/whatsapp.queue";
 const log = logger.child({ service: "message" });
 
 // ── Channel-aware hotel resolution ───────────────────────────────────────────
@@ -197,14 +198,14 @@ export async function logIncomingMessage(
 
   if (autoReplyMode === "DAY") {
     const tBot = Date.now();
-    const botReply = await botProcess(hotel.id, guest.id, body ?? null);
+    const botReply = await botProcess(hotel.id, guest.id, body ?? null, channel);
     botMs = Date.now() - tBot;
     sentReplyText = botReply === BOT_ALREADY_SENT ? null : botReply;
   }
 
   if (autoReplyMode === "NIGHT") {
     const tBot = Date.now();
-    const botReply = await botProcess(hotel.id, guest.id, body ?? null);
+    const botReply = await botProcess(hotel.id, guest.id, body ?? null, channel);
     botMs = Date.now() - tBot;
     if (botReply === BOT_ALREADY_SENT) {
       // Bot already dispatched its own reply (carousel) — suppress nightMsg too.
@@ -287,17 +288,71 @@ export async function logIncomingMessage(
   };
 }
 
-// ── Undo-send registry — maps messageId → active setTimeout handle ────────────
-// Lives in the server process; no separate worker needed for short delays.
-const _pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// ── Undo-send: remove the delayed outbound job before it fires ────────────────
+// Delayed sends are now durable BullMQ jobs on the `whatsapp-out` queue keyed by
+// messageId (jobId = message.id). Cancelling removes that job. This is an
+// OPTIMISATION only — the correctness backstop is undoSend's atomic
+// `deleteMany where status=PENDING`, which wins the race even if the job already
+// fired (the worker's `updateMany PENDING→SENT` then no-ops).
+export async function cancelPendingSend(messageId: string): Promise<boolean> {
+  try {
+    const job = await whatsappQueue.getJob(messageId);
+    if (!job) return false;
+    await job.remove();
+    return true;
+  } catch (err) {
+    // A remove failure is non-fatal: the DB PENDING-guard still prevents an
+    // undone message from being delivered.
+    log.warn({ err, messageId }, "cancelPendingSend: failed to remove delayed job");
+    return false;
+  }
+}
 
-/** Cancel a pending delayed send. Returns true if the timer existed. */
-export function cancelPendingSend(messageId: string): boolean {
-  const timer = _pendingTimers.get(messageId);
-  if (!timer) return false;
-  clearTimeout(timer);
-  _pendingTimers.delete(messageId);
-  return true;
+/**
+ * Executes a delayed outbound send. Called by the whatsapp-out worker when the
+ * delay elapses. Logic is identical to the previous in-process setTimeout body:
+ * atomically claim the PENDING row, send via the channel, persist status, emit.
+ * Channel is re-read from the message row so both WhatsApp and Instagram delayed
+ * sends work (matches sendManualReply, which is channel-aware).
+ */
+export async function executeDelayedSend(messageId: string): Promise<void> {
+  // Atomic claim: transition PENDING → SENT in one statement.
+  // If undoSend already deleted the row, updateMany returns count=0 and we exit
+  // before touching the network — eliminating the send-after-cancel race.
+  const claimed = await prisma.message.updateMany({
+    where: { id: messageId, status: MessageStatus.PENDING },
+    data:  { status: MessageStatus.SENT },
+  });
+  if (claimed.count === 0) return;
+
+  const message = await prisma.message.findUnique({ where: { id: messageId } });
+  if (!message) return;
+
+  let wamid: string | undefined;
+  let finalStatus: MessageStatus = MessageStatus.SENT;
+
+  try {
+    const result = await sendChannelMessage({
+      channel:   message.channel,
+      toPhone:   message.toPhone,
+      fromPhone: message.fromPhone,
+      hotelId:   message.hotelId,
+      guestId:   message.guestId ?? null,
+      text:      message.body ?? "",
+    });
+    wamid = extractProviderMessageId(result, message.channel);
+    log.info({ messageId: message.id, hotelId: message.hotelId }, "[Delay] message sent");
+  } catch (err) {
+    log.error({ err, messageId: message.id }, "[Delay] send failed");
+    finalStatus = MessageStatus.FAILED;
+  }
+
+  await prisma.message.update({
+    where: { id: message.id },
+    data:  { status: finalStatus, ...(wamid ? { wamid } : {}) },
+  });
+
+  emitToHotel(message.hotelId, "message:status", { messageId: message.id, status: finalStatus });
 }
 
 // ── Manual staff reply ────────────────────────────────────────────────────────
@@ -344,41 +399,16 @@ export async function sendManualReply(input: {
 
     emitToHotel(hotelId, "message:new", { message });
 
-    // Schedule the actual send inside this server process using setTimeout.
-    // No separate worker process required for short delays (1–60s).
-    const timer = setTimeout(async () => {
-      _pendingTimers.delete(message.id);
-
-      // Atomic claim: transition PENDING → SENT in one statement.
-      // If undoSend already deleted the row, updateMany returns count=0 and
-      // we exit before touching the network — eliminating the send-after-cancel race.
-      const claimed = await prisma.message.updateMany({
-        where: { id: message.id, status: MessageStatus.PENDING },
-        data:  { status: MessageStatus.SENT },
-      });
-      if (claimed.count === 0) return;
-
-      let wamid: string | undefined;
-      let finalStatus: MessageStatus = MessageStatus.SENT;
-
-      try {
-        const result = await sendChannelMessage({ channel, toPhone, fromPhone, hotelId, guestId, text });
-        wamid = extractProviderMessageId(result, channel);
-        log.info({ messageId: message.id, hotelId }, "[Delay] message sent");
-      } catch (err) {
-        log.error({ err, messageId: message.id }, "[Delay] send failed");
-        finalStatus = MessageStatus.FAILED;
-      }
-
-      await prisma.message.update({
-        where: { id: message.id },
-        data:  { status: finalStatus, ...(wamid ? { wamid } : {}) },
-      });
-
-      emitToHotel(hotelId, "message:status", { messageId: message.id, status: finalStatus });
-    }, delaySeconds * 1000);
-
-    _pendingTimers.set(message.id, timer);
+    // Schedule the actual send as a DURABLE delayed job on the whatsapp-out queue.
+    // jobId = message.id so undoSend can remove it by id (see cancelPendingSend).
+    // Survives a process restart — the setTimeout approach lost the send if the
+    // process died mid-delay. executeDelayedSend() runs the same atomic-claim +
+    // channel-send logic the timer used to run.
+    await whatsappQueue.add(
+      "outbound-send",
+      { messageId: message.id },
+      { delay: delaySeconds * 1000, jobId: message.id },
+    );
 
     return { message, delaySeconds };
   }

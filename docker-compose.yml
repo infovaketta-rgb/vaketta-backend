@@ -1,0 +1,65 @@
+# docker-compose.yml — single-container VPS deployment
+#
+# Services:
+#   app    — Express + Socket.IO + all BullMQ workers + crons (one process)
+#   redis  — self-hosted Redis for BullMQ + pub/sub + cron locks
+#
+# Postgres is NOT included here: keep your managed Postgres (Neon/Supabase) and
+# point DATABASE_URL at it, or add a `postgres` service if you self-host it.
+#
+# Only the app port is published to the host — put a reverse proxy (nginx/Caddy)
+# in front for TLS. Redis stays on the internal network, never exposed.
+#
+# Secrets: provide them via a .env file next to this compose file (chmod 600) or
+# your orchestrator's secret store. Never bake secrets into the image.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      NODE_ENV: production
+      PORT: "5000"
+      # Redis reachable on the internal compose network by service name.
+      REDIS_URL: redis://redis:6379
+      # V8 heap cap — raise on a larger VPS.
+      NODE_MAX_OLD_SPACE_MB: "400"
+    ports:
+      - "5000:5000"          # host:container — front this with nginx/Caddy for TLS
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    networks:
+      - vaketta
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - vaketta
+    # No `ports:` — internal only. Do not expose Redis to the host/internet.
+
+volumes:
+  redis-data:
+
+networks:
+  vaketta:
+    driver: bridge

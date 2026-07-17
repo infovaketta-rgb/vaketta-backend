@@ -9,12 +9,12 @@
  *   • backpressure — `concurrency` caps simultaneous bot/AI pipelines so a burst
  *                    of inbound messages can't exhaust memory or the DB pool
  *
- * IMPORTANT: this worker MUST run in the WEB process — it is imported from
- * server.ts, NOT from whatsapp.worker.ts. logIncomingMessage emits Socket.IO
- * events via emitToHotel, and `io` only has connected clients in the web
- * process (there is no Socket.IO Redis adapter). Running it in the standalone
- * worker service would silently drop message:new / staff:notification /
- * message:media_ready realtime updates.
+ * IMPORTANT: this worker MUST run in the WEB process — it is started via
+ * bootstrap/workers.ts (imported by server.ts). logIncomingMessage emits
+ * Socket.IO events via emitToHotel, and `io` only has connected clients in the
+ * web process (there is no Socket.IO Redis adapter). Running it in a separate
+ * worker process would silently drop message:new / staff:notification /
+ * message:media_ready realtime updates. All workers now run in this one process.
  */
 
 import { Worker } from "bullmq";

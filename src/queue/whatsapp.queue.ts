@@ -1,6 +1,10 @@
 import { Queue } from "bullmq";
 import { redis } from "./redis";
 
+// Durable delayed outbound sends. Producer: message.service `sendManualReply`
+// (delayed staff replies, jobId = message.id). Consumer: outboundSend.worker.
+// Retries are idempotent — executeDelayedSend atomically claims the PENDING row,
+// so a retry after the row is SENT/FAILED/deleted no-ops instead of double-sending.
 export const whatsappQueue = new Queue("whatsapp-out", {
   connection: redis,
   defaultJobOptions: {

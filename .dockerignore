@@ -1,7 +1,33 @@
+# Dependencies
 node_modules
+
+# Build output
 dist
+.next
+
+# Environment files
 .env
 .env.*
-*.log
-uploads
+!.env.example
+
+# Git
 .git
+.github
+
+# Logs
+*.log
+npm-debug.log*
+
+
+
+# Editor files
+.vscode
+.idea
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation (optional)
+README.md
+*.md

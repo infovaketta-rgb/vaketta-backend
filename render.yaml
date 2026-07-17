@@ -13,16 +13,10 @@ services:
         value: 5000
       - fromGroup: vaketta-secrets
 
-  # ── Worker service ────────────────────────────────────────────────────────────
-  - type: worker
-    name: vaketta-worker
-    runtime: node
-    buildCommand: npm ci && npm run build
-    startCommand: node --max-old-space-size=400 dist/workers/whatsapp.worker.js
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - fromGroup: vaketta-secrets
+  # NOTE: the former `vaketta-worker` service was removed. All BullMQ workers and
+  # cron jobs now run inside the web process (bootstrap/workers.ts + crons.ts),
+  # guarded by Redis SETNX locks. A separate worker service is only needed if a
+  # Socket.IO Redis adapter is added AND the web process is scaled to >1 instance.
 
 envVarGroups:
   - name: vaketta-secrets
