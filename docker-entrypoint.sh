@@ -29,7 +29,8 @@ if [ -n "$REDIS_PASSWORD" ]; then
 fi
 
 echo "[entrypoint] applying database migrations..."
-npx prisma migrate deploy
+#npx prisma migrate deploy
+echo "Skipping migrations"
 
 HEAP="${NODE_MAX_OLD_SPACE_MB:-400}"
 echo "[entrypoint] starting server (max-old-space-size=${HEAP}MB)..."
