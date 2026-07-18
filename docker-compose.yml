@@ -38,7 +38,7 @@ services:
       # above) at container start, pointing at the compose-local `redis` service
       # and overriding the external REDIS_URL that's also in .env.production.
     ports:
-      - "5000:5000"          # host:container — front this with nginx/Caddy for TLS
+      - "127.0.0.1:5000:5000"          # host:container — front this with nginx/Caddy for TLS
     depends_on:
       redis:
         condition: service_healthy
