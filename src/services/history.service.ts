@@ -43,8 +43,8 @@ async function resolveHotel(
 
 export async function processHistoryWebhook(value: any): Promise<void> {
   try {
-    const phoneNumberId      = value?.data?.metadata?.phone_number_id      as string | undefined;
-    const displayPhoneNumber = value?.data?.metadata?.display_phone_number as string | undefined;
+    const phoneNumberId      = value?.metadata?.phone_number_id      as string | undefined;
+    const displayPhoneNumber = value?.metadata?.display_phone_number as string | undefined;
 
     const hotel = await resolveHotel(phoneNumberId, displayPhoneNumber);
     if (!hotel) {
@@ -62,7 +62,7 @@ export async function processHistoryWebhook(value: any): Promise<void> {
       return;
     }
 
-    const historyChunks = value?.data?.history as any[] | undefined;
+    const historyChunks = value?.history as any[] | undefined;
     if (!historyChunks?.length) return;
 
     const hotelPhoneNorm = normalizePhone(hotel.phone);
