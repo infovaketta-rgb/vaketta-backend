@@ -69,9 +69,13 @@ export async function processHistoryWebhook(value: any): Promise<void> {
     let startedSet = current?.historySyncStarted != null;
 
     for (const chunk of historyChunks) {
-      const progressStr = (chunk?.metadata?.progress as string | undefined) ?? "0%";
-      const progress    = Math.min(100, Math.max(0, parseInt(progressStr) || 0));
-      const phase       = ((chunk?.metadata?.phase as string | undefined) ?? "").toUpperCase();
+      // Meta sends progress/phase as numbers OR strings depending on payload
+      // version — coerce via String() before any numeric/string op. `phase` is
+      // usually a numeric enum, so NEVER assume it is a string (calling
+      // .toUpperCase() on a number throws "toUpperCase is not a function").
+      const progressRaw = chunk?.metadata?.progress;
+      const progress    = Math.min(100, Math.max(0, parseInt(String(progressRaw ?? ""), 10) || 0));
+      const phase       = String(chunk?.metadata?.phase ?? "").toUpperCase();
       const isFinal     = progress >= 100 || phase === "COMPLETE";
 
       // Persist sync state
