@@ -16,6 +16,7 @@
 
 import prisma from "../../db/connect";
 import { sendListMessage } from "../../services/whatsapp.send.service";
+import { buildListMetadata } from "../../services/interactiveReply.service";
 import { decryptWhatsAppToken } from "../../utils/encryption.utils";
 import { MessageChannel, MessageStatus } from "@prisma/client";
 import { logger } from "../../utils/logger";
@@ -194,21 +195,23 @@ async function resolveHotelGuest(
 }
 
 async function persistAndEmit(
-  hotelId:   string,
-  guestId:   string,
-  fromPhone: string,
-  toPhone:   string,
-  wamid:     string,
-  bodyText:  string,
-  rows:      unknown[],
+  hotelId:     string,
+  guestId:     string,
+  fromPhone:   string,
+  toPhone:     string,
+  wamid:       string,
+  bodyText:    string,
+  buttonLabel: string,
+  sections:    Array<{ title?: string; rows: Array<{ id: string; title: string; description?: string }> }>,
 ): Promise<void> {
   const saved = await prisma.message.create({
     data: {
       direction:   "OUT",
       fromPhone,
       toPhone,
-      body:        JSON.stringify({ bodyText, rows }),
+      body:        bodyText,
       messageType: "list",
+      metadata:    buildListMetadata(buttonLabel, sections),
       hotelId,
       guestId,
       channel:     MessageChannel.WHATSAPP,
@@ -249,8 +252,6 @@ export async function trySendRoomMenuList(args: {
     const buttonLabel = "Options";
     const footerText  = "Type MENU to cancel";
 
-    const allRows = sections.flatMap((s) => s.rows);
-
     const wamid = await sendListMessage(phone, phoneNumberId, accessToken, {
       bodyText,
       footerText,
@@ -258,7 +259,7 @@ export async function trySendRoomMenuList(args: {
       sections,
     });
 
-    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, bodyText, allRows);
+    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, bodyText, buttonLabel, sections);
     return true;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "room-menu list send failed — falling back to text");
@@ -302,8 +303,6 @@ export async function trySendMoveToRoomList(args: {
     const buttonLabel = "Choose Room";
     const footerText  = "Type MENU to cancel";
 
-    const allRows = sections.flatMap((s) => s.rows);
-
     const wamid = await sendListMessage(phone, phoneNumberId, accessToken, {
       bodyText,
       footerText,
@@ -311,7 +310,7 @@ export async function trySendMoveToRoomList(args: {
       sections,
     });
 
-    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, bodyText, allRows);
+    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, bodyText, buttonLabel, sections);
     return { sent: true, destIndices };
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "move-to-room list send failed — falling back to text");
@@ -379,7 +378,6 @@ export async function trySendChangeRoomTypeList(args: {
     const sections    = buildChangeTypeSections(candidates);
     const buttonLabel = "Choose Type";
     const footerText  = "Type MENU to cancel";
-    const allRows     = sections.flatMap((s) => s.rows);
 
     const wamid = await sendListMessage(phone, phoneNumberId, accessToken, {
       bodyText,
@@ -388,7 +386,7 @@ export async function trySendChangeRoomTypeList(args: {
       sections,
     });
 
-    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, bodyText, allRows);
+    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, bodyText, buttonLabel, sections);
     return true;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "change-room-type list send failed — falling back to text");
@@ -429,7 +427,6 @@ export async function trySendManualModeList(args: {
     const sections   = buildManualModeSections(state, addable);
     const buttonLabel = "Edit Booking";
     const footerText  = "Type MENU to cancel";
-    const allRows     = sections.flatMap((s) => s.rows);
 
     const wamid = await sendListMessage(phone, phoneNumberId, accessToken, {
       bodyText:    summary,
@@ -438,7 +435,7 @@ export async function trySendManualModeList(args: {
       sections,
     });
 
-    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, summary, allRows);
+    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, summary, buttonLabel, sections);
     return true;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "manual-mode list send failed — falling back to text");

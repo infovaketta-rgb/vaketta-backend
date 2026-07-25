@@ -17,6 +17,7 @@
 
 import prisma from "../../db/connect";
 import { sendListMessage, sendTextMessage } from "../../services/whatsapp.send.service";
+import { buildListMetadata } from "../../services/interactiveReply.service";
 import { decryptWhatsAppToken } from "../../utils/encryption.utils";
 import { MessageChannel, MessageStatus } from "@prisma/client";
 import { logger } from "../../utils/logger";
@@ -223,8 +224,9 @@ export async function trySendPlanList(args: {
         direction:   "OUT",
         fromPhone:   hotel.phone,
         toPhone:     guest.phone,
-        body:        JSON.stringify({ bodyText: lastChunk, buttonLabel, rows: planRows }),
+        body:        lastChunk,
         messageType: "list",
+        metadata:    buildListMetadata(buttonLabel, sections),
         hotelId,
         guestId,
         channel:     MessageChannel.WHATSAPP,

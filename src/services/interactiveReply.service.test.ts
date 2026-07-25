@@ -6,7 +6,13 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { extractInteractiveReply, buildReplyMetadata } from "./interactiveReply.service";
+import {
+  extractInteractiveReply,
+  buildReplyMetadata,
+  extractOutboundInteractive,
+  buildListMetadata,
+  buildButtonsMetadata,
+} from "./interactiveReply.service";
 
 describe("extractInteractiveReply", () => {
   it("parses a list_reply with id, title and description", () => {
@@ -86,6 +92,94 @@ describe("buildReplyMetadata", () => {
     const reply = { type: "list_reply" as const, id: "opt_3", title: "Suite", description: null };
     expect(buildReplyMetadata(reply)).toEqual({
       interactiveReply: { type: "list_reply", id: "opt_3", title: "Suite", description: null },
+    });
+  });
+});
+
+describe("extractOutboundInteractive", () => {
+  it("parses an outbound list send (body text + button + sections)", () => {
+    const out = extractOutboundInteractive({
+      type: "interactive",
+      interactive: {
+        type: "list",
+        body: { text: "Pick a room type" },
+        action: {
+          button: "View Options",
+          sections: [{ title: "Rooms", rows: [
+            { id: "opt_0", title: "Deluxe", description: "Sea view" },
+            { id: "opt_1", title: "Standard" },
+          ] }],
+        },
+      },
+    });
+    expect(out).toEqual({
+      bodyText:    "Pick a room type",
+      messageType: "list",
+      metadata: { interactive: {
+        type: "list",
+        buttonLabel: "View Options",
+        sections: [{ title: "Rooms", rows: [
+          { id: "opt_0", title: "Deluxe", description: "Sea view" },
+          { id: "opt_1", title: "Standard" },
+        ] }],
+      } },
+    });
+  });
+
+  it("parses an outbound reply-buttons send", () => {
+    const out = extractOutboundInteractive({
+      type: "interactive",
+      interactive: {
+        type: "button",
+        body: { text: "Confirm?" },
+        action: { buttons: [
+          { type: "reply", reply: { id: "CONFIRM_BOOKING", title: "✅ Confirm" } },
+          { type: "reply", reply: { id: "CANCEL_BOOKING",  title: "✖️ Cancel" } },
+        ] },
+      },
+    });
+    expect(out).toEqual({
+      bodyText:    "Confirm?",
+      messageType: "button",
+      metadata: { interactive: {
+        type: "buttons",
+        buttons: [
+          { id: "CONFIRM_BOOKING", title: "✅ Confirm" },
+          { id: "CANCEL_BOOKING",  title: "✖️ Cancel" },
+        ],
+      } },
+    });
+  });
+
+  it("returns null for inbound replies, plain text, and non-messages", () => {
+    expect(extractOutboundInteractive({
+      type: "interactive",
+      interactive: { type: "list_reply", list_reply: { id: "opt_1", title: "A" } },
+    })).toBeNull();
+    expect(extractOutboundInteractive({ type: "text", text: { body: "hi" } })).toBeNull();
+    expect(extractOutboundInteractive(undefined)).toBeNull();
+  });
+});
+
+describe("outbound builders", () => {
+  it("buildListMetadata normalizes sections and drops extra keys", () => {
+    const meta = buildListMetadata("Options", [
+      { title: "S1", rows: [{ id: "a", title: "Row A", description: "d", extra: "x" } as never] },
+      { rows: [{ id: "b", title: "Row B" }] },
+    ]);
+    expect(meta).toEqual({ interactive: {
+      type: "list",
+      buttonLabel: "Options",
+      sections: [
+        { title: "S1", rows: [{ id: "a", title: "Row A", description: "d" }] },
+        { rows: [{ id: "b", title: "Row B" }] },
+      ],
+    } });
+  });
+
+  it("buildButtonsMetadata coerces ids/titles to strings", () => {
+    expect(buildButtonsMetadata([{ id: "X", title: "Go" }])).toEqual({
+      interactive: { type: "buttons", buttons: [{ id: "X", title: "Go" }] },
     });
   });
 });

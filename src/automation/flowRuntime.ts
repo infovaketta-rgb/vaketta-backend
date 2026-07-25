@@ -44,6 +44,7 @@ import { BookingStatus, MessageChannel, MessageStatus } from "@prisma/client";
 import { shouldAutoReply } from "./shouldAutoReply";
 import { sendCarouselMessage, sendMediaMessage, sendListMessage, sendTextMessage, sendButtonMessage, type CarouselCard } from "../services/whatsapp.send.service";
 import { sendChannelMessage } from "../services/channel.send.service";
+import { buildListMetadata, buildButtonsMetadata } from "../services/interactiveReply.service";
 import { flowResumeQueue } from "../queue/flowResumeQueue";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
@@ -221,8 +222,9 @@ async function safeMenu(hotelId: string, guestId: string): Promise<string | null
               direction:   "OUT",
               fromPhone:   hotel.phone,
               toPhone:     guest.phone,
-              body:        JSON.stringify({ bodyText: payload.bodyText, buttonLabel: payload.buttonLabel }),
+              body:        payload.bodyText,
               messageType: "list",
+              metadata:    buildListMetadata(payload.buttonLabel, payload.sections),
               hotelId,
               guestId,
               channel:     MessageChannel.WHATSAPP,
@@ -399,8 +401,9 @@ async function trySendOptionsList(args: {
         direction:   "OUT",
         fromPhone:   hotel.phone,
         toPhone:     guest.phone,
-        body:        JSON.stringify({ bodyText, buttonLabel, options }),
+        body:        bodyText,
         messageType: "list",
+        metadata:    buildListMetadata(buttonLabel, [{ title: sectionTitle, rows }]),
         hotelId,
         guestId,
         channel:     MessageChannel.WHATSAPP,
@@ -576,8 +579,9 @@ async function trySendMixItUpList(args: { hotelId: string; guestId: string }): P
         direction:   "OUT",
         fromPhone:   hotel.phone,
         toPhone:     guest.phone,
-        body:        JSON.stringify({ bodyText, buttonLabel, rows: sections[0]!.rows }),
+        body:        bodyText,
         messageType: "list",
+        metadata:    buildListMetadata(buttonLabel, sections),
         hotelId,
         guestId,
         channel:     MessageChannel.WHATSAPP,
@@ -627,8 +631,9 @@ async function trySendConfirmButtons(args: { hotelId: string; guestId: string; b
         direction:   "OUT",
         fromPhone:   hotel.phone,
         toPhone:     guest.phone,
-        body:        JSON.stringify({ bodyText, buttons }),
+        body:        bodyText,
         messageType: "button",
+        metadata:    buildButtonsMetadata(buttons),
         hotelId,
         guestId,
         channel:     MessageChannel.WHATSAPP,

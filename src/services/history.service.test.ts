@@ -284,22 +284,68 @@ describe("processHistoryWebhook — interactive replies (title in body, id in me
     expect(args.metadata.interactiveReply.id).toBe("opt_1");
   });
 
-  it("leaves outbound interactive sends and plain text untouched (no metadata)", async () => {
+  it("stores outbound interactive sends with body text + structure in metadata", async () => {
     const v = historyValue();
     v.history[0]!.threads[0]!.messages = [
       {
         id: "wamid.OUTLIST", from: "15550001111", type: "interactive",
-        interactive: { type: "list", action: { button: "View Menu", sections: [] } },
+        interactive: {
+          type: "list",
+          body: { text: "Welcome! Tap below to see our menu." },
+          action: {
+            button: "View Menu",
+            sections: [{ title: "Menu", rows: [
+              { id: "opt_0", title: "Room Booking", description: "Check availability" },
+              { id: "opt_1", title: "Talk to Staff" },
+            ] }],
+          },
+        },
         timestamp: "1700000600",
+      },
+      {
+        id: "wamid.OUTBTN", from: "15550001111", type: "interactive",
+        interactive: {
+          type: "button",
+          body: { text: "Confirm your booking?" },
+          action: { buttons: [
+            { type: "reply", reply: { id: "CONFIRM_BOOKING", title: "✅ Confirm" } },
+            { type: "reply", reply: { id: "CANCEL_BOOKING",  title: "✖️ Cancel" } },
+          ] },
+        },
+        timestamp: "1700000650",
       },
       { id: "wamid.TXT", from: "919812345678", type: "text",
         text: { body: "hello" }, timestamp: "1700000700" },
     ] as any;
 
     await processHistoryWebhook(v);
-    for (const call of messageUpsert.mock.calls) {
-      expect(call[0]!.create.metadata).toBeUndefined();
-    }
+
+    const listArgs = messageUpsert.mock.calls.find((c) => c[0].create.wamid === "wamid.OUTLIST")?.[0].create;
+    expect(listArgs.direction).toBe("OUT");
+    expect(listArgs.messageType).toBe("list");
+    expect(listArgs.body).toBe("Welcome! Tap below to see our menu."); // never serialized JSON
+    expect(listArgs.metadata.interactive).toEqual({
+      type: "list",
+      buttonLabel: "View Menu",
+      sections: [{ title: "Menu", rows: [
+        { id: "opt_0", title: "Room Booking", description: "Check availability" },
+        { id: "opt_1", title: "Talk to Staff" },
+      ] }],
+    });
+
+    const btnArgs = messageUpsert.mock.calls.find((c) => c[0].create.wamid === "wamid.OUTBTN")?.[0].create;
+    expect(btnArgs.messageType).toBe("button");
+    expect(btnArgs.body).toBe("Confirm your booking?");
+    expect(btnArgs.metadata.interactive).toEqual({
+      type: "buttons",
+      buttons: [
+        { id: "CONFIRM_BOOKING", title: "✅ Confirm" },
+        { id: "CANCEL_BOOKING",  title: "✖️ Cancel" },
+      ],
+    });
+
+    const txtArgs = messageUpsert.mock.calls.find((c) => c[0].create.wamid === "wamid.TXT")?.[0].create;
+    expect(txtArgs.metadata).toBeUndefined(); // plain text untouched
   });
 });
 

@@ -4,7 +4,7 @@ import { emitToHotel } from "../realtime/emit";
 import { MessageChannel, MessageStatus } from "@prisma/client";
 import { logger } from "../utils/logger";
 import { extractMediaFromWebhookMessage } from "./media.service";
-import { extractInteractiveReply, buildReplyMetadata } from "./interactiveReply.service";
+import { extractInteractiveReply, buildReplyMetadata, extractOutboundInteractive } from "./interactiveReply.service";
 import { historyMediaQueue } from "../queue/historyMedia.queue";
 
 const log = logger.child({ service: "history" });
@@ -156,10 +156,15 @@ async function processThread(
     // Interactive replies in history (guest tapped a list row / button) — same
     // treatment as the live webhook: store the human-readable title as the
     // body, keep the payload id + type in metadata for the Message Details UI.
-    // Outbound interactive sends (interactive.type "list"/"button") parse to
-    // null and keep the old fallback path.
     const reply = extractInteractiveReply(msg);
     if (reply) body = reply.title ?? reply.id;
+
+    // Outbound interactive sends (the bot's own list/button messages appearing
+    // in history): store the human-readable body text + the interactive
+    // structure in metadata — same shape the live persist sites write — so the
+    // bubble renders like WhatsApp instead of a serialized payload.
+    const outbound = reply ? null : extractOutboundInteractive(msg);
+    if (outbound?.bodyText) body = outbound.bodyText;
 
     // Honour original timestamp — never use new Date()
     const timestamp = msg.timestamp
@@ -189,14 +194,15 @@ async function processThread(
       fromPhone,
       toPhone,
       body,
-      messageType: VALID_MSG_TYPES.has(msgType) ? msgType : "text",
+      messageType: outbound ? outbound.messageType
+                            : VALID_MSG_TYPES.has(msgType) ? msgType : "text",
       hotelId,
       guestId:   guest.id,
       channel:   MessageChannel.WHATSAPP,
       status,
       wamid,
       timestamp,
-      ...(reply ? { metadata: buildReplyMetadata(reply) } : {}),
+      ...(reply ? { metadata: buildReplyMetadata(reply) } : outbound ? { metadata: outbound.metadata } : {}),
       ...(media
         ? { mediaUrl: `pending://${media.mediaId}`, mimeType: media.mimeType, fileName: media.fileName }
         : {}),
@@ -257,19 +263,26 @@ export async function processSmbMessageEcho(value: any): Promise<void> {
       });
 
       const msgType = (msg.type as string) || "text";
-      const body =
+      let body =
         msg.text?.body        ??
         msg.image?.caption    ??
         msg.video?.caption    ??
         msg.document?.caption ??
         null;
 
+      // Echoed interactive sends: store body text + structure in metadata,
+      // same shape as processThread / the live persist sites.
+      const outbound = extractOutboundInteractive(msg);
+      if (outbound?.bodyText) body = outbound.bodyText;
+
       const messageData = {
         direction:   "OUT",
         fromPhone:   hotelPhoneNorm,
         toPhone:     guestPhoneRaw,
         body,
-        messageType: VALID_MSG_TYPES.has(msgType) ? msgType : "text",
+        messageType: outbound ? outbound.messageType
+                              : VALID_MSG_TYPES.has(msgType) ? msgType : "text",
+        ...(outbound ? { metadata: outbound.metadata } : {}),
         hotelId:     hotel.id,
         guestId:     guest.id,
         channel:     MessageChannel.WHATSAPP,

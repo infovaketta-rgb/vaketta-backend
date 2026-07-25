@@ -21,6 +21,7 @@ import { executeFlowStep } from "./flowRuntime";
 import { getAIReply } from "../services/ai.service";
 import { incrementAIUsage } from "../services/usage.service";
 import { sendListMessage } from "../services/whatsapp.send.service";
+import { buildListMetadata } from "../services/interactiveReply.service";
 import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { MessageChannel, MessageStatus } from "@prisma/client";
 
@@ -132,8 +133,9 @@ async function showMenu(
               direction:   "OUT",
               fromPhone:   hotel.phone,
               toPhone:     guest.phone,
-              body:        JSON.stringify({ bodyText: payload.bodyText, buttonLabel: payload.buttonLabel }),
+              body:        payload.bodyText,
               messageType: "list",
+              metadata:    buildListMetadata(payload.buttonLabel, payload.sections),
               hotelId,
               guestId,
               channel:     MessageChannel.WHATSAPP,
