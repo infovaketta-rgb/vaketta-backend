@@ -400,6 +400,7 @@ model Message {
   fileName    String? // original filename, used for documents
   wamid       String? // Meta's message ID — used to map status webhooks
   jobId       String? // BullMQ job ID — set when message is queued with a delay (undo-send)
+  metadata    Json? // structured extras, e.g. { interactiveReply: { type, id, title } } for WA list/button taps
   timestamp   DateTime @default(now())
 
   channel MessageChannel @default(WHATSAPP)

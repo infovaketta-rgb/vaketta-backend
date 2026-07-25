@@ -235,6 +235,74 @@ describe("processHistoryWebhook — media import (queued backfill)", () => {
   });
 });
 
+describe("processHistoryWebhook — interactive replies (title in body, id in metadata)", () => {
+  it("stores the human-readable title as body and the payload id/type in metadata", async () => {
+    const v = historyValue();
+    v.history[0]!.threads[0]!.messages = [
+      {
+        id: "wamid.LIST1", from: "919812345678", type: "interactive",
+        interactive: { type: "list_reply", list_reply: { id: "opt_2", title: "Deluxe Room", description: "Sea view" } },
+        timestamp: "1700000300",
+      },
+      {
+        id: "wamid.QR1", from: "919812345678", type: "button",
+        button: { payload: "room_abc123", text: "Select Room" },
+        timestamp: "1700000400",
+      },
+    ] as any;
+
+    await processHistoryWebhook(v);
+    expect(messageUpsert).toHaveBeenCalledTimes(2);
+
+    const listArgs = messageUpsert.mock.calls.find((c) => c[0].create.wamid === "wamid.LIST1")?.[0].create;
+    expect(listArgs.messageType).toBe("text");
+    expect(listArgs.body).toBe("Deluxe Room"); // what the guest saw — not "opt_2"
+    expect(listArgs.metadata).toEqual({
+      interactiveReply: { type: "list_reply", id: "opt_2", title: "Deluxe Room", description: "Sea view" },
+    });
+
+    const qrArgs = messageUpsert.mock.calls.find((c) => c[0].create.wamid === "wamid.QR1")?.[0].create;
+    expect(qrArgs.body).toBe("Select Room");
+    expect(qrArgs.metadata).toEqual({
+      interactiveReply: { type: "quick_reply", id: "room_abc123", title: "Select Room", description: null },
+    });
+  });
+
+  it("keeps the payload id as body when Meta omits the title (legacy hide filter applies)", async () => {
+    const v = historyValue();
+    v.history[0]!.threads[0]!.messages = [
+      {
+        id: "wamid.LIST2", from: "919812345678", type: "interactive",
+        interactive: { type: "list_reply", list_reply: { id: "opt_1" } },
+        timestamp: "1700000500",
+      },
+    ] as any;
+
+    await processHistoryWebhook(v);
+    const args = messageUpsert.mock.calls[0]![0].create;
+    expect(args.body).toBe("opt_1");
+    expect(args.metadata.interactiveReply.id).toBe("opt_1");
+  });
+
+  it("leaves outbound interactive sends and plain text untouched (no metadata)", async () => {
+    const v = historyValue();
+    v.history[0]!.threads[0]!.messages = [
+      {
+        id: "wamid.OUTLIST", from: "15550001111", type: "interactive",
+        interactive: { type: "list", action: { button: "View Menu", sections: [] } },
+        timestamp: "1700000600",
+      },
+      { id: "wamid.TXT", from: "919812345678", type: "text",
+        text: { body: "hello" }, timestamp: "1700000700" },
+    ] as any;
+
+    await processHistoryWebhook(v);
+    for (const call of messageUpsert.mock.calls) {
+      expect(call[0]!.create.metadata).toBeUndefined();
+    }
+  });
+});
+
 // ── Idempotency / duplicate-import regression suite ─────────────────────────
 //
 // Covers the scenarios from the "fully idempotent" requirement:

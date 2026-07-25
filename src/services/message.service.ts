@@ -11,6 +11,7 @@ import { MessageChannel } from "@prisma/client";
 
 import { sendChannelMessage } from "./channel.send.service";
 import { whatsappQueue } from "../queue/whatsapp.queue";
+import { MessageMetadata } from "./interactiveReply.service";
 const log = logger.child({ service: "message" });
 
 // ── Channel-aware hotel resolution ───────────────────────────────────────────
@@ -53,6 +54,14 @@ export type IncomingMessageInput = {
   wamid?:      string | null;
   /** Channel this message arrived on. Defaults to "whatsapp". Future: "instagram" | "call" */
   channel?: MessageChannel;
+  /**
+   * What the bot pipeline should process when it differs from the stored body.
+   * Interactive replies store the human-readable title in `body` (chat UI) but
+   * the flow engine must match the payload id (room_*, opt_N, plan_N…).
+   */
+  botBody?: string | null;
+  /** Structured extras persisted on Message.metadata (e.g. interactiveReply) */
+  metadata?: MessageMetadata | null;
 };
 
 type IncomingMessageResult = {
@@ -65,7 +74,7 @@ type IncomingMessageResult = {
 export async function logIncomingMessage(
   input: IncomingMessageInput
 ): Promise<IncomingMessageResult> {
-  const { fromPhone, toPhone, body, messageType, mediaUrl, mimeType, fileName, wamid ,channel = MessageChannel.WHATSAPP} = input;
+  const { fromPhone, toPhone, body, messageType, mediaUrl, mimeType, fileName, wamid, botBody, metadata, channel = MessageChannel.WHATSAPP } = input;
 
   // Per-stage timing — surfaced in one structured log line on the full reply path
   // so slow messages are diagnosable (DB setup vs bot vs Meta send) without guessing.
@@ -134,7 +143,8 @@ export async function logIncomingMessage(
       guestId:     guest.id,
       status:      MessageStatus.RECEIVED,
       channel,
-      ...(wamid ? { wamid } : {}),
+      ...(wamid    ? { wamid }    : {}),
+      ...(metadata ? { metadata } : {}),
     },
   });
 
@@ -196,16 +206,20 @@ export async function logIncomingMessage(
   // which in NIGHT mode would still send the standalone nightMsg.
   const BOT_ALREADY_SENT = "ALREADY_SENT";
 
+  // Interactive replies: the bot matches on the payload id (botBody), not the
+  // human-readable title stored in body for the chat UI.
+  const botInput = botBody ?? body ?? null;
+
   if (autoReplyMode === "DAY") {
     const tBot = Date.now();
-    const botReply = await botProcess(hotel.id, guest.id, body ?? null, channel);
+    const botReply = await botProcess(hotel.id, guest.id, botInput, channel);
     botMs = Date.now() - tBot;
     sentReplyText = botReply === BOT_ALREADY_SENT ? null : botReply;
   }
 
   if (autoReplyMode === "NIGHT") {
     const tBot = Date.now();
-    const botReply = await botProcess(hotel.id, guest.id, body ?? null, channel);
+    const botReply = await botProcess(hotel.id, guest.id, botInput, channel);
     botMs = Date.now() - tBot;
     if (botReply === BOT_ALREADY_SENT) {
       // Bot already dispatched its own reply (carousel) — suppress nightMsg too.

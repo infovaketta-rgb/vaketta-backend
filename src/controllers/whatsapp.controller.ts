@@ -4,6 +4,7 @@ import prisma from "../db/connect";
 import { MessageStatus } from "@prisma/client";
 import { emitToHotel } from "../realtime/emit";
 import { extractMediaFromWebhookMessage } from "../services/media.service";
+import { extractInteractiveReply, buildReplyMetadata, MessageMetadata } from "../services/interactiveReply.service";
 import { whatsappInboundQueue } from "../queue/whatsappInbound.queue";
 import { processHistoryWebhook, processSmbMessageEcho } from "../services/history.service";
 import crypto from "crypto";
@@ -132,35 +133,24 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
     // Extract text body (text messages) or caption (media messages)
     let body: string | null = message.text?.body ?? message[messageType]?.caption ?? null;
 
-    // Interactive replies (e.g. carousel "Select Room" tap) — collapse to a
-    // text message whose body is the reply id, so the flow engine can match
-    // patterns like "room_<roomId>" without any new code path downstream.
-    if (messageType === "interactive") {
-      const ir = message.interactive;
-      const replyId =
-        ir?.type === "button_reply" ? (ir.button_reply?.id as string | undefined) :
-        ir?.type === "list_reply"   ? (ir.list_reply?.id   as string | undefined) :
-                                      undefined;
-      if (!replyId) {
-        log.info({ irType: ir?.type }, "skipping interactive reply with no id");
+    // Interactive replies (list/button/quick_reply taps) — collapse to a text
+    // message. The STORED body is the human-readable title the guest actually
+    // tapped (what renders in the chat bubble); the payload id travels
+    // separately as `botBody` so the flow engine can still match patterns like
+    // "room_<roomId>" / "opt_N" / "plan_N", and the full reply is persisted in
+    // Message.metadata.interactiveReply for the Message Details UI.
+    let botBody:  string | null          = null;
+    let metadata: MessageMetadata | null = null;
+    if (messageType === "interactive" || messageType === "button") {
+      const reply = extractInteractiveReply(message);
+      if (!reply) {
+        log.info({ messageType, irType: message.interactive?.type }, "skipping interactive message with no reply id");
         return res.sendStatus(200);
       }
       messageType = "text";
-      body        = replyId;
-    }
-
-    // Carousel quick_reply taps — Meta delivers these as type "button" with
-    // the quick_reply id in message.button.payload (e.g. "room_<roomId>").
-    // Collapse to a plain text message so the flow engine's Phase 2 regex
-    // (^room_(.+)$) can match without any new downstream code path.
-    if (messageType === "button") {
-      const payload = message.button?.payload as string | undefined;
-      if (!payload) {
-        log.info("skipping button message with no payload");
-        return res.sendStatus(200);
-      }
-      messageType = "text";
-      body        = payload;
+      body        = reply.title ?? reply.id; // no title from Meta → old behaviour (id, hidden by the UI filter)
+      botBody     = reply.id;
+      metadata    = buildReplyMetadata(reply);
     }
 
     const SUPPORTED_TYPES = new Set(["text", "image", "video", "audio", "document", "sticker"]);
@@ -180,9 +170,9 @@ export async function handleWhatsAppWebhook(req: Request, res: Response) {
           mediaUrl: `pending://${mediaInfo.mediaId}`,
           mimeType: mediaInfo.mimeType,
           fileName: mediaInfo.fileName,
-          wamid,
+          wamid, botBody, metadata,
         }
-      : { fromPhone, toPhone, body, messageType, mediaUrl: null, mimeType: null, fileName: null, wamid };
+      : { fromPhone, toPhone, body, messageType, mediaUrl: null, mimeType: null, fileName: null, wamid, botBody, metadata };
 
     // Enqueue BEFORE ACK so a Redis failure makes Meta retry (no lost message).
     // The bot/AI/send pipeline then runs in a bounded-concurrency worker instead
