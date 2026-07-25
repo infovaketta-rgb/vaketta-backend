@@ -2,6 +2,7 @@ import { Worker } from "bullmq";
 import prisma from "../db/connect";
 import { redis } from "../queue/redis";
 import { processInstagramInboundEvent } from "../services/instagram.service";
+import { isFinalAttempt } from "./deadLetter.util";
 import { logger } from "../utils/logger";
 
 const log = logger.child({
@@ -88,6 +89,20 @@ const worker = new Worker(
 worker.on(
  "failed",
  async(job,err)=>{
+
+  // BullMQ fires "failed" on every attempt — only dead-letter once the
+  // final retry is exhausted, otherwise a 3-attempt job writes 3 rows.
+  if(!isFinalAttempt(job)){
+    log.warn(
+     {
+      err,
+      jobId:job?.id,
+      attemptsMade:job?.attemptsMade
+     },
+     "attempt failed — retry scheduled"
+    );
+    return;
+  }
 
   log.error(
    {

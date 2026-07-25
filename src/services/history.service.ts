@@ -5,6 +5,7 @@ import { MessageChannel, MessageStatus } from "@prisma/client";
 import { logger } from "../utils/logger";
 import { extractMediaFromWebhookMessage } from "./media.service";
 import { extractInteractiveReply, buildReplyMetadata, extractOutboundInteractive } from "./interactiveReply.service";
+import { persistEchoedOutboundMessage } from "./echoPersist.service";
 import { historyMediaQueue } from "../queue/historyMedia.queue";
 
 const log = logger.child({ service: "history" });
@@ -256,12 +257,6 @@ export async function processSmbMessageEcho(value: any): Promise<void> {
       const guestPhoneRaw = normalizePhone((msg.to as string) ?? "");
       if (!guestPhoneRaw) continue;
 
-      const guest = await prisma.guest.upsert({
-        where:  { phone_hotelId: { phone: guestPhoneRaw, hotelId: hotel.id } },
-        create: { phone: guestPhoneRaw, hotelId: hotel.id },
-        update: {},
-      });
-
       const msgType = (msg.type as string) || "text";
       let body =
         msg.text?.body        ??
@@ -275,47 +270,19 @@ export async function processSmbMessageEcho(value: any): Promise<void> {
       const outbound = extractOutboundInteractive(msg);
       if (outbound?.bodyText) body = outbound.bodyText;
 
-      const messageData = {
-        direction:   "OUT",
+      // Guest upsert + (hotelId, wamid) dedup-upsert + emit-only-when-new all
+      // live in the shared echo persister (also used by Instagram is_echo events).
+      await persistEchoedOutboundMessage({
+        hotelId:     hotel.id,
         fromPhone:   hotelPhoneNorm,
-        toPhone:     guestPhoneRaw,
+        guestPhone:  guestPhoneRaw,
         body,
         messageType: outbound ? outbound.messageType
                               : VALID_MSG_TYPES.has(msgType) ? msgType : "text",
         ...(outbound ? { metadata: outbound.metadata } : {}),
-        hotelId:     hotel.id,
-        guestId:     guest.id,
+        wamid,
         channel:     MessageChannel.WHATSAPP,
-        status:      MessageStatus.SENT,
-        ...(wamid ? { wamid } : {}),
-      };
-
-      let saved;
-      let isNew = true;
-      if (wamid) {
-        // DB-safe dedup via the (hotelId, wamid) unique constraint — an echo
-        // re-delivered by Meta resolves to the same row instead of racing a
-        // check-then-create. Detect whether this call created the row (vs.
-        // hit an existing one) so message:new is never re-emitted for an
-        // echo that was already stored.
-        const before = await prisma.message.findUnique({
-          where: { hotelId_wamid: { hotelId: hotel.id, wamid } },
-          select: { id: true },
-        });
-        isNew = !before;
-        saved = await prisma.message.upsert({
-          where:  { hotelId_wamid: { hotelId: hotel.id, wamid } },
-          create: messageData,
-          update: {},
-        });
-      } else {
-        // No wamid to key on — same fallback behaviour as before this change.
-        saved = await prisma.message.create({ data: messageData });
-      }
-
-      if (isNew) {
-        emitToHotel(hotel.id, "message:new", { message: saved });
-      }
+      });
     }
   } catch (err) {
     log.error({ err }, "processSmbMessageEcho error");

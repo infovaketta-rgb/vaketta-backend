@@ -1,15 +1,62 @@
 import { MessageChannel } from "@prisma/client";
-import { logIncomingMessage } from "./message.service";
+import { logIncomingMessage, resolveHotelByChannel } from "./message.service";
+import { persistEchoedOutboundMessage } from "./echoPersist.service";
+import { logger } from "../utils/logger";
 export { encryptInstagramToken, decryptInstagramToken } from "../utils/encryption.utils";
 
+const log = logger.child({ service: "instagram" });
+
 export async function processInstagramInboundEvent(event: any): Promise<void> {
-  console.log("[Instagram] recipient:", event.recipient?.id, "sender:", event.sender?.id, "mid:", event.message?.mid);
   const senderId    = event.sender?.id    as string | undefined;
   const recipientId = event.recipient?.id as string | undefined;
   const mid         = event.message?.mid  as string | undefined;
   const text        = event.message?.text as string | null ?? null;
 
   if (!senderId || !recipientId || !mid) return;
+
+  // ── Echo events (message.is_echo === true) ─────────────────────────────────
+  // Meta mirrors messages the business SENT (e.g. staff replying from the
+  // Instagram app) back to every subscription of the sending account. The ID
+  // roles are flipped vs. inbound: sender = business account, recipient = the
+  // guest's account-scoped IGSID. Never run these through the inbound flow —
+  // resolving a hotel by the guest IGSID can only ever fail.
+  if (event.message?.is_echo === true) {
+    const hotel = await resolveHotelByChannel(MessageChannel.INSTAGRAM, senderId);
+    if (!hotel) {
+      // Expected when another IG professional account is subscribed to the same
+      // Meta app (its echoes reach us too) — permanently unresolvable, skip
+      // without throwing so the job never burns retries or dead letters.
+      log.debug({ senderId, mid }, "instagram echo: sender is not a connected hotel — skipping");
+      return;
+    }
+    if (!text) {
+      // Attachment-only echoes (reels, media shares) — not stored yet, matching
+      // the text-only outbound Instagram messages Vaketta itself sends.
+      log.debug({ senderId, mid }, "instagram echo: no text body — skipping");
+      return;
+    }
+    await persistEchoedOutboundMessage({
+      hotelId:     hotel.id,
+      fromPhone:   hotel.phone,          // same business-side identifier as staff replies sent from Vaketta
+      guestPhone:  recipientId,          // guest IGSID in this account's scope
+      body:        text,
+      messageType: "text",
+      wamid:       mid,                  // (hotelId, wamid) unique constraint dedups redeliveries
+      channel:     MessageChannel.INSTAGRAM,
+    });
+    return;
+  }
+
+  // ── Normal inbound (guest → hotel) ──────────────────────────────────────────
+  // Pre-check hotel resolution so an unknown recipient is a permanent skip, not
+  // a thrown error: logIncomingMessage's throw would make BullMQ retry an event
+  // that can never succeed. Transient failures (DB down) still throw below and
+  // still retry.
+  const hotel = await resolveHotelByChannel(MessageChannel.INSTAGRAM, recipientId);
+  if (!hotel) {
+    log.warn({ recipientId, senderId, mid }, "instagram inbound: no connected hotel for recipient — skipping");
+    return;
+  }
 
   // Delegate to the shared inbound pipeline — this gives Instagram the same
   // guest upsert, socket emit, bot auto-reply, push notification, and usage

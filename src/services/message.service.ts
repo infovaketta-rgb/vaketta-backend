@@ -17,7 +17,10 @@ const log = logger.child({ service: "message" });
 // ── Channel-aware hotel resolution ───────────────────────────────────────────
 // WhatsApp  → hotel matched by its phone number (the Meta-registered number)
 // Instagram → hotel matched via HotelConfig.instagramBusinessAccountId
-async function resolveHotelByChannel(channel: MessageChannel, recipientId: string) {
+// Exported so channel services can pre-check resolution and treat "no hotel"
+// as a permanent skip instead of letting logIncomingMessage throw (a hotel
+// that doesn't exist won't appear on a BullMQ retry).
+export async function resolveHotelByChannel(channel: MessageChannel, recipientId: string) {
   if (channel === MessageChannel.INSTAGRAM) {
     const cfg = await prisma.hotelConfig.findUnique({
       where:   { instagramBusinessAccountId: recipientId },
