@@ -334,7 +334,12 @@ export async function connectWhatsAppEmbeddedSignup(
   invalidateCredentialsCache(hotelId); // creds just rotated → drop send-path cache
   console.log("[embedded-signup] Credentials saved for hotel:", hotelId);
 
-  // 4. Trigger history sync — wrapped in its own try/catch that ALWAYS logs
+  // 4. Trigger history sync — on EVERY successful embedded signup, including a
+  // reconnect of an already-connected hotel. Duplicate protection lives at the
+  // DB layer now (Message @@unique([hotelId, wamid]) + upsert-based dedup in
+  // history.service.ts), so re-triggering Meta's history redelivery on
+  // reconnect is safe: reprocessed chunks resolve to the SAME rows instead of
+  // inserting duplicates. Wrapped in its own try/catch that ALWAYS logs.
   try {
     console.log("[history] Calling smb_app_data for phoneNumberId:", phoneNumberId);
     const smbRes = await fetch(
@@ -352,8 +357,9 @@ export async function connectWhatsAppEmbeddedSignup(
       await prisma.hotel.update({
         where: { id: hotelId },
         data: {
-          historySyncStatus:  "pending",
-          historySyncStarted: new Date(),
+          historySyncStatus:    "pending",
+          historySyncStarted:   new Date(),
+          historySyncCompleted: null,
         },
       });
       console.log("[history] Sync triggered successfully for hotel:", hotelId);
@@ -368,6 +374,48 @@ export async function connectWhatsAppEmbeddedSignup(
   // 5. Return success response to frontend
   console.log("[embedded-signup] Onboarding complete for hotel:", hotelId);
   return { phoneNumberId, wabaId };
+}
+
+// Explicit history re-sync for an already-connected hotel — lets a hotel
+// re-pull WhatsApp chat history without going through the OAuth dialog again
+// (connectWhatsAppEmbeddedSignup already re-syncs on every reconnect; this is
+// for re-syncing WITHOUT reconnecting). Reuses the stored credentials; does
+// not touch the OAuth token/WABA/phone number. Safe against duplicates for
+// the same reason reconnect is: Message's (hotelId, wamid) unique constraint
+// + upsert-based dedup in history.service.ts, not any gating here.
+export async function triggerWhatsAppHistoryResync(hotelId: string): Promise<void> {
+  const config = await prisma.hotelConfig.findUnique({ where: { hotelId } });
+  const phoneNumberId = config?.metaPhoneNumberId ?? "";
+  if (!phoneNumberId || !config?.metaAccessTokenEncrypted) {
+    throw new Error("WhatsApp is not connected for this hotel");
+  }
+  const accessToken = decryptWhatsAppToken(config.metaAccessTokenEncrypted);
+
+  const platformRow = await prisma.platformSettings.findUnique({ where: { id: "global" } }) as PlatformRow;
+  const apiVersion   = platformRow?.metaApiVersion ?? "v25.0";
+
+  const smbRes = await fetch(
+    `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/smb_app_data`,
+    {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+      body:    JSON.stringify({ messaging_product: "whatsapp", sync_type: "history" }),
+    }
+  );
+  const smbBody = await smbRes.json() as any;
+  if (!smbRes.ok) {
+    throw new Error(smbBody?.error?.message ?? "Failed to trigger history re-sync");
+  }
+
+  await prisma.hotel.update({
+    where: { id: hotelId },
+    data: {
+      historySyncStatus:    "pending",
+      historySyncStarted:   new Date(),
+      historySyncCompleted: null,
+    },
+  });
+  console.log("[history] Explicit re-sync triggered for hotel:", hotelId);
 }
 
 export async function updateHotelProfile(

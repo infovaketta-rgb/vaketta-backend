@@ -18,6 +18,7 @@
  *   flow-resume            → flowResumeWorker         (delayed flow continuation)
  *   confirmation-sequence  → confirmationSequence.worker (staff-confirmed sends)
  *   whatsapp-out           → outboundSend.worker      (durable delayed staff replies)
+ *   history-media          → historyMedia.worker      (backfills media on historical sync messages)
  */
 import { logger } from "../utils/logger";
 
@@ -26,6 +27,7 @@ import "../workers/instagram.worker";
 import "../workers/flowResumeWorker";
 import "../workers/confirmationSequence.worker";
 import "../workers/outboundSend.worker";
+import "../workers/historyMedia.worker";
 
 const log = logger.child({ service: "workers" });
 
@@ -35,6 +37,7 @@ const WORKER_QUEUES = [
   "flow-resume",
   "confirmation-sequence",
   "whatsapp-out",
+  "history-media",
 ] as const;
 
 /** No-op initializer — importing this module has already started the workers.

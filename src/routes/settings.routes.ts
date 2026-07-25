@@ -18,6 +18,7 @@ import {
   patchWhatsAppHandler,
   testWhatsAppHandler,
   embeddedSignupHandler,
+  resyncWhatsAppHistoryHandler,
   getInstagramHandler,
   patchInstagramHandler,
   deleteAllChatsHandler,
@@ -52,6 +53,7 @@ router.get("/whatsapp",             getWhatsAppHandler);
 router.patch("/whatsapp",           patchWhatsAppHandler);
 router.post("/whatsapp/test",             testWhatsAppHandler);
 router.post("/whatsapp/embedded-signup",  embeddedSignupHandler);
+router.post("/whatsapp/resync-history",   resyncWhatsAppHistoryHandler);
 
 router.get("/instagram",                       getInstagramHandler);
 router.patch("/instagram",                     patchInstagramHandler);

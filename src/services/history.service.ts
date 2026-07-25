@@ -3,6 +3,8 @@ import { normalizePhone } from "../utils/phone";
 import { emitToHotel } from "../realtime/emit";
 import { MessageChannel, MessageStatus } from "@prisma/client";
 import { logger } from "../utils/logger";
+import { extractMediaFromWebhookMessage } from "./media.service";
+import { historyMediaQueue } from "../queue/historyMedia.queue";
 
 const log = logger.child({ service: "history" });
 
@@ -136,10 +138,6 @@ async function processThread(
     const wamid = (msg?.id as string | undefined) ?? null;
     if (!wamid) continue;
 
-    // Deduplicate: skip if this wamid is already stored for this hotel
-    const exists = await prisma.message.findFirst({ where: { wamid, hotelId } });
-    if (exists) continue;
-
     const fromNorm  = normalizePhone((msg.from as string) ?? "");
     const direction = fromNorm === hotelPhoneNorm ? "OUT" : "IN";
     const fromPhone = direction === "OUT" ? hotelPhoneNorm : guestPhone;
@@ -168,21 +166,51 @@ async function processThread(
       direction === "IN"      ? MessageStatus.RECEIVED  :
                                 MessageStatus.SENT;
 
-    await prisma.message.create({
-      data: {
-        direction,
-        fromPhone,
-        toPhone,
-        body,
-        messageType: VALID_MSG_TYPES.has(msgType) ? msgType : "text",
-        hotelId,
-        guestId:   guest.id,
-        channel:   MessageChannel.WHATSAPP,
-        status,
-        wamid,
-        timestamp,
-      },
+    // Media messages (image/video/audio/document/sticker): the history payload
+    // carries a media ID, not a downloadable URL — same shape as live inbound
+    // messages. Reuse extractMediaFromWebhookMessage (no duplicated parsing),
+    // write a `pending://{mediaId}` placeholder so the row exists immediately,
+    // then queue the actual Graph-API-fetch + R2-upload so bulk import never
+    // blocks on network I/O per message. historyMedia.worker backfills it via
+    // the SAME downloadMetaMedia() pipeline live inbound uses.
+    const media = extractMediaFromWebhookMessage(msg);
+
+    const messageData = {
+      direction,
+      fromPhone,
+      toPhone,
+      body,
+      messageType: VALID_MSG_TYPES.has(msgType) ? msgType : "text",
+      hotelId,
+      guestId:   guest.id,
+      channel:   MessageChannel.WHATSAPP,
+      status,
+      wamid,
+      timestamp,
+      ...(media
+        ? { mediaUrl: `pending://${media.mediaId}`, mimeType: media.mimeType, fileName: media.fileName }
+        : {}),
+    };
+
+    // Upsert on the (hotelId, wamid) unique constraint — DB-safe dedup instead
+    // of a check-then-create race. Meta re-delivering the same chunk, two
+    // chunks processed concurrently, or a reconnect re-syncing the same
+    // history all resolve to the SAME row: the first write creates it, every
+    // later attempt hits the unique index and no-ops via `update: {}` instead
+    // of racing to insert a duplicate.
+    const created = await prisma.message.upsert({
+      where:  { hotelId_wamid: { hotelId, wamid } },
+      create: messageData,
+      update: {}, // already stored — leave the existing row untouched
     });
+
+    if (media) {
+      await historyMediaQueue.add(
+        "history-media",
+        { messageId: created.id, mediaId: media.mediaId, mimeType: media.mimeType, hotelPhone: hotelPhoneNorm },
+        { jobId: created.id },
+      );
+    }
   }
 }
 
@@ -212,12 +240,6 @@ export async function processSmbMessageEcho(value: any): Promise<void> {
       const guestPhoneRaw = normalizePhone((msg.to as string) ?? "");
       if (!guestPhoneRaw) continue;
 
-      // Deduplicate by wamid
-      if (wamid) {
-        const exists = await prisma.message.findFirst({ where: { wamid, hotelId: hotel.id } });
-        if (exists) continue;
-      }
-
       const guest = await prisma.guest.upsert({
         where:  { phone_hotelId: { phone: guestPhoneRaw, hotelId: hotel.id } },
         create: { phone: guestPhoneRaw, hotelId: hotel.id },
@@ -232,22 +254,45 @@ export async function processSmbMessageEcho(value: any): Promise<void> {
         msg.document?.caption ??
         null;
 
-      const saved = await prisma.message.create({
-        data: {
-          direction:   "OUT",
-          fromPhone:   hotelPhoneNorm,
-          toPhone:     guestPhoneRaw,
-          body,
-          messageType: VALID_MSG_TYPES.has(msgType) ? msgType : "text",
-          hotelId:     hotel.id,
-          guestId:     guest.id,
-          channel:     MessageChannel.WHATSAPP,
-          status:      MessageStatus.SENT,
-          ...(wamid ? { wamid } : {}),
-        },
-      });
+      const messageData = {
+        direction:   "OUT",
+        fromPhone:   hotelPhoneNorm,
+        toPhone:     guestPhoneRaw,
+        body,
+        messageType: VALID_MSG_TYPES.has(msgType) ? msgType : "text",
+        hotelId:     hotel.id,
+        guestId:     guest.id,
+        channel:     MessageChannel.WHATSAPP,
+        status:      MessageStatus.SENT,
+        ...(wamid ? { wamid } : {}),
+      };
 
-      emitToHotel(hotel.id, "message:new", { message: saved });
+      let saved;
+      let isNew = true;
+      if (wamid) {
+        // DB-safe dedup via the (hotelId, wamid) unique constraint — an echo
+        // re-delivered by Meta resolves to the same row instead of racing a
+        // check-then-create. Detect whether this call created the row (vs.
+        // hit an existing one) so message:new is never re-emitted for an
+        // echo that was already stored.
+        const before = await prisma.message.findUnique({
+          where: { hotelId_wamid: { hotelId: hotel.id, wamid } },
+          select: { id: true },
+        });
+        isNew = !before;
+        saved = await prisma.message.upsert({
+          where:  { hotelId_wamid: { hotelId: hotel.id, wamid } },
+          create: messageData,
+          update: {},
+        });
+      } else {
+        // No wamid to key on — same fallback behaviour as before this change.
+        saved = await prisma.message.create({ data: messageData });
+      }
+
+      if (isNew) {
+        emitToHotel(hotel.id, "message:new", { message: saved });
+      }
     }
   } catch (err) {
     log.error({ err }, "processSmbMessageEcho error");

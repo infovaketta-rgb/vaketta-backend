@@ -13,6 +13,7 @@ import {
   updateWhatsAppConfig,
   testWhatsAppConnection,
   connectWhatsAppEmbeddedSignup,
+  triggerWhatsAppHistoryResync,
   getInstagramConfig,
   updateInstagramConfig,
   getPlatformSettings,
@@ -213,6 +214,21 @@ export async function embeddedSignupHandler(req: Request, res: Response) {
       hotelId(req), code, wabaId, phoneNumberId, redirectUri ?? "",
     );
     res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(502).json({ error: err.message });
+  }
+}
+
+// Explicit, standalone history re-sync — for a hotel that is ALREADY connected
+// and wants to re-pull WhatsApp chat history without going through the full
+// OAuth dialog again (e.g. "Re-sync chat history" button in Settings). Reuses
+// the hotel's already-stored credentials; does not touch metaAccessToken /
+// metaWabaId / metaPhoneNumberId. Duplicate-safe: relies on the same
+// (hotelId, wamid) unique-constraint + upsert dedup as every other import path.
+export async function resyncWhatsAppHistoryHandler(req: Request, res: Response) {
+  try {
+    await triggerWhatsAppHistoryResync(hotelId(req));
+    res.json({ success: true });
   } catch (err: any) {
     res.status(502).json({ error: err.message });
   }
