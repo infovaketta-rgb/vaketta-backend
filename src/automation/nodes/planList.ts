@@ -1,25 +1,19 @@
 /**
  * planList.ts
  *
- * Injectable WhatsApp interactive-LIST sender for the advanced_room_allocation
- * node's multi-plan Phase 1. The list message carries the full per-plan
- * breakdown in its body (≤1,024 chars) and the plans as tappable rows in a
- * modal — one message, no carousel, no separate pre-text. Kept OUT of
- * advancedRoomAllocation.ts (which stays import-free / dependency-injected) —
- * this file owns the DB + Meta + socket side effects. Mirrors
- * `trySendOptionsList` in flowRuntime.ts exactly.
+ * Injectable "choice" sender for the advanced_room_allocation node's multi-plan
+ * Phase 1. The interactive message carries the full per-plan breakdown in its
+ * body (≤1,024 chars) and the plans as tappable `plan_N` rows — rendered as a
+ * WhatsApp list or Instagram quick replies by the channel renderer behind
+ * sendOutbound. Kept OUT of advancedRoomAllocation.ts (which stays
+ * import-free / dependency-injected).
  *
- * `buildPlanDescription` / `buildPlanDetailText` are pure + exported for unit
- * testing; importing this module is side-effect-free at load (Prisma client is
- * lazy; the whatsapp service + encryption util only act when called; emit is
- * imported dynamically).
+ * `buildPlanDescription` / `buildPlanDetailText` / `chunkPlanDetailText` are
+ * pure + exported for unit testing.
  */
 
-import prisma from "../../db/connect";
-import { sendListMessage, sendTextMessage } from "../../services/whatsapp.send.service";
-import { buildListMetadata } from "../../services/interactiveReply.service";
-import { decryptWhatsAppToken } from "../../utils/encryption.utils";
-import { MessageChannel, MessageStatus } from "@prisma/client";
+import { sendOutbound } from "../../services/outbound/outbound.service";
+import { MessageChannel } from "@prisma/client";
 import { logger } from "../../utils/logger";
 import type { AllocationPlan, AllocationRoomInput } from "./advancedRoomAllocation";
 
@@ -144,30 +138,16 @@ export function buildPlanDetailText(plans: AllocationPlan[]): string {
 export async function trySendPlanList(args: {
   hotelId:              string;
   guestId:              string;
+  channel:              MessageChannel;
   plans:                AllocationPlan[];
   // Kept for API compatibility (callers still pass it); the plan list no longer
   // renders a per-room-type section now that preference is collected up front.
   eligibleRoomInputs?:  AllocationRoomInput[];
 }): Promise<boolean> {
-  const { hotelId, guestId, plans } = args;
+  const { hotelId, guestId, channel, plans } = args;
   if (plans.length === 0) return false;
-  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
 
   try {
-    const [hotel, guest] = await Promise.all([
-      prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
-      prisma.guest.findUnique({ where: { id: guestId } }),
-    ]);
-    if (!hotel || !guest) return false;
-
-    const cfg = hotel.config;
-    const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
-    const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
-    if (!phoneNumberId || !encryptedTok) return false;
-    const accessToken = decryptWhatsAppToken(encryptedTok);
-
-    const buttonLabel = "View Plans";
-
     // Smart-plan rows (Piece 2C): "{label} — ₹{total}" title + rationale description.
     // Falls back to the legacy "Plan N — ₹total" / buildPlanDescription when a plan
     // carries no label/rationale (legacy generatePlans output).
@@ -184,61 +164,26 @@ export async function trySendPlanList(args: {
     const sections = [{ title: "Choose a Plan", rows: planRows }];
 
     // Chunk plan detail text so no single message exceeds MAX_BODY.
-    // All chunks except the last are plain text; the last carries the list button.
+    // All chunks except the last are plain text; the last carries the choice UI.
     const chunks = chunkPlanDetailText(plans);
     const lastChunk = chunks[chunks.length - 1]!;
 
-    // Send any leading plain-text chunks
+    // Send any leading plain-text chunks — a chunk failure aborts the whole
+    // plan list (caller falls back to the text rendering), matching the old
+    // throw-through behaviour.
     for (const chunk of chunks.slice(0, -1)) {
-      await sendTextMessage({
-        toPhone:   guest.phone,
-        fromPhone: hotel.phone,
-        hotelId,
-        guestId,
-        text:      chunk,
-      });
-      await prisma.message.create({
-        data: {
-          direction:   "OUT",
-          fromPhone:   hotel.phone,
-          toPhone:     guest.phone,
-          body:        chunk,
-          messageType: "text",
-          hotelId,
-          guestId,
-          channel:     MessageChannel.WHATSAPP,
-          status:      MessageStatus.SENT,
-        },
-      });
+      const chunkRes = await sendOutbound({ hotelId, guestId, channel }, { kind: "text", text: chunk });
+      if (!chunkRes.sent) return false;
     }
 
-    // Last chunk — interactive list with plan + room-type rows
-    const wamid = await sendListMessage(guest.phone, phoneNumberId, accessToken, {
+    // Last chunk — the interactive plan choice (WA list / IG quick replies)
+    const res = await sendOutbound({ hotelId, guestId, channel }, {
+      kind:        "choice",
       bodyText:    lastChunk,
-      buttonLabel,
+      buttonLabel: "View Plans",
       sections,
     });
-
-    const saved = await prisma.message.create({
-      data: {
-        direction:   "OUT",
-        fromPhone:   hotel.phone,
-        toPhone:     guest.phone,
-        body:        lastChunk,
-        messageType: "list",
-        metadata:    buildListMetadata(buttonLabel, sections),
-        hotelId,
-        guestId,
-        channel:     MessageChannel.WHATSAPP,
-        status:      MessageStatus.SENT,
-        wamid,
-      },
-    });
-
-    const { emitToHotel } = await import("../../realtime/emit");
-    emitToHotel(hotelId, "message:new", { message: saved });
-
-    return true;
+    return res.sent;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "plan list send failed — falling back to text list");
     return false;

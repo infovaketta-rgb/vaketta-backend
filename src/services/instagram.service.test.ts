@@ -156,3 +156,55 @@ describe("Instagram echo events (staff replies from the Instagram app)", () => {
     expect(logIncomingMessage).not.toHaveBeenCalled();
   });
 });
+
+describe("interactive reply normalization (quick replies + postbacks)", () => {
+  beforeEach(() => resolveHotelByChannel.mockResolvedValue(HOTEL));
+
+  it("quick-reply tap: body = tapped title, botBody = payload id, metadata = quick_reply", async () => {
+    await processInstagramInboundEvent(inboundEvent({
+      message: { mid: "mid.QR1", text: "First option", quick_reply: { payload: "opt_0" } },
+    }));
+
+    expect(logIncomingMessage).toHaveBeenCalledWith({
+      fromPhone:   "996345286534670",
+      toPhone:     "17841443797859809",
+      body:        "First option",   // human-readable title in the chat bubble
+      messageType: "text",
+      wamid:       "mid.QR1",
+      channel:     "INSTAGRAM",
+      botBody:     "opt_0",          // what the flow engine matches on
+      metadata:    { interactiveReply: { type: "quick_reply", id: "opt_0", title: "First option", description: null } },
+    });
+  });
+
+  it("postback tap (button/generic template): mid from event.postback, body = title, botBody = payload", async () => {
+    await processInstagramInboundEvent(inboundEvent({
+      message: undefined,
+      postback: { mid: "mid.PB1", title: "Choose", payload: "room_rt1" },
+    }));
+
+    expect(logIncomingMessage).toHaveBeenCalledWith({
+      fromPhone:   "996345286534670",
+      toPhone:     "17841443797859809",
+      body:        "Choose",
+      messageType: "text",
+      wamid:       "mid.PB1",
+      channel:     "INSTAGRAM",
+      botBody:     "room_rt1",
+      metadata:    { interactiveReply: { type: "button_reply", id: "room_rt1", title: "Choose", description: null } },
+    });
+  });
+
+  it("plain text message stays byte-identical (no botBody/metadata keys added)", async () => {
+    await processInstagramInboundEvent(inboundEvent());
+
+    expect(logIncomingMessage).toHaveBeenCalledWith({
+      fromPhone:   "996345286534670",
+      toPhone:     "17841443797859809",
+      body:        "Hi",
+      messageType: "text",
+      wamid:       "mid.INBOUND1",
+      channel:     "INSTAGRAM",
+    });
+  });
+});

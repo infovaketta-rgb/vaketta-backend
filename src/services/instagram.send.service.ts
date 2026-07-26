@@ -1,5 +1,7 @@
 import prisma from "../db/connect";
-import { decryptInstagramToken } from "./instagram.service";
+// Import from encryption.utils directly — the ./instagram.service re-export
+// would drag in message.service → realtime/emit → server.ts (heavy chain).
+import { decryptInstagramToken } from "../utils/encryption.utils";
 import { logger } from "../utils/logger";
 
 const VERSION_TTL_MS = 300_000;
@@ -118,23 +120,21 @@ async function metaPost(
 
 
 
-export async function sendInstagramTextMessage(
- input:{
-   toPhone:string; // ig scoped id
-   text:string;
-   hotelId:string;
- }
+// ── Shared dispatch (gate → creds → mock → guard → retry) ────────────────────
+// Every IG send goes through the same lifecycle: the outbound feature flag, the
+// hotel's stored IG-Login token, the mock short-circuit, and the connect-
+// completeness guard. `message` is the IG-Login `message` object; the recipient
+// wrapper and retry policy are identical for all message shapes.
+async function dispatchInstagramMessage(
+ hotelId:string,
+ toPhone:string, // ig scoped id
+ message:object,
+ mockLabel:string,
+ mockMeta:Record<string,unknown> = {},
 ){
-
     if(process.env.INSTAGRAM_OUTBOUND_ENABLED !== "true"){
         throw new Error("Instagram outbound disabled");
     }
-
- const {
-   toPhone,
-   text,
-   hotelId
- }=input;
 
  const {
    accessToken,
@@ -146,7 +146,7 @@ export async function sendInstagramTextMessage(
  );
 
  if(mockMode){
-   log.info({ toPhone, preview: text?.slice(0, 80) }, "MOCK INSTAGRAM send");
+   log.info({ toPhone, ...mockMeta }, mockLabel);
    return null;
  }
 
@@ -163,9 +163,145 @@ export async function sendInstagramTextMessage(
    recipient:{
      id:toPhone
    },
-   message:{
-      text
-   }
+   message
  },accessToken));
+}
 
+export async function sendInstagramTextMessage(
+ input:{
+   toPhone:string; // ig scoped id
+   text:string;
+   hotelId:string;
+ }
+){
+ const { toPhone, text, hotelId } = input;
+ return dispatchInstagramMessage(
+   hotelId, toPhone,
+   { text },
+   "MOCK INSTAGRAM send",
+   { preview: text?.slice(0, 80) },
+ );
+}
+
+// ── Interactive sends (IG-Login messaging API) ────────────────────────────────
+// Caps per Meta docs: quick replies ≤13 (title ≤20); button template ≤3 buttons
+// (title ≤20, text ≤640); generic template ≤10 elements (title/subtitle ≤80,
+// ≤3 buttons each). Callers (the Instagram renderer) enforce the count caps and
+// decide fallback; these senders only apply the hard character slices, mirroring
+// how the WhatsApp senders own their own title slices.
+
+export async function sendInstagramQuickReplies(
+ input:{
+   toPhone:string;
+   hotelId:string;
+   text:string;
+   quickReplies:Array<{ title:string; payload:string }>;
+ }
+){
+ const { toPhone, hotelId, text, quickReplies } = input;
+ return dispatchInstagramMessage(
+   hotelId, toPhone,
+   {
+     text,
+     quick_replies: quickReplies.map((q)=>({
+       content_type: "text",
+       title:        q.title.slice(0, 20),
+       payload:      q.payload,
+     })),
+   },
+   "MOCK INSTAGRAM quick-replies send",
+   { count: quickReplies.length },
+ );
+}
+
+export async function sendInstagramButtonTemplate(
+ input:{
+   toPhone:string;
+   hotelId:string;
+   text:string;
+   buttons:Array<{ title:string; payload:string }>;
+ }
+){
+ const { toPhone, hotelId, text, buttons } = input;
+ return dispatchInstagramMessage(
+   hotelId, toPhone,
+   {
+     attachment:{
+       type:"template",
+       payload:{
+         template_type:"button",
+         text,
+         buttons: buttons.map((b)=>({
+           type:    "postback",
+           title:   b.title.slice(0, 20),
+           payload: b.payload,
+         })),
+       },
+     },
+   },
+   "MOCK INSTAGRAM button-template send",
+   { count: buttons.length },
+ );
+}
+
+export type InstagramGenericElement = {
+  title:     string;
+  subtitle?: string;
+  imageUrl?: string;
+  buttons:   Array<{ title:string; payload:string }>;
+};
+
+export async function sendInstagramGenericTemplate(
+ input:{
+   toPhone:string;
+   hotelId:string;
+   elements:InstagramGenericElement[];
+ }
+){
+ const { toPhone, hotelId, elements } = input;
+ return dispatchInstagramMessage(
+   hotelId, toPhone,
+   {
+     attachment:{
+       type:"template",
+       payload:{
+         template_type:"generic",
+         elements: elements.map((el)=>({
+           title: el.title.slice(0, 80),
+           ...(el.subtitle ? { subtitle: el.subtitle.slice(0, 80) } : {}),
+           ...(el.imageUrl ? { image_url: el.imageUrl } : {}),
+           buttons: el.buttons.slice(0, 3).map((b)=>({
+             type:    "postback",
+             title:   b.title.slice(0, 20),
+             payload: b.payload,
+           })),
+         })),
+       },
+     },
+   },
+   "MOCK INSTAGRAM generic-template send",
+   { count: elements.length },
+ );
+}
+
+export async function sendInstagramMediaMessage(
+ input:{
+   toPhone:string;
+   hotelId:string;
+   mediaType:"image"|"video"|"audio";
+   mediaUrl:string;
+ }
+){
+ const { toPhone, hotelId, mediaType, mediaUrl } = input;
+ return dispatchInstagramMessage(
+   hotelId, toPhone,
+   {
+     attachment:{
+       type:    mediaType,
+       payload: { url: mediaUrl },
+     },
+   },
+   "MOCK INSTAGRAM media send",
+   { mediaType, mediaUrl },
+ );
 }

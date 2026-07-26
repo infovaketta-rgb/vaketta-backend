@@ -23,7 +23,7 @@ vi.mock("../db/connect", () => ({
 }));
 
 const decryptInstagramToken = vi.fn((..._a: any[]) => "IGAA_TEST_TOKEN_abc123");
-vi.mock("./instagram.service", () => ({
+vi.mock("../utils/encryption.utils", () => ({
   decryptInstagramToken: (...a: any[]) => decryptInstagramToken(...a),
 }));
 
@@ -31,7 +31,13 @@ vi.mock("../utils/logger", () => ({
   logger: { child: () => ({ debug: vi.fn(), warn: vi.fn(), info: vi.fn(), error: vi.fn() }) },
 }));
 
-import { sendInstagramTextMessage } from "./instagram.send.service";
+import {
+  sendInstagramTextMessage,
+  sendInstagramQuickReplies,
+  sendInstagramButtonTemplate,
+  sendInstagramGenericTemplate,
+  sendInstagramMediaMessage,
+} from "./instagram.send.service";
 
 const fetchMock = vi.fn();
 
@@ -155,5 +161,104 @@ describe("sendInstagramTextMessage — IG-Login messaging endpoint", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ── Interactive senders — exact IG-Login wire shapes ─────────────────────────
+
+describe("Instagram interactive senders — wire shapes", () => {
+  const parseBody = () => JSON.parse(fetchMock.mock.calls[0]![1].body);
+
+  beforeEach(() => {
+    fetchMock.mockResolvedValue(graphOk({ message_id: "mid.INT" }));
+  });
+
+  it("quick replies: text + quick_replies[] with content_type/title(≤20)/payload", async () => {
+    await sendInstagramQuickReplies({
+      toPhone: "996345286534670", hotelId: "hotel_1",
+      text: "Pick one:",
+      quickReplies: [
+        { title: "A very long option title over 20", payload: "opt_0" },
+        { title: "Second", payload: "opt_1" },
+      ],
+    });
+    expect(fetchMock.mock.calls[0]![0]).toBe("https://graph.instagram.com/v25.0/me/messages");
+    expect(parseBody()).toEqual({
+      recipient: { id: "996345286534670" },
+      message: {
+        text: "Pick one:",
+        quick_replies: [
+          { content_type: "text", title: "A very long option t", payload: "opt_0" },
+          { content_type: "text", title: "Second",               payload: "opt_1" },
+        ],
+      },
+    });
+  });
+
+  it("button template: attachment/template/button with postback buttons", async () => {
+    await sendInstagramButtonTemplate({
+      toPhone: "996345286534670", hotelId: "hotel_1",
+      text: "Confirm?",
+      buttons: [{ title: "✅ Confirm", payload: "CONFIRM_BOOKING" }],
+    });
+    expect(parseBody()).toEqual({
+      recipient: { id: "996345286534670" },
+      message: {
+        attachment: {
+          type: "template",
+          payload: {
+            template_type: "button",
+            text: "Confirm?",
+            buttons: [{ type: "postback", title: "✅ Confirm", payload: "CONFIRM_BOOKING" }],
+          },
+        },
+      },
+    });
+  });
+
+  it("generic template: elements with title/subtitle(≤80)/image_url/postbacks", async () => {
+    await sendInstagramGenericTemplate({
+      toPhone: "996345286534670", hotelId: "hotel_1",
+      elements: [{
+        title: "Deluxe", subtitle: "₹5,000/night — Sea view", imageUrl: "https://r2/d.jpg",
+        buttons: [{ title: "Choose", payload: "room_rt1" }, { title: "View Photos", payload: "photos_rt1" }],
+      }],
+    });
+    expect(parseBody()).toEqual({
+      recipient: { id: "996345286534670" },
+      message: {
+        attachment: {
+          type: "template",
+          payload: {
+            template_type: "generic",
+            elements: [{
+              title: "Deluxe", subtitle: "₹5,000/night — Sea view", image_url: "https://r2/d.jpg",
+              buttons: [
+                { type: "postback", title: "Choose",      payload: "room_rt1" },
+                { type: "postback", title: "View Photos", payload: "photos_rt1" },
+              ],
+            }],
+          },
+        },
+      },
+    });
+  });
+
+  it("media: attachment with type + payload.url", async () => {
+    await sendInstagramMediaMessage({
+      toPhone: "996345286534670", hotelId: "hotel_1", mediaType: "image", mediaUrl: "https://r2/x.jpg",
+    });
+    expect(parseBody()).toEqual({
+      recipient: { id: "996345286534670" },
+      message: { attachment: { type: "image", payload: { url: "https://r2/x.jpg" } } },
+    });
+  });
+
+  it("interactive senders share the outbound gate: disabled flag throws, no fetch", async () => {
+    vi.stubEnv("INSTAGRAM_OUTBOUND_ENABLED", "false");
+    await expect(
+      sendInstagramQuickReplies({ toPhone: "x", hotelId: "hotel_1", text: "t", quickReplies: [] }),
+    ).rejects.toThrow("Instagram outbound disabled");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

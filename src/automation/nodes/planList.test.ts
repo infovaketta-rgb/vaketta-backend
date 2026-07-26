@@ -1,25 +1,18 @@
 /**
  * Tests for planList.ts. The pure buildPlanDetailText cases need no DB/API; the
- * trySendPlanList cases mock prisma + sendListMessage + emit so we can assert the
- * single interactive-list send (plan_N rows, messageType "list") and the body
- * truncation edge case.
+ * trySendPlanList cases mock the outbound pipeline (sendOutbound) so we can
+ * assert the single "choice" payload (plan_N rows) and the chunking edge case —
+ * the channel-specific wire format is the renderer suites' concern.
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-vi.mock("../../db/connect", () => ({
-  default: {
-    hotel:   { findUnique: vi.fn() },
-    guest:   { findUnique: vi.fn() },
-    message: { create:     vi.fn() },
-  },
+const sendOutbound = vi.fn();
+vi.mock("../../services/outbound/outbound.service", () => ({
+  sendOutbound: (...a: any[]) => sendOutbound(...a),
 }));
-vi.mock("../../services/whatsapp.send.service", () => ({ sendListMessage: vi.fn(), sendTextMessage: vi.fn() }));
-vi.mock("../../utils/encryption.utils", () => ({ decryptWhatsAppToken: vi.fn(() => "tok") }));
-vi.mock("../../realtime/emit", () => ({ emitToHotel: vi.fn() }));
 
-import prisma from "../../db/connect";
-import { sendListMessage } from "../../services/whatsapp.send.service";
+import { MessageChannel } from "@prisma/client";
 import { buildPlanDetailText, buildPlanDescription, trySendPlanList } from "./planList";
 import type { AllocationPlan, AllocationRoom } from "./advancedRoomAllocation";
 
@@ -46,8 +39,10 @@ function pl(over: Partial<AllocationPlan> = {}): AllocationPlan {
   };
 }
 
-type ListOpts = { bodyText: string; buttonLabel: string; sections: { title: string; rows: { id: string; title: string; description: string }[] }[] };
-const lastListOpts = (): ListOpts => vi.mocked(sendListMessage).mock.calls[0]![3] as ListOpts;
+type ChoicePayload = { kind: "choice"; bodyText: string; buttonLabel: string; sections: { title: string; rows: { id: string; title: string; description: string }[] }[] };
+const choiceCalls = () => sendOutbound.mock.calls.filter((c) => c[1].kind === "choice");
+const textCalls   = () => sendOutbound.mock.calls.filter((c) => c[1].kind === "text");
+const lastChoice  = (): ChoicePayload => choiceCalls()[0]![1] as ChoicePayload;
 
 describe("plan detail text", () => {
   // ── buildPlanDetailText (unchanged) ──────────────────────────────────────────
@@ -108,43 +103,35 @@ describe("plan detail text", () => {
   // ── trySendPlanList ──────────────────────────────────────────────────────────
   beforeEach(() => {
     vi.clearAllMocks();
-    process.env["MOCK_WHATSAPP_SEND"] = "";
-    vi.mocked(prisma.hotel.findUnique).mockResolvedValue({
-      id: "h1", phone: "H", config: { metaPhoneNumberId: "PN", metaAccessTokenEncrypted: "enc" },
-    } as never);
-    vi.mocked(prisma.guest.findUnique).mockResolvedValue({ phone: "G" } as never);
-    vi.mocked(prisma.message.create).mockImplementation((async (arg: { data: unknown }) => ({ id: "m", ...(arg.data as object) })) as never);
-    vi.mocked(sendListMessage).mockResolvedValue("list-wamid");
+    sendOutbound.mockResolvedValue({ sent: true, messageId: "wamid" });
   });
 
+  const CTX = { hotelId: "h1", guestId: "g1", channel: MessageChannel.WHATSAPP };
   const twoPlans = (): AllocationPlan[] => [pl({ label: "A" }), pl({ label: "B", rooms: [pr({ adults: 3 }), pr({ adults: 2 })] })];
 
-  // 7. One interactive list, plan_N rows, persisted as messageType "list".
-  it("Case PD7: sends one list with plan_N rows and persists a single 'list' message", async () => {
+  // 7. One "choice" payload with plan_N rows through the outbound pipeline.
+  it("Case PD7: sends one choice payload with plan_N rows (no pre-text)", async () => {
     const plans = twoPlans();
-    const ok = await trySendPlanList({ hotelId: "h1", guestId: "g1", plans });
+    const ok = await trySendPlanList({ ...CTX, plans });
     expect(ok).toBe(true);
-    expect(sendListMessage).toHaveBeenCalledTimes(1);
+    expect(sendOutbound).toHaveBeenCalledTimes(1); // single message, no pre-text
+    expect(sendOutbound.mock.calls[0]![0]).toEqual(CTX); // channel passed through opaquely
 
-    const opts = lastListOpts();
-    expect(opts.buttonLabel).toBe("View Plans");
-    expect(opts.sections[0]!.title).toBe("Choose a Plan");
-    const rows = opts.sections[0]!.rows;
+    const payload = lastChoice();
+    expect(payload.buttonLabel).toBe("View Plans");
+    expect(payload.sections[0]!.title).toBe("Choose a Plan");
+    const rows = payload.sections[0]!.rows;
     expect(rows.map((r) => r.id)).toEqual(["plan_0", "plan_1"]);
-    // New row format (Piece 2C): "{label} — ₹{total}" title; rationale (or the
+    // Row format (Piece 2C): "{label} — ₹{total}" title; rationale (or the
     // legacy buildPlanDescription when a plan has no rationale) as description.
     expect(rows[0]!.title.startsWith("A —")).toBe(true);
     expect(rows[0]!.title.length).toBeLessThanOrEqual(24);
     expect(rows[1]!.description).toBe(buildPlanDescription(plans[1]!));
-    expect(opts.bodyText).toContain("Your Room Options"); // full breakdown is the body
-
-    const calls = vi.mocked(prisma.message.create).mock.calls;
-    expect(calls).toHaveLength(1); // single message, no pre-text
-    expect((calls[0]![0] as { data: { messageType: string } }).data.messageType).toBe("list");
+    expect(payload.bodyText).toContain("Your Room Options"); // full breakdown is the body
   });
 
-  // 8. Large plans are chunked — list button on last chunk, details not truncated with "…".
-  it("Case PD8: large plans chunked — list button on last chunk, no truncation", async () => {
+  // 8. Large plans are chunked — choice on last chunk, details not truncated with "…".
+  it("Case PD8: large plans chunked — choice carries the last chunk, no truncation", async () => {
     // Use 3 plans each with enough rooms that the combined body exceeds 1024 chars.
     const bigRooms = Array.from({ length: 6 }, (_, k) => pr({ roomTypeName: `Type ${k}`, adults: 3, extraBed: true }));
     const plans = [
@@ -152,26 +139,20 @@ describe("plan detail text", () => {
       pl({ label: "B", rooms: bigRooms }),
       pl({ label: "C", rooms: bigRooms }),
     ];
-    await trySendPlanList({ hotelId: "h1", guestId: "g1", plans });
+    await trySendPlanList({ ...CTX, plans });
 
-    // sendListMessage called exactly once (for the final chunk)
-    expect(sendListMessage).toHaveBeenCalledTimes(1);
+    // Exactly one choice payload (the final chunk); ≥1 leading text chunk
+    expect(choiceCalls()).toHaveLength(1);
+    expect(textCalls().length).toBeGreaterThan(0);
 
     // Final chunk bodyText ≤1024 and does NOT end with "…" (no truncation)
-    const { bodyText } = lastListOpts();
+    const { bodyText } = lastChoice();
     expect(bodyText.length).toBeLessThanOrEqual(1024);
     expect(bodyText.endsWith("…")).toBe(false);
 
-    // At least one plain-text message was sent before the list
-    const creates = vi.mocked(prisma.message.create).mock.calls;
-    const textChunks = creates.filter(
-      (c) => (c[0] as { data: { messageType: string } }).data.messageType === "text"
-    );
-    expect(textChunks.length).toBeGreaterThan(0);
-
     // All plan labels appear somewhere across all sent content
     const allText = [
-      ...textChunks.map((c) => (c[0] as { data: { body: string } }).data.body),
+      ...textCalls().map((c) => (c[1] as { text: string }).text),
       bodyText,
     ].join("\n");
     for (const p of plans) {
@@ -179,11 +160,21 @@ describe("plan detail text", () => {
     }
   });
 
-  // 9. Missing credentials → returns false (no send).
-  it("Case PD9: returns false when the hotel has no Meta credentials", async () => {
-    vi.mocked(prisma.hotel.findUnique).mockResolvedValue({ id: "h1", phone: "H", config: {} } as never);
-    const ok = await trySendPlanList({ hotelId: "h1", guestId: "g1", plans: twoPlans() });
+  // 9. Channel can't send (no credentials / unsupported) → returns false.
+  it("Case PD9: returns false when the channel cannot send", async () => {
+    sendOutbound.mockResolvedValue({ sent: false, reason: "no_credentials" });
+    const ok = await trySendPlanList({ ...CTX, plans: twoPlans() });
     expect(ok).toBe(false);
-    expect(sendListMessage).not.toHaveBeenCalled();
+  });
+
+  // 10. A leading text-chunk failure aborts (caller falls back to text rendering).
+  it("Case PD10: chunk send failure aborts before the choice payload", async () => {
+    const bigRooms = Array.from({ length: 6 }, (_, k) => pr({ roomTypeName: `Type ${k}`, adults: 3, extraBed: true }));
+    const plans = [pl({ label: "A", rooms: bigRooms }), pl({ label: "B", rooms: bigRooms }), pl({ label: "C", rooms: bigRooms })];
+    sendOutbound.mockResolvedValue({ sent: false, reason: "send_failed" });
+
+    const ok = await trySendPlanList({ ...CTX, plans });
+    expect(ok).toBe(false);
+    expect(choiceCalls()).toHaveLength(0); // never reached the interactive send
   });
 });

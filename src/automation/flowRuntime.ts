@@ -42,11 +42,10 @@ import { generateReferenceNumber } from "../utils/booking.utils";
 import { cancelBooking } from "../services/booking.service";
 import { BookingStatus, MessageChannel, MessageStatus } from "@prisma/client";
 import { shouldAutoReply } from "./shouldAutoReply";
-import { sendCarouselMessage, sendMediaMessage, sendListMessage, sendTextMessage, sendButtonMessage, type CarouselCard } from "../services/whatsapp.send.service";
 import { sendChannelMessage } from "../services/channel.send.service";
-import { buildListMetadata, buildButtonsMetadata } from "../services/interactiveReply.service";
+import { sendOutbound } from "../services/outbound/outbound.service";
+import type { OutboundCard } from "../services/outbound/payload";
 import { flowResumeQueue } from "../queue/flowResumeQueue";
-import { decryptWhatsAppToken } from "../utils/encryption.utils";
 import { getPublishedNodes } from "../services/flow.service";
 import { getHotelConfigCached, getPlatformMaxStayCeiling } from "../services/settings.service";
 import { getWatchedFlowVarNames, pickWatchedFlowVars } from "../services/templateVariableMapping.service";
@@ -197,47 +196,26 @@ function safeSetVar(
   return { ...flowVars, [key]: value };
 }
 
-async function safeMenu(hotelId: string, guestId: string): Promise<string | null> {
+async function safeMenu(
+  hotelId: string,
+  guestId: string,
+  channel: MessageChannel = MessageChannel.WHATSAPP,
+): Promise<string | null> {
   const cfg = await getHotelConfigCached(hotelId);
   const botMsgsMap = (cfg?.botMessages as Record<string, string> | null) ?? {};
   if (botMsgsMap.menuUseListMessage === "true") {
     try {
       const payload = await buildMenuListPayload(hotelId);
       if (payload) {
-        const [hotel, guest] = await Promise.all([
-          prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } }),
-          prisma.guest.findUnique({ where: { id: guestId  }, select: { phone: true } }),
-        ]);
-        const phoneNumberId = (cfg as any)?.metaPhoneNumberId as string ?? "";
-        const encTok        = (cfg as any)?.metaAccessTokenEncrypted as string ?? "";
-        if (hotel && guest && phoneNumberId && encTok) {
-          const accessToken = decryptWhatsAppToken(encTok);
-          const wamid = await sendListMessage(guest.phone, phoneNumberId, accessToken, {
-            bodyText:    payload.bodyText,
-            buttonLabel: payload.buttonLabel,
-            sections:    payload.sections,
-          });
-          const saved = await prisma.message.create({
-            data: {
-              direction:   "OUT",
-              fromPhone:   hotel.phone,
-              toPhone:     guest.phone,
-              body:        payload.bodyText,
-              messageType: "list",
-              metadata:    buildListMetadata(payload.buttonLabel, payload.sections),
-              hotelId,
-              guestId,
-              channel:     MessageChannel.WHATSAPP,
-              status:      MessageStatus.SENT,
-              wamid,
-            },
-          });
-          const { emitToHotel } = await import("../realtime/emit");
-          emitToHotel(hotelId, "message:new", { message: saved });
-          return null; // list already dispatched
-        }
+        const res = await sendOutbound({ hotelId, guestId, channel }, {
+          kind:        "choice",
+          bodyText:    payload.bodyText,
+          buttonLabel: payload.buttonLabel,
+          sections:    payload.sections,
+        });
+        if (res.sent) return null; // interactive menu already dispatched
       }
-    } catch { /* credentials missing or send failed — fall through to plain text */ }
+    } catch { /* fall through to plain text */ }
   }
   return (await buildMenuMessage(hotelId)) ?? MENU_FALLBACK;
 }
@@ -255,6 +233,7 @@ async function safeMenu(hotelId: string, guestId: string): Promise<string | null
 async function trySendRoomCarousel(args: {
   hotelId:      string;
   guestId:      string;
+  channel:      MessageChannel;
   displayRooms: {
     id:                   string;
     name:                 string;
@@ -264,27 +243,11 @@ async function trySendRoomCarousel(args: {
   }[];
   promptText:   string;
 }): Promise<boolean> {
-  const { hotelId, guestId, displayRooms, promptText } = args;
-  // Meta requires at least 2 cards in a carousel
+  const { hotelId, guestId, channel, displayRooms, promptText } = args;
+  // WhatsApp requires ≥2 cards; skipping early also saves the photo query.
   if (displayRooms.length < 2) return false;
 
-  // Honour the same dev/test guard the text sender uses. Without this, a
-  // mock-mode environment with leftover real credentials would POST to Meta.
-  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
-
   try {
-    const [hotel, guest] = await Promise.all([
-      prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
-      prisma.guest.findUnique({ where: { id: guestId } }),
-    ]);
-    if (!hotel || !guest) return false;
-
-    const cfg = hotel.config;
-    const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
-    const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
-    if (!phoneNumberId || !encryptedTok) return false;
-    const accessToken = decryptWhatsAppToken(encryptedTok);
-
     // Lead photo per room (isMain first, then lowest order).
     const photos = await prisma.roomPhoto.findMany({
       where:   { roomTypeId: { in: displayRooms.map((r) => r.id) } },
@@ -316,7 +279,7 @@ async function trySendRoomCarousel(args: {
       return `${t} ${n}`;
     });
 
-    const cards: CarouselCard[] = displayRooms.map((r, i) => ({
+    const cards: OutboundCard[] = displayRooms.map((r, i) => ({
       imageUrl:    photoByRoom.get(r.id) ?? CAROUSEL_FALLBACK_IMAGE,
       title:       r.name,
       price:       r.basePrice,
@@ -325,27 +288,12 @@ async function trySendRoomCarousel(args: {
       buttonLabel: uniqueTitles[i]!,
     }));
 
-    const wamid = await sendCarouselMessage(guest.phone, phoneNumberId, accessToken, promptText, cards);
-
-    const saved = await prisma.message.create({
-      data: {
-        direction:   "OUT",
-        fromPhone:   hotel.phone,
-        toPhone:     guest.phone,
-        body:        JSON.stringify({ cards }),
-        messageType: "carousel",
-        hotelId,
-        guestId,
-        channel:     MessageChannel.WHATSAPP,
-        status:      MessageStatus.SENT,
-        wamid,
-      },
+    const res = await sendOutbound({ hotelId, guestId, channel }, {
+      kind:     "cards",
+      bodyText: promptText,
+      cards,
     });
-
-    const { emitToHotel } = await import("../realtime/emit");
-    emitToHotel(hotelId, "message:new", { message: saved });
-
-    return true;
+    return res.sent;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "carousel send failed — falling back to text list");
     return false;
@@ -362,64 +310,26 @@ async function trySendRoomCarousel(args: {
 async function trySendOptionsList(args: {
   hotelId:      string;
   guestId:      string;
+  channel:      MessageChannel;
   bodyText:     string;
   buttonLabel:  string;
   sectionTitle: string;
   options:      Array<{ label: string; value?: string; description?: string }>;
 }): Promise<boolean> {
-  const { hotelId, guestId, bodyText, buttonLabel, sectionTitle, options } = args;
+  const { hotelId, guestId, channel, bodyText, buttonLabel, sectionTitle, options } = args;
+  const rows = options.map((opt, i) => ({
+    id:    `opt_${i}`,
+    title: (opt.label || `Option ${i + 1}`).slice(0, 24),
+    ...(opt.description ? { description: opt.description.slice(0, 72) } : {}),
+  }));
 
-  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
-
-  try {
-    const [hotel, guest] = await Promise.all([
-      prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
-      prisma.guest.findUnique({ where: { id: guestId } }),
-    ]);
-    if (!hotel || !guest) return false;
-
-    const cfg = hotel.config;
-    const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
-    const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
-    if (!phoneNumberId || !encryptedTok) return false;
-    const accessToken = decryptWhatsAppToken(encryptedTok);
-
-    const rows = options.map((opt, i) => ({
-      id:    `opt_${i}`,
-      title: (opt.label || `Option ${i + 1}`).slice(0, 24),
-      ...(opt.description ? { description: opt.description.slice(0, 72) } : {}),
-    }));
-
-    const wamid = await sendListMessage(guest.phone, phoneNumberId, accessToken, {
-      bodyText,
-      buttonLabel,
-      sections: [{ title: sectionTitle, rows }],
-    });
-
-    const saved = await prisma.message.create({
-      data: {
-        direction:   "OUT",
-        fromPhone:   hotel.phone,
-        toPhone:     guest.phone,
-        body:        bodyText,
-        messageType: "list",
-        metadata:    buildListMetadata(buttonLabel, [{ title: sectionTitle, rows }]),
-        hotelId,
-        guestId,
-        channel:     MessageChannel.WHATSAPP,
-        status:      MessageStatus.SENT,
-        wamid,
-      },
-    });
-
-    const { emitToHotel } = await import("../realtime/emit");
-    emitToHotel(hotelId, "message:new", { message: saved });
-
-    return true;
-  } catch (err) {
-    log.warn({ err, hotelId, guestId }, "options: list send failed — falling back to text");
-    return false;
-  }
+  const res = await sendOutbound({ hotelId, guestId, channel }, {
+    kind:        "choice",
+    bodyText,
+    buttonLabel,
+    sections:    [{ title: sectionTitle, rows }],
+  });
+  return res.sent;
 }
 
 // ── ARA room-type carousel sender ─────────────────────────────────────────────
@@ -427,9 +337,10 @@ async function trySendOptionsList(args: {
 // (maxAdults >= adults). Button id uses "room_TYPE:{roomTypeId}" so the
 // plan_selection handler can distinguish it from the show_rooms "room_{id}" buttons.
 
-const trySendRoomTypeCarousel: SendRoomCarouselFn = async ({ hotelId, guestId, roomInputs, adults }) => {
-  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
-
+async function trySendRoomTypeCarousel(
+  args: Parameters<SendRoomCarouselFn>[0] & { channel: MessageChannel },
+): Promise<boolean> {
+  const { hotelId, guestId, channel, roomInputs, adults } = args;
   try {
     log.info({
       adults,
@@ -440,18 +351,6 @@ const trySendRoomTypeCarousel: SendRoomCarouselFn = async ({ hotelId, guestId, r
     const eligible = roomInputs.filter((r) => r.availableCount > 0);
     log.info({ eligibleCount: eligible.length, adults }, "carousel: after filter");
     if (eligible.length === 0) return false;
-
-    const [hotel, guest] = await Promise.all([
-      prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
-      prisma.guest.findUnique({ where: { id: guestId } }),
-    ]);
-    if (!hotel || !guest) return false;
-
-    const cfg = hotel.config;
-    const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
-    const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
-    if (!phoneNumberId || !encryptedTok) return false;
-    const accessToken = decryptWhatsAppToken(encryptedTok);
 
     // Lead photo per room type (isMain first, then lowest order)
     const photos = await prisma.roomPhoto.findMany({
@@ -465,7 +364,7 @@ const trySendRoomTypeCarousel: SendRoomCarouselFn = async ({ hotelId, guestId, r
     }
 
     const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
-    const cards: CarouselCard[] = eligible.slice(0, 10).map((r) => {
+    const cards: OutboundCard[] = eligible.slice(0, 10).map((r) => {
       const baseA = r.baseAdults  ?? 2;
       const maxA  = r.maxAdults   ?? baseA;
       const maxC  = r.maxChildren ?? 0;
@@ -483,119 +382,44 @@ const trySendRoomTypeCarousel: SendRoomCarouselFn = async ({ hotelId, guestId, r
 
     log.info({ cardsCount: cards.length }, "carousel: cards built");
 
-    const wamid = await sendCarouselMessage(
-      guest.phone, phoneNumberId, accessToken,
-      "🏨 *Choose a room type:*",
+    const res = await sendOutbound({ hotelId, guestId, channel }, {
+      kind:     "cards",
+      bodyText: "🏨 *Choose a room type:*",
       cards,
-    );
-
-    const saved = await prisma.message.create({
-      data: {
-        direction:   "OUT",
-        fromPhone:   hotel.phone,
-        toPhone:     guest.phone,
-        body:        JSON.stringify({ cards }),
-        messageType: "carousel",
-        hotelId,
-        guestId,
-        channel:     MessageChannel.WHATSAPP,
-        status:      MessageStatus.SENT,
-        wamid,
-      },
     });
-
-    const { emitToHotel } = await import("../realtime/emit");
-    emitToHotel(hotelId, "message:new", { message: saved });
-
-    return true;
+    return res.sent;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "ARA room carousel send failed — skipping");
     return false;
   }
-};
+}
 
 // ── ARA occupancy-notice sender ───────────────────────────────────────────────
 // Sends the "children counted as adults" summary directly (sendTextMessage, not
 // BullMQ) right before the room carousel. Persists the OUT bubble + emits so the
 // dashboard shows it. Never throws — a failed notice must not block allocation.
-async function trySendOccupancyNotice(args: { hotelId: string; guestId: string; text: string }): Promise<void> {
-  const { hotelId, guestId, text } = args;
-  try {
-    const [hotel, guest] = await Promise.all([
-      prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } }),
-      prisma.guest.findUnique({ where: { id: guestId }, select: { phone: true } }),
-    ]);
-    if (!hotel || !guest) return;
-
-    await sendTextMessage({ toPhone: guest.phone, fromPhone: hotel.phone, hotelId, guestId, text });
-
-    const saved = await prisma.message.create({
-      data: {
-        direction:   "OUT",
-        fromPhone:   hotel.phone,
-        toPhone:     guest.phone,
-        body:        text,
-        messageType: "text",
-        hotelId,
-        guestId,
-        channel:     MessageChannel.WHATSAPP,
-        status:      MessageStatus.SENT,
-      },
-    });
-    const { emitToHotel } = await import("../realtime/emit");
-    emitToHotel(hotelId, "message:new", { message: saved });
-  } catch (err) {
-    log.warn({ err, hotelId, guestId }, "ARA occupancy notice send failed — skipping");
-  }
+async function trySendOccupancyNotice(
+  args: { hotelId: string; guestId: string; text: string; channel: MessageChannel },
+): Promise<void> {
+  const { hotelId, guestId, text, channel } = args;
+  await sendOutbound({ hotelId, guestId, channel }, { kind: "text", text });
 }
 
 // ── ARA "Mix it up" list sender (Piece 2A) ────────────────────────────────────
 // Sent AFTER the room carousel. A single tappable row "Mix it up 🎲" → reply id
 // MIX_IT_UP (the webhook collapses list_reply.id to a text body the ARA handler
 // matches). Returns true if sent. Never throws.
-async function trySendMixItUpList(args: { hotelId: string; guestId: string }): Promise<boolean> {
-  const { hotelId, guestId } = args;
-  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
-  try {
-    const [hotel, guest] = await Promise.all([
-      prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
-      prisma.guest.findUnique({ where: { id: guestId } }),
-    ]);
-    if (!hotel || !guest) return false;
-    const cfg = hotel.config;
-    const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
-    const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
-    if (!phoneNumberId || !encryptedTok) return false;
-    const accessToken = decryptWhatsAppToken(encryptedTok);
-
-    const bodyText    = "_Not sure? Let us pick the best combination for you_ 👇";
-    const buttonLabel = "Options";
-    const sections    = [{ title: "Let us choose", rows: [{ id: "MIX_IT_UP", title: "Mix it up 🎲", description: "We'll pick the best room combination" }] }];
-
-    const wamid = await sendListMessage(guest.phone, phoneNumberId, accessToken, { bodyText, buttonLabel, sections });
-
-    const saved = await prisma.message.create({
-      data: {
-        direction:   "OUT",
-        fromPhone:   hotel.phone,
-        toPhone:     guest.phone,
-        body:        bodyText,
-        messageType: "list",
-        metadata:    buildListMetadata(buttonLabel, sections),
-        hotelId,
-        guestId,
-        channel:     MessageChannel.WHATSAPP,
-        status:      MessageStatus.SENT,
-        wamid,
-      },
-    });
-    const { emitToHotel } = await import("../realtime/emit");
-    emitToHotel(hotelId, "message:new", { message: saved });
-    return true;
-  } catch (err) {
-    log.warn({ err, hotelId, guestId }, "ARA mix-it-up list send failed — skipping");
-    return false;
-  }
+async function trySendMixItUpList(
+  args: { hotelId: string; guestId: string; channel: MessageChannel },
+): Promise<boolean> {
+  const { hotelId, guestId, channel } = args;
+  const res = await sendOutbound({ hotelId, guestId, channel }, {
+    kind:        "choice",
+    bodyText:    "_Not sure? Let us pick the best combination for you_ 👇",
+    buttonLabel: "Options",
+    sections:    [{ title: "Let us choose", rows: [{ id: "MIX_IT_UP", title: "Mix it up 🎲", description: "We'll pick the best room combination" }] }],
+  });
+  return res.sent;
 }
 
 // ── ARA confirm-buttons sender ────────────────────────────────────────────────
@@ -603,51 +427,20 @@ async function trySendMixItUpList(args: { hotelId: string; guestId: string }): P
 // (Confirm / Modify / Cancel). The button ids map to the same actions as the
 // legacy "1"/"2"/"MENU" text replies (the webhook collapses button_reply.id to a
 // text body). Returns true if sent (→ "ALREADY_SENT"). Never throws.
-async function trySendConfirmButtons(args: { hotelId: string; guestId: string; bodyText: string }): Promise<boolean> {
-  const { hotelId, guestId, bodyText } = args;
-  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
-  try {
-    const [hotel, guest] = await Promise.all([
-      prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
-      prisma.guest.findUnique({ where: { id: guestId } }),
-    ]);
-    if (!hotel || !guest) return false;
-    const cfg = hotel.config;
-    const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
-    const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
-    if (!phoneNumberId || !encryptedTok) return false;
-    const accessToken = decryptWhatsAppToken(encryptedTok);
-
-    const buttons = [
+async function trySendConfirmButtons(
+  args: { hotelId: string; guestId: string; bodyText: string; channel: MessageChannel },
+): Promise<boolean> {
+  const { hotelId, guestId, bodyText, channel } = args;
+  const res = await sendOutbound({ hotelId, guestId, channel }, {
+    kind:     "buttons",
+    bodyText,
+    buttons: [
       { id: "CONFIRM_BOOKING", title: "✅ Confirm" },
       { id: "MODIFY_BOOKING",  title: "✏️ Modify" },
       { id: "CANCEL_BOOKING",  title: "✖️ Cancel" },
-    ];
-
-    const wamid = await sendButtonMessage(guest.phone, phoneNumberId, accessToken, { bodyText, buttons });
-
-    const saved = await prisma.message.create({
-      data: {
-        direction:   "OUT",
-        fromPhone:   hotel.phone,
-        toPhone:     guest.phone,
-        body:        bodyText,
-        messageType: "button",
-        metadata:    buildButtonsMetadata(buttons),
-        hotelId,
-        guestId,
-        channel:     MessageChannel.WHATSAPP,
-        status:      MessageStatus.SENT,
-        wamid,
-      },
-    });
-    const { emitToHotel } = await import("../realtime/emit");
-    emitToHotel(hotelId, "message:new", { message: saved });
-    return true;
-  } catch (err) {
-    log.warn({ err, hotelId, guestId }, "ARA confirm buttons send failed — falling back to text");
-    return false;
-  }
+    ],
+  });
+  return res.sent;
 }
 
 // ── Room type fetcher ──────────────────────────────────────────────────────────
@@ -732,7 +525,7 @@ export async function executeFlowStep(
   const flowContent = await getPublishedNodes(flowId);
   if (!flowContent) {
     await resetSessionDb(guestId, hotelId);
-    return safeMenu(hotelId, guestId);
+    return safeMenu(hotelId, guestId, channel);
   }
 
   const { nodes, edges } = flowContent;
@@ -880,7 +673,7 @@ export async function executeFlowStep(
     if (++hops > MAX_HOPS) {
       log.error({ flowId, guestId, lastNode: currentNodeId }, `MAX_HOPS(${MAX_HOPS}) exceeded — likely infinite loop`);
       await resetSession(guestId, hotelId);
-      const hopMenu = await safeMenu(hotelId, guestId);
+      const hopMenu = await safeMenu(hotelId, guestId, channel);
       const hopNote = "Something went wrong in our conversation flow. Let's start over.";
       return hopMenu ? `${hopNote}\n\n${hopMenu}` : hopNote;
     }
@@ -889,7 +682,7 @@ export async function executeFlowStep(
     if (!node) {
       // Node missing — flow was likely re-published mid-session.
       await resetSession(guestId, hotelId);
-      const driftMenu = await safeMenu(hotelId, guestId);
+      const driftMenu = await safeMenu(hotelId, guestId, channel);
       const driftNote = "We've just updated our options — starting fresh.";
       return driftMenu ? `${driftNote}\n\n${driftMenu}` : driftNote;
     }
@@ -924,7 +717,7 @@ export async function executeFlowStep(
       // ── start ───────────────────────────────────────────────────────────────
       case "start": {
         const next = nextNodeId(currentNodeId, adjacency);
-        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
         return advance(next);
       }
 
@@ -936,7 +729,7 @@ export async function executeFlowStep(
 
         if (!next) {
           await resetSession(guestId, hotelId);
-          return text || safeMenu(hotelId, guestId);
+          return text || safeMenu(hotelId, guestId, channel);
         }
 
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
@@ -967,7 +760,7 @@ export async function executeFlowStep(
 
           let rawList: { id: string; name: string; price: number }[] = [];
           try { rawList = JSON.parse(flowData.flowVars["__roomList__"] ?? "[]"); } catch { /* corrupted — treat as empty */ }
-          if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+          if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
 
           const num = parseInt(input, 10);
           if (isNaN(num) || num < 1 || num > rawList.length) {
@@ -993,7 +786,7 @@ export async function executeFlowStep(
           delete flowData.waitingFor;
 
           const next = nextNodeId(currentNodeId, adjacency);
-          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
           return advance(next);
         }
@@ -1046,7 +839,7 @@ export async function executeFlowStep(
 
           delete flowData.waitingFor;
           const next = nextNodeId(currentNodeId, adjacency);
-          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
           return advance(next);
         }
@@ -1079,7 +872,7 @@ export async function executeFlowStep(
           delete flowData.flowVars["__questionType__"];
           delete flowData.waitingFor;
           const next = nextNodeId(currentNodeId, adjacency);
-          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
           return advance(next);
         }
@@ -1105,7 +898,7 @@ export async function executeFlowStep(
               flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, intent === "confirm" ? "yes" : "no");
               delete flowData.waitingFor;
               const next = nextNodeId(currentNodeId, adjacency);
-              if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+              if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
               await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
               return advance(next);
             }
@@ -1116,7 +909,7 @@ export async function executeFlowStep(
           flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, isYes ? "yes" : "no");
           delete flowData.waitingFor;
           const next = nextNodeId(currentNodeId, adjacency);
-          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+          if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
           return advance(next);
         }
@@ -1204,7 +997,7 @@ export async function executeFlowStep(
         delete flowData.waitingFor;
 
         const next = nextNodeId(currentNodeId, adjacency);
-        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
         return advance(next);
       }
@@ -1351,6 +1144,7 @@ export async function executeFlowStep(
           const carouselSent = await trySendRoomCarousel({
             hotelId,
             guestId,
+            channel,
             displayRooms: displayRooms.slice(0, 10),
             promptText:   prompt,
           });
@@ -1367,7 +1161,7 @@ export async function executeFlowStep(
         let rawList: { id: string; name: string; price: number; maxAdults: number | null; maxChildren: number | null }[] = [];
         try { rawList = JSON.parse(flowData.flowVars["__roomList__"] ?? "[]"); } catch { /* corrupted — treat as empty */ }
 
-        if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+        if (!rawList.length) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
 
         // ── View Photos handler ───────────────────────────────────────────────
         // Carousel "View Photos" buttons emit "photos_<roomId>". Send extra
@@ -1394,19 +1188,14 @@ export async function executeFlowStep(
             return "No additional photos available for this room.";
           }
 
+          // persist:false preserves pre-refactor behaviour — photo bursts were
+          // never mirrored into the dashboard thread.
           for (const photo of extraPhotos) {
-            try {
-              await sendMediaMessage({
-                toPhone:     guest.phone,
-                hotelId,
-                messageType: "image",
-                mediaUrl:    photo.url,
-                mimeType:    "image/jpeg",
-                caption:     null,
-              });
-            } catch (err) {
-              log.warn({ err, roomId, url: photo.url }, "show_rooms: photo send failed");
-            }
+            await sendOutbound(
+              { hotelId, guestId, channel },
+              { kind: "media", messageType: "image", mediaUrl: photo.url, mimeType: "image/jpeg" },
+              { persist: false },
+            );
           }
 
           // Re-send carousel so guest can still select a room.
@@ -1432,6 +1221,7 @@ export async function executeFlowStep(
               await trySendRoomCarousel({
                 hotelId,
                 guestId,
+                channel,
                 displayRooms: orderedRooms.slice(0, 10),
                 promptText:   interpolate(d.text || "Please choose a room type:", flowData.flowVars),
               });
@@ -1483,7 +1273,7 @@ export async function executeFlowStep(
         delete flowData.waitingFor;
 
         const next = nextNodeId(currentNodeId, adjacency);
-        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
         return advance(next);
       }
@@ -1492,6 +1282,9 @@ export async function executeFlowStep(
       // Multi-room allocation with occupancy + extra-bed logic. Self-contained in
       // ./nodes/advancedRoomAllocation.ts — all deps injected, no module state.
       case "advanced_room_allocation": {
+        // The ARA node is channel-agnostic — every injected sender gets the
+        // active channel bound here via closure, so the node's dep signatures
+        // (and its tests) never mention channels.
         return handleAdvancedRoomAllocation({
           node,
           currentNodeId,
@@ -1506,22 +1299,22 @@ export async function executeFlowStep(
           nextNodeId,
           updateSession,
           resetSession,
-          safeMenu,
+          safeMenu: (h, g) => safeMenu(h, g, channel),
           fetchRoomTypes,
           getCalendarData,
           interpretModification: interpretAllocationModification,
-          sendPlanList:     trySendPlanList,
-          sendRoomCarousel: trySendRoomTypeCarousel,
+          sendPlanList:     (a) => trySendPlanList({ ...a, channel }),
+          sendRoomCarousel: (a) => trySendRoomTypeCarousel({ ...a, channel }),
           childAgeLimit:        hotelCfg?.childAgeLimit ?? 12,
           extractChildrenAges:  extractChildrenAgesAI,
-          sendOccupancyNotice:  trySendOccupancyNotice,
-          sendRoomDescriptions: trySendOccupancyNotice, // generic text sender (same shape)
-          sendMixItUpList:      trySendMixItUpList,
-          sendConfirmButtons:   trySendConfirmButtons,
-          sendRoomMenuList:        trySendRoomMenuList,
-          sendMoveToRoomList:      trySendMoveToRoomList,
-          sendManualModeList:      trySendManualModeList,
-          sendChangeRoomTypeList:  trySendChangeRoomTypeList,
+          sendOccupancyNotice:  (a) => trySendOccupancyNotice({ ...a, channel }),
+          sendRoomDescriptions: (a) => trySendOccupancyNotice({ ...a, channel }), // generic text sender (same shape)
+          sendMixItUpList:      (a) => trySendMixItUpList({ ...a, channel }),
+          sendConfirmButtons:   (a) => trySendConfirmButtons({ ...a, channel }),
+          sendRoomMenuList:        (a) => trySendRoomMenuList({ ...a, channel }),
+          sendMoveToRoomList:      (a) => trySendMoveToRoomList({ ...a, channel }),
+          sendManualModeList:      (a) => trySendManualModeList({ ...a, channel }),
+          sendChangeRoomTypeList:  (a) => trySendChangeRoomTypeList({ ...a, channel }),
         });
       }
 
@@ -1545,7 +1338,7 @@ export async function executeFlowStep(
         if (!next) {
           log.error({ flowId, nodeId: currentNodeId, handle }, "branch node has no outgoing edge");
           await resetSession(guestId, hotelId);
-          return safeMenu(hotelId, guestId);
+          return safeMenu(hotelId, guestId, channel);
         }
         return advance(next);
       }
@@ -1958,7 +1751,7 @@ export async function executeFlowStep(
         if (d.actionType === "start_booking_flow") {
           log.error({ flowId }, 'deprecated action "start_booking_flow" — replace with create_booking');
           await resetSession(guestId, hotelId);
-          return (d.message ? `${d.message}\n\n` : "") + (await safeMenu(hotelId, guestId) ?? "");
+          return (d.message ? `${d.message}\n\n` : "") + (await safeMenu(hotelId, guestId, channel) ?? "");
         }
 
         // ── handoff_to_staff ───────────────────────────────────────────────────
@@ -1973,7 +1766,7 @@ export async function executeFlowStep(
         // ── reset_to_menu ──────────────────────────────────────────────────────
         if (d.actionType === "reset_to_menu") {
           await resetSession(guestId, hotelId);
-          const menu = await safeMenu(hotelId, guestId);
+          const menu = await safeMenu(hotelId, guestId, channel);
           return d.message ? `${d.message}\n\n${menu ?? ""}`.trim() : menu;
         }
 
@@ -2090,7 +1883,7 @@ export async function executeFlowStep(
           nextNodeId(currentNodeId, adjacency, handle) ??
           nextNodeId(currentNodeId, adjacency);
 
-        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
         return advance(next);
       }
@@ -2102,7 +1895,7 @@ export async function executeFlowStep(
         if (!d.targetNodeId || !nodeMap.has(d.targetNodeId)) {
           log.error({ flowId, targetNodeId: d.targetNodeId }, "jump node references missing targetNodeId");
           await resetSession(guestId, hotelId);
-          return safeMenu(hotelId, guestId);
+          return safeMenu(hotelId, guestId, channel);
         }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${d.targetNodeId}`, { ...sessionData, flow: { ...flowData } });
         return advance(d.targetNodeId);
@@ -2113,7 +1906,6 @@ export async function executeFlowStep(
       // Each {{n}} variable resolved from flowVars via variableMapping.
       // Routes: "success" handle → next node; "failure" handle → fallback.
       case "send_template": {
-        const { sendTemplateMessage } = await import("../services/templates.service");
         const d = node.data as any;
 
         const template = d.templateId
@@ -2150,12 +1942,18 @@ export async function executeFlowStep(
             : "";
         }
 
-        let sendOk = false;
-        try {
-          await sendTemplateMessage(hotelId, guestId, d.templateId, values);
-          sendOk = true;
-        } catch (err: unknown) {
-          log.warn({ err, templateId: d.templateId, flowId }, "send_template node: failed to send template");
+        // Templates are a channel capability: WhatsApp delegates to
+        // templates.service (which persists + emits itself); channels without a
+        // template concept (Instagram) report unsupported and the node routes
+        // its failure edge — no doomed API call.
+        const tplRes = await sendOutbound({ hotelId, guestId, channel }, {
+          kind:       "template",
+          templateId: d.templateId,
+          values,
+        });
+        const sendOk = tplRes.sent;
+        if (!sendOk) {
+          log.warn({ reason: tplRes.reason, templateId: d.templateId, flowId }, "send_template node: template not sent");
         }
 
         const handle  = sendOk ? "success" : "failure";
@@ -2289,7 +2087,7 @@ export async function executeFlowStep(
 
         if (!opts.length) {
           await resetSession(guestId, hotelId);
-          return safeMenu(hotelId, guestId);
+          return safeMenu(hotelId, guestId, channel);
         }
 
         if (!flowData.waitingFor) {
@@ -2301,6 +2099,7 @@ export async function executeFlowStep(
             const listSent = await trySendOptionsList({
               hotelId,
               guestId,
+              channel,
               bodyText,
               buttonLabel:  ((d.listButtonLabel as string | undefined) || "View Options").slice(0, 20),
               sectionTitle: ((d.sectionTitle   as string | undefined) || "Options"     ).slice(0, 24),
@@ -2340,14 +2139,14 @@ export async function executeFlowStep(
         delete flowData.waitingFor;
 
         const next = nextNodeId(currentNodeId, adjacency);
-        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId); }
+        if (!next) { await resetSession(guestId, hotelId); return safeMenu(hotelId, guestId, channel); }
         await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
         return advance(next);
       }
 
       default: {
         await resetSession(guestId, hotelId);
-        return safeMenu(hotelId, guestId);
+        return safeMenu(hotelId, guestId, channel);
       }
     }
   }

@@ -20,10 +20,8 @@ import { getHotelConfigCached } from "../services/settings.service";
 import { executeFlowStep } from "./flowRuntime";
 import { getAIReply } from "../services/ai.service";
 import { incrementAIUsage } from "../services/usage.service";
-import { sendListMessage } from "../services/whatsapp.send.service";
-import { buildListMetadata } from "../services/interactiveReply.service";
-import { decryptWhatsAppToken } from "../utils/encryption.utils";
-import { MessageChannel, MessageStatus } from "@prisma/client";
+import { sendOutbound } from "../services/outbound/outbound.service";
+import { MessageChannel } from "@prisma/client";
 
 // ── Reset trigger keywords ─────────────────────────────────────────────────────
 
@@ -109,48 +107,27 @@ async function showMenu(
     }
   }
 
-  // List-message menu — send interactive tap-to-open list if enabled in botMessages
+  // Interactive menu — a channel-neutral "choice" payload; the renderer decides
+  // whether that becomes a WhatsApp list or Instagram quick replies. Any
+  // non-send (credentials, caps, mock) falls through to the plain-text menu.
   const botMsgsMap = (cfg?.botMessages as Record<string, string> | null) ?? {};
   if (botMsgsMap.menuUseListMessage === "true") {
     try {
       const payload = await buildMenuListPayload(hotelId);
       if (payload) {
-        const [hotel, guest] = await Promise.all([
-          prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } }),
-          prisma.guest.findUnique({ where: { id: guestId }, select: { phone: true } }),
-        ]);
-        const phoneNumberId = (cfg as any)?.metaPhoneNumberId as string ?? "";
-        const encTok        = (cfg as any)?.metaAccessTokenEncrypted as string ?? "";
-        if (hotel && guest && phoneNumberId && encTok) {
-          const accessToken = decryptWhatsAppToken(encTok);
-          const wamid = await sendListMessage(guest.phone, phoneNumberId, accessToken, {
-            bodyText:    payload.bodyText,
-            buttonLabel: payload.buttonLabel,
-            sections:    payload.sections,
-          });
-          const saved = await prisma.message.create({
-            data: {
-              direction:   "OUT",
-              fromPhone:   hotel.phone,
-              toPhone:     guest.phone,
-              body:        payload.bodyText,
-              messageType: "list",
-              metadata:    buildListMetadata(payload.buttonLabel, payload.sections),
-              hotelId,
-              guestId,
-              channel:     MessageChannel.WHATSAPP,
-              status:      MessageStatus.SENT,
-              wamid,
-            },
-          });
+        const res = await sendOutbound({ hotelId, guestId, channel }, {
+          kind:        "choice",
+          bodyText:    payload.bodyText,
+          buttonLabel: payload.buttonLabel,
+          sections:    payload.sections,
+        });
+        if (res.sent) {
           await updateSession(guestId, hotelId, "AWAITING_SELECTION", {});
-          const { emitToHotel } = await import("../realtime/emit");
-          emitToHotel(hotelId, "message:new", { message: saved });
-          return null; // list message already dispatched — no text reply needed
+          return null; // interactive menu already dispatched — no text reply needed
         }
       }
     } catch {
-      // credentials missing or send failed — fall through to plain text
+      // send failed — fall through to plain text
     }
   }
 

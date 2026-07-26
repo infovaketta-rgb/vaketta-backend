@@ -1,6 +1,7 @@
 import { MessageChannel } from "@prisma/client";
 import { logIncomingMessage, resolveHotelByChannel } from "./message.service";
 import { persistEchoedOutboundMessage } from "./echoPersist.service";
+import { buildReplyMetadata, type MessageMetadata } from "./interactiveReply.service";
 import { logger } from "../utils/logger";
 export { encryptInstagramToken, decryptInstagramToken } from "../utils/encryption.utils";
 
@@ -9,7 +10,9 @@ const log = logger.child({ service: "instagram" });
 export async function processInstagramInboundEvent(event: any): Promise<void> {
   const senderId    = event.sender?.id    as string | undefined;
   const recipientId = event.recipient?.id as string | undefined;
-  const mid         = event.message?.mid  as string | undefined;
+  // Postback events (generic/button template taps) carry their mid on
+  // event.postback, not event.message.
+  const mid         = (event.message?.mid ?? event.postback?.mid) as string | undefined;
   const text        = event.message?.text as string | null ?? null;
 
   if (!senderId || !recipientId || !mid) return;
@@ -58,15 +61,45 @@ export async function processInstagramInboundEvent(event: any): Promise<void> {
     return;
   }
 
+  // ── Interactive-reply normalization ─────────────────────────────────────────
+  // Same contract as the WhatsApp webhook: body = the human-readable title the
+  // guest tapped, botBody = the payload id the flow engine matches on
+  // (opt_N, room_*, plan_N, MOD_*…), metadata = { interactiveReply }.
+  //  • Quick-reply tap  → message.quick_reply.payload (+ message.text = title)
+  //  • Postback tap     → postback.payload / postback.title (button + generic
+  //    templates; stored as "button_reply" — semantically a button tap, and the
+  //    dashboard already knows that label)
+  let body    = text;
+  let botBody: string | null = null;
+  let metadata: MessageMetadata | null = null;
+
+  const quickReplyPayload = event.message?.quick_reply?.payload;
+  const postback          = event.postback;
+  if (quickReplyPayload) {
+    botBody  = String(quickReplyPayload);
+    metadata = buildReplyMetadata({ type: "quick_reply", id: botBody, title: text, description: null });
+  } else if (postback?.payload) {
+    botBody  = String(postback.payload);
+    body     = postback.title ? String(postback.title) : botBody;
+    metadata = buildReplyMetadata({
+      type:        "button_reply",
+      id:          botBody,
+      title:       postback.title ? String(postback.title) : null,
+      description: null,
+    });
+  }
+
   // Delegate to the shared inbound pipeline — this gives Instagram the same
   // guest upsert, socket emit, bot auto-reply, push notification, and usage
   // tracking that WhatsApp receives via the same function.
   await logIncomingMessage({
     fromPhone:   senderId,
     toPhone:     recipientId,
-    body:        text,
+    body,
     messageType: "text",
     wamid:       mid,
     channel:     MessageChannel.INSTAGRAM,
+    ...(botBody  ? { botBody }  : {}),
+    ...(metadata ? { metadata } : {}),
   });
 }

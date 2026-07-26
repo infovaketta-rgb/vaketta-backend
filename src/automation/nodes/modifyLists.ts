@@ -14,11 +14,8 @@
  * Pure builder functions are exported for unit testing.
  */
 
-import prisma from "../../db/connect";
-import { sendListMessage } from "../../services/whatsapp.send.service";
-import { buildListMetadata } from "../../services/interactiveReply.service";
-import { decryptWhatsAppToken } from "../../utils/encryption.utils";
-import { MessageChannel, MessageStatus } from "@prisma/client";
+import { sendOutbound } from "../../services/outbound/outbound.service";
+import { MessageChannel } from "@prisma/client";
 import { logger } from "../../utils/logger";
 import type {
   AllocationRoom,
@@ -175,53 +172,9 @@ export function buildManualModeSections(
   return sections;
 }
 
-// ── Shared DB/credential helper ───────────────────────────────────────────────
-
-async function resolveHotelGuest(
-  hotelId: string,
-  guestId: string,
-): Promise<{ phone: string; hotelPhone: string; phoneNumberId: string; accessToken: string } | null> {
-  const [hotel, guest] = await Promise.all([
-    prisma.hotel.findUnique({ where: { id: hotelId }, include: { config: true } }),
-    prisma.guest.findUnique({ where: { id: guestId } }),
-  ]);
-  if (!hotel || !guest) return null;
-  const cfg           = hotel.config;
-  const phoneNumberId = cfg?.metaPhoneNumberId ?? "";
-  const encryptedTok  = cfg?.metaAccessTokenEncrypted ?? "";
-  if (!phoneNumberId || !encryptedTok) return null;
-  const accessToken = decryptWhatsAppToken(encryptedTok);
-  return { phone: guest.phone, hotelPhone: hotel.phone, phoneNumberId, accessToken };
-}
-
-async function persistAndEmit(
-  hotelId:     string,
-  guestId:     string,
-  fromPhone:   string,
-  toPhone:     string,
-  wamid:       string,
-  bodyText:    string,
-  buttonLabel: string,
-  sections:    Array<{ title?: string; rows: Array<{ id: string; title: string; description?: string }> }>,
-): Promise<void> {
-  const saved = await prisma.message.create({
-    data: {
-      direction:   "OUT",
-      fromPhone,
-      toPhone,
-      body:        bodyText,
-      messageType: "list",
-      metadata:    buildListMetadata(buttonLabel, sections),
-      hotelId,
-      guestId,
-      channel:     MessageChannel.WHATSAPP,
-      status:      MessageStatus.SENT,
-      wamid,
-    },
-  });
-  const { emitToHotel } = await import("../../realtime/emit");
-  emitToHotel(hotelId, "message:new", { message: saved });
-}
+// Credential resolution, channel dispatch, persistence, and socket emit all
+// live in sendOutbound (services/outbound) — these senders only build the
+// logical "choice" payloads.
 
 // ── Injectable sender 1: room-action menu ─────────────────────────────────────
 
@@ -236,31 +189,22 @@ export type SendRoomMenuListFn = (args: {
 export async function trySendRoomMenuList(args: {
   hotelId:    string;
   guestId:    string;
+  channel:    MessageChannel;
   room:       AllocationRoom;
   options:    RoomAction[];
   roomIndex:  number;
 }): Promise<boolean> {
-  const { hotelId, guestId, room, options, roomIndex } = args;
-  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
+  const { hotelId, guestId, channel, room, options, roomIndex } = args;
   try {
-    const creds = await resolveHotelGuest(hotelId, guestId);
-    if (!creds) return false;
-    const { phone, hotelPhone, phoneNumberId, accessToken } = creds;
-
     const bodyText = `*Room ${roomIndex + 1}: ${room.roomTypeName}*\n👥 ${occupancyLabel(room)}\n💰 ${inr(room.pricePerNight)}/night\n\nWhat would you like to do?`;
-    const sections = buildRoomMenuSections(room, options);
-    const buttonLabel = "Options";
-    const footerText  = "Type MENU to cancel";
-
-    const wamid = await sendListMessage(phone, phoneNumberId, accessToken, {
+    const res = await sendOutbound({ hotelId, guestId, channel }, {
+      kind:        "choice",
       bodyText,
-      footerText,
-      buttonLabel,
-      sections,
+      buttonLabel: "Options",
+      footerText:  "Type MENU to cancel",
+      sections:    buildRoomMenuSections(room, options),
     });
-
-    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, bodyText, buttonLabel, sections);
-    return true;
+    return res.sent;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "room-menu list send failed — falling back to text");
     return false;
@@ -281,37 +225,29 @@ export type SendMoveToRoomListFn = (args: {
 export async function trySendMoveToRoomList(args: {
   hotelId:    string;
   guestId:    string;
+  channel:    MessageChannel;
   state:      AraState;
   fromIndex:  number;
   pending:    { adults: number; children: number };
   resolveCfg: RoomConfigResolver;
 }): Promise<{ sent: boolean; destIndices: number[] }> {
-  const { hotelId, guestId, state, fromIndex, pending, resolveCfg } = args;
-  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return { sent: false, destIndices: [] };
+  const { hotelId, guestId, channel, state, fromIndex, pending, resolveCfg } = args;
   try {
-    const creds = await resolveHotelGuest(hotelId, guestId);
-    if (!creds) return { sent: false, destIndices: [] };
-    const { phone, hotelPhone, phoneNumberId, accessToken } = creds;
-
     const { sections, destIndices } = buildMoveToRoomSections(state, fromIndex, pending, resolveCfg);
     if (destIndices.length === 0) return { sent: false, destIndices: [] };
 
     const moving: string[] = [];
     if (pending.adults   > 0) moving.push(`${pending.adults} adult${pending.adults === 1 ? "" : "s"}`);
     if (pending.children > 0) moving.push(`${pending.children} child${pending.children > 1 ? "ren" : ""}`);
-    const bodyText    = `Move ${moving.join(", ")} to which room?`;
-    const buttonLabel = "Choose Room";
-    const footerText  = "Type MENU to cancel";
 
-    const wamid = await sendListMessage(phone, phoneNumberId, accessToken, {
-      bodyText,
-      footerText,
-      buttonLabel,
+    const res = await sendOutbound({ hotelId, guestId, channel }, {
+      kind:        "choice",
+      bodyText:    `Move ${moving.join(", ")} to which room?`,
+      buttonLabel: "Choose Room",
+      footerText:  "Type MENU to cancel",
       sections,
     });
-
-    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, bodyText, buttonLabel, sections);
-    return { sent: true, destIndices };
+    return { sent: res.sent, destIndices: res.sent ? destIndices : [] };
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "move-to-room list send failed — falling back to text");
     return { sent: false, destIndices: [] };
@@ -363,31 +299,21 @@ export type SendChangeRoomTypeListFn = (args: {
 export async function trySendChangeRoomTypeList(args: {
   hotelId:    string;
   guestId:    string;
+  channel:    MessageChannel;
   room:       AllocationRoom;
   roomIndex:  number;
   candidates: AllocationRoomInput[];
 }): Promise<boolean> {
-  const { hotelId, guestId, room, roomIndex, candidates } = args;
-  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
+  const { hotelId, guestId, channel, roomIndex, candidates } = args;
   try {
-    const creds = await resolveHotelGuest(hotelId, guestId);
-    if (!creds) return false;
-    const { phone, hotelPhone, phoneNumberId, accessToken } = creds;
-
-    const bodyText    = `Change Room ${roomIndex + 1} to which type?`;
-    const sections    = buildChangeTypeSections(candidates);
-    const buttonLabel = "Choose Type";
-    const footerText  = "Type MENU to cancel";
-
-    const wamid = await sendListMessage(phone, phoneNumberId, accessToken, {
-      bodyText,
-      footerText,
-      buttonLabel,
-      sections,
+    const res = await sendOutbound({ hotelId, guestId, channel }, {
+      kind:        "choice",
+      bodyText:    `Change Room ${roomIndex + 1} to which type?`,
+      buttonLabel: "Choose Type",
+      footerText:  "Type MENU to cancel",
+      sections:    buildChangeTypeSections(candidates),
     });
-
-    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, bodyText, buttonLabel, sections);
-    return true;
+    return res.sent;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "change-room-type list send failed — falling back to text");
     return false;
@@ -406,16 +332,12 @@ export type SendManualModeListFn = (args: {
 export async function trySendManualModeList(args: {
   hotelId: string;
   guestId: string;
+  channel: MessageChannel;
   state:   AraState;
   addable: AllocationRoomInput[];
 }): Promise<boolean> {
-  const { hotelId, guestId, state, addable } = args;
-  if (process.env["MOCK_WHATSAPP_SEND"] === "true") return false;
+  const { hotelId, guestId, channel, state, addable } = args;
   try {
-    const creds = await resolveHotelGuest(hotelId, guestId);
-    if (!creds) return false;
-    const { phone, hotelPhone, phoneNumberId, accessToken } = creds;
-
     const total  = state.selectedRooms.reduce((s, r) => s + r.totalPrice, 0);
     const rooms  = state.selectedRooms;
     let summary  = `✏️ *Modify your booking*\n`;
@@ -424,19 +346,14 @@ export async function trySendManualModeList(args: {
     });
     summary += `\n*Total: ${inr(total)}*`;
 
-    const sections   = buildManualModeSections(state, addable);
-    const buttonLabel = "Edit Booking";
-    const footerText  = "Type MENU to cancel";
-
-    const wamid = await sendListMessage(phone, phoneNumberId, accessToken, {
+    const res = await sendOutbound({ hotelId, guestId, channel }, {
+      kind:        "choice",
       bodyText:    summary,
-      footerText,
-      buttonLabel,
-      sections,
+      buttonLabel: "Edit Booking",
+      footerText:  "Type MENU to cancel",
+      sections:    buildManualModeSections(state, addable),
     });
-
-    await persistAndEmit(hotelId, guestId, hotelPhone, phone, wamid, summary, buttonLabel, sections);
-    return true;
+    return res.sent;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "manual-mode list send failed — falling back to text");
     return false;

@@ -46,7 +46,9 @@ export async function handleInstagramWebhook(
  for(
   const event of entry.messaging||[]
  ){
-   const mid:string|undefined = event.message?.mid;
+   // Postback events (button/generic-template taps) carry their mid on
+   // event.postback, not event.message — accept both so taps aren't dropped.
+   const mid:string|undefined = event.message?.mid ?? event.postback?.mid;
    if(!mid) continue;
 
    // Pre-create the idempotency record so the worker's claim guard
