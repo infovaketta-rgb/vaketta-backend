@@ -75,14 +75,24 @@ async function withRetry<T>(
  throw lastErr;
 }
 
+// ── Send host: graph.instagram.com, NOT graph.facebook.com ──────────────────
+// The connect flow is "Instagram API with Instagram Login" (Business Login for
+// Instagram): it stores a long-lived IG USER token (IGAA… prefix). Those tokens
+// are only parseable by graph.instagram.com — posting them to the legacy
+// Messenger-Platform endpoint graph.facebook.com/{ig-id}/messages fails with
+// OAuthException 190 "Cannot parse access token" (that host expects EAA… Page
+// tokens from Embedded Signup). Auth flow and send API must belong to the SAME
+// Meta API generation. `/me/messages` is used instead of `/{ig-id}/messages` so
+// the token itself identifies the account — sidestepping the user_id vs
+// app-scoped-id namespace ambiguity of the stored instagramBusinessAccountId.
+// Docs: developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/messaging-api/
 async function metaPost(
- igAccountId:string,
  body:any,
  accessToken:string
 ){
  const version = await getMetaVersion();
  const res=await fetch(
- `https://graph.facebook.com/${version}/${igAccountId}/messages`,
+ `https://graph.instagram.com/${version}/me/messages`,
  {
    method:"POST",
    headers:{
@@ -140,15 +150,19 @@ export async function sendInstagramTextMessage(
    return null;
  }
 
+ // igAccountId is no longer part of the URL (`/me/messages` — see metaPost),
+ // but a missing id still means the connect flow never completed: fail fast
+ // with the same error as before rather than letting Meta reject the send.
  if(!igAccountId){
    throw new Error("Instagram business account ID not configured");
  }
 
- return withRetry(()=>metaPost(igAccountId,{
+ // Body shape per the IG-Login messaging API: recipient + message only.
+ // (`messaging_type` was a Messenger-Platform field — not part of this API.)
+ return withRetry(()=>metaPost({
    recipient:{
      id:toPhone
    },
-   messaging_type:"RESPONSE",
    message:{
       text
    }
