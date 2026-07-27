@@ -1178,6 +1178,57 @@ function writeOutputContract(flowVars: Record<string, string>, allocated: Alloca
 
 // ── Date helpers (UTC, mirrors availability.service style) ────────────────────
 
+/**
+ * Shared guard for the node's two date entry points (phase1 and
+ * finishAgeCollection). Returns the night count, or a guest-facing message when
+ * the dates are unusable.
+ *
+ * A bad/reversed date is RECOVERABLE: prefer `retryStep` (re-ask just that date,
+ * keep everything else) and only reset when no rewind is possible — an unmapped
+ * variable or an exhausted retry budget. Both call sites go through here so the
+ * two paths can't drift apart.
+ */
+async function resolveNightsOrExplain(
+  deps: AdvancedRoomAllocationDeps,
+): Promise<{ nights: number; checkIn: string; checkOut: string } | { message: string | null }> {
+  const { hotelId, guestId, flowData, resetSession, retryStep } = deps;
+  const vars = flowData.flowVars;
+  const checkIn = vars["bookingCheckIn"];
+  const checkOut = vars["bookingCheckOut"];
+
+  if (!checkIn || !checkOut) {
+    const missing = !checkIn ? "bookingCheckIn" : "bookingCheckOut";
+    if (retryStep) {
+      // Any cached allocation was computed from dates we're about to change.
+      clearState(vars);
+      const retried = await retryStep(
+        missing,
+        "I still need your stay dates to suggest rooms — let's fill that in. 👍",
+      );
+      if (retried !== null) return { message: retried };
+    }
+    await resetSession(guestId, hotelId);
+    return { message: "I don't have your check-in / check-out dates yet. Please start over from the main menu." };
+  }
+
+  const nights = countNights(checkIn, checkOut);
+  if (nights <= 0) {
+    if (retryStep) {
+      clearState(vars);
+      const retried = await retryStep(
+        "bookingCheckOut",
+        `Your check-out date (${checkOut}) must be *after* your check-in date (${checkIn}). ` +
+          `Let's fix just that — everything else is saved. 👍`,
+      );
+      if (retried !== null) return { message: retried };
+    }
+    await resetSession(guestId, hotelId);
+    return { message: "Check-out must be after check-in. Please start over from the main menu." };
+  }
+
+  return { nights, checkIn, checkOut };
+}
+
 function countNights(checkIn: string, checkOut: string): number {
   const ci = Date.parse(`${checkIn}T00:00:00Z`);
   const co = Date.parse(`${checkOut}T00:00:00Z`);
@@ -1241,6 +1292,13 @@ export type AdvancedRoomAllocationDeps = {
   safeMenu:       (hotelId: string, guestId: string) => Promise<string | null>;
   fetchRoomTypes: FetchRoomTypesFn;
   getCalendarData: GetCalendarDataFn;
+  // OPTIONAL — step-level retry. Rewinds to the node that collected `variable`,
+  // clears just that value and re-prompts, preserving every other answer.
+  // Returns null when the rewind isn't possible (unknown variable or the retry
+  // budget is spent), in which case the caller falls back to its existing
+  // reset-and-restart. Absent → callers reset exactly as they did before, so
+  // every existing test and flow keeps its old behaviour.
+  retryStep?: (variable: string, message: string) => Promise<string | null>;
   // OPTIONAL — when provided, manual mode uses it as a fallback to interpret
   // free-text edits that structured parsing can't. Absent → no AI fallback
   // (manual mode behaves exactly as before).
@@ -1446,18 +1504,10 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
   }
 
   // Date inputs are mandatory; let an earlier date question collect them.
-  const checkIn  = vars["bookingCheckIn"];
-  const checkOut = vars["bookingCheckOut"];
-  if (!checkIn || !checkOut) {
-    await resetSession(guestId, hotelId);
-    return "I don't have your check-in / check-out dates yet. Please start over from the main menu.";
-  }
-
-  const nights = countNights(checkIn, checkOut);
-  if (nights <= 0) {
-    await resetSession(guestId, hotelId);
-    return "Check-out must be after check-in. Please start over from the main menu.";
-  }
+  // A missing/reversed date re-asks that one field instead of wiping the session.
+  const dates = await resolveNightsOrExplain(deps);
+  if ("message" in dates) return dates.message;
+  const { nights, checkIn, checkOut } = dates;
 
   // Guest counts come from configurable flowVars (set on the node), falling back
   // to the historical bookingAdults / bookingChildren names + "2" / "0" defaults.
@@ -1468,6 +1518,15 @@ async function phase1(deps: AdvancedRoomAllocationDeps): Promise<string | null> 
   const children = parseInt(vars[childrenVarName] ?? "0", 10) || 0;
 
   if (adults + children === 0) {
+    // Recoverable: re-ask the guest count rather than discarding the dates.
+    if (deps.retryStep) {
+      clearState(vars);
+      const retried = await deps.retryStep(
+        adultsVarName,
+        "I need at least one guest to suggest rooms — how many people are staying?",
+      );
+      if (retried !== null) return retried;
+    }
     await resetSession(guestId, hotelId);
     return "I need at least one guest to allocate a room. Please start over from the main menu.";
   }
@@ -1572,6 +1631,19 @@ async function proceedToAllocation(
   // fail gracefully BEFORE sending the carousel (no point asking for a preference).
   const feasible = allocateRooms({ adults, children, rooms: roomInputs, config, nights });
   if (!feasible || feasible.length === 0) {
+    // Recoverable: the message already invites different dates — so actually let
+    // the guest supply them instead of ending the conversation.
+    const soldOut =
+      `Sorry, we don't have enough rooms for ${adults + children} guests on those dates. ` +
+      `Try different dates and I'll check again — your other details are saved. 👍`;
+    if (deps.retryStep) {
+      // Drop the cached allocation first — otherwise phase1's idempotency guard
+      // would re-render this same (now stale) result instead of re-allocating
+      // against the guest's corrected dates.
+      clearState(deps.flowData.flowVars);
+      const retried = await deps.retryStep("bookingCheckIn", soldOut);
+      if (retried !== null) return retried;
+    }
     await resetSession(guestId, hotelId);
     return `Sorry, we don't have enough rooms for ${adults + children} guests on those dates. Please contact us directly or try different dates.`;
   }
@@ -1646,6 +1718,17 @@ async function generateAndSendPlans(
   });
 
   if (plans.length === 0) {
+    const soldOut =
+      `Sorry, we don't have enough rooms for ${pref.adults + pref.children} guests on those dates. ` +
+      `Try different dates and I'll check again — your other details are saved. 👍`;
+    if (deps.retryStep) {
+      // Drop the cached allocation first — otherwise phase1's idempotency guard
+      // would re-render this same (now stale) result instead of re-allocating
+      // against the guest's corrected dates.
+      clearState(deps.flowData.flowVars);
+      const retried = await deps.retryStep("bookingCheckIn", soldOut);
+      if (retried !== null) return retried;
+    }
     await resetSession(guestId, hotelId);
     return `Sorry, we don't have enough rooms for ${pref.adults + pref.children} guests on those dates. Please contact us directly or try different dates.`;
   }
@@ -1782,17 +1865,9 @@ async function finishAgeCollection(
   const data = (node.data ?? {}) as AdvancedRoomAllocationNodeData;
   const config = resolveConfig(data, deps.childAgeLimit);
 
-  const checkIn  = vars["bookingCheckIn"];
-  const checkOut = vars["bookingCheckOut"];
-  if (!checkIn || !checkOut) {
-    await resetSession(guestId, hotelId);
-    return "I don't have your check-in / check-out dates yet. Please start over from the main menu.";
-  }
-  const nights = countNights(checkIn, checkOut);
-  if (nights <= 0) {
-    await resetSession(guestId, hotelId);
-    return "Check-out must be after check-in. Please start over from the main menu.";
-  }
+  const dates = await resolveNightsOrExplain(deps);
+  if ("message" in dates) return dates.message;
+  const { nights, checkIn, checkOut } = dates;
 
   return reclassifyAndProceed(deps, {
     adults:   ac.adults,

@@ -16,7 +16,16 @@
  *   handoff_to_staff, notify_staff, reset_to_menu, set_variable, send_review_request, view_bookings
  */
 
-import * as chrono from "chrono-node";
+import { parseGuestDateStr, todayInTZ, daysBetween } from "./guestDate";
+import {
+  indexVarProducers,
+  planRetry,
+  chooseDateFieldToRetry,
+  retriesExhausted,
+  bumpRetryCount,
+  clearRetryCount,
+  clearAllRetryCounts,
+} from "./stepRetry";
 import prisma from "../db/connect";
 import { logger } from "../utils/logger";
 
@@ -128,22 +137,30 @@ function parseFlexDate(raw: string): Date | null {
   return null;
 }
 
-/** Parse any natural-language date string from a guest. Tries chrono-node first; falls back to AI extraction. */
-async function parseGuestDate(input: string): Promise<Date | null> {
-  const chronoResult = chrono.parseDate(input.trim(), new Date(), { forwardDate: true }) ?? null;
-  if (chronoResult) return chronoResult;
-  return extractDateWithAI(input);
+/**
+ * Parse any guest-typed date into a calendar-day string (YYYY-MM-DD), resolved
+ * in the HOTEL's timezone.
+ *
+ * Delegates to guestDate.ts, which layers relative-day phrases → explicit
+ * numeric/month dates → chrono, in that order. That ordering is load-bearing:
+ * chrono ANSWERS "day after tomorrow" and "05/06/2026" — just wrongly (as
+ * tomorrow, and as May 6) — so those classes must be resolved before it runs.
+ * See the header of guestDate.ts for the three bugs this fixes.
+ *
+ * Only if every deterministic layer declines do we spend a call on the AI
+ * fallback, which already returns midnight UTC and is read as a plain day.
+ */
+async function parseGuestDate(input: string, timeZone: string): Promise<string | null> {
+  const parsed = parseGuestDateStr(input, timeZone);
+  if (parsed) return parsed;
+
+  const ai = await extractDateWithAI(input);
+  return ai ? ai.toISOString().slice(0, 10) : null;
 }
 
 /** Normalise date to YYYY-MM-DD string */
 function toDateStr(d: Date): string {
   return d.toISOString().slice(0, 10);
-}
-
-/** Midnight UTC today */
-function todayUTC(): Date {
-  const d = new Date();
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
 // interpolate() moved to ./interpolate.ts (dependency-free, unit-testable);
@@ -605,6 +622,51 @@ export async function executeFlowStep(
     sessionWasReset = true;
   };
 
+  // ── Step-level retry ────────────────────────────────────────────────────────
+  // Provenance index: variable name → the node that collected it. Built once per
+  // turn from the published graph, so a flow gains retry support for a new
+  // question node the moment it's added — no per-node config, no field lists.
+  const varProducers = indexVarProducers(nodes as any);
+
+  /**
+   * Recoverable-input handler. Rewinds to the node that collected `variable`,
+   * clears just that value, and re-prompts — preserving every other answer the
+   * guest has given (name, check-in, room choice, ages...).
+   *
+   * Returns null when the rewind isn't possible (no producing node, or the guest
+   * has burned MAX_STEP_RETRIES on this field); the caller then falls back to its
+   * existing terminal behaviour, so there is always a way out of the step.
+   *
+   * Channel-agnostic: the re-prompt travels the node's normal outbound path, so
+   * WhatsApp / Instagram / future channels are handled identically.
+   */
+  async function retryStep(variable: string, message: string): Promise<string | null> {
+    if (retriesExhausted(flowData.flowVars, variable)) {
+      log.info({ flowId, guestId, variable }, "step retry budget exhausted — falling back to reset");
+      return null;
+    }
+
+    const plan = planRetry(variable, flowData.flowVars, varProducers, message);
+    if (!plan) {
+      log.info({ flowId, guestId, variable }, "step retry: no producing node — falling back to reset");
+      return null;
+    }
+
+    flowData.flowVars = bumpRetryCount(plan.flowVars, variable);
+    // Re-entering a question node with waitingFor cleared makes it re-prompt.
+    delete flowData.waitingFor;
+
+    await updateSession(guestId, hotelId, `FLOW:${flowId}:${plan.nodeId}`, {
+      ...sessionData,
+      flow: { ...flowData },
+    });
+
+    // Send the explanation now, then let the node ask its own question, so the
+    // guest sees "why it failed" followed by the original prompt.
+    if (plan.message) await sendNow(plan.message);
+    return advance(plan.nodeId);
+  }
+
   const reply = await advance(nodeId);
 
   // Postgres backup write — session.service already wrote Redis on the critical
@@ -799,43 +861,63 @@ export async function executeFlowStep(
             return interpolate(d.text || "Please enter a date:", flowData.flowVars);
           }
 
-          const parsed = await parseGuestDate(input);
-          if (!parsed) {
+          // Every comparison below is on YYYY-MM-DD strings, which sort
+          // lexicographically — no Date objects, so an instant is never
+          // reinterpreted in another zone (the old .toISOString() day-shift).
+          const hotelTz = hotelCfg?.timezone ?? "UTC";
+          const dateStr = await parseGuestDate(input, hotelTz);
+          if (!dateStr) {
             await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
             return d.validationError || "I didn't catch that date 😅 Try something like *25 May* or *25/05/2026*";
           }
 
+          // "Today" is the hotel's today, not the server's.
+          const todayStr = todayInTZ(hotelTz);
+
           if (d.dateMin === "today") {
-            if (parsed < todayUTC()) {
+            if (dateStr < todayStr) {
               await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
               return d.validationError || "Please enter a *future* date.";
             }
           } else if (d.dateMin && d.dateMin !== "none") {
             // dateMin names an earlier date variable — the answer must be strictly after it.
-            const minRaw  = flowData.flowVars[d.dateMin];
-            const minDate = minRaw ? parseFlexDate(minRaw) : null;
-            if (minDate && toDateStr(parsed) <= toDateStr(minDate)) {
+            // The stored var is already normalized YYYY-MM-DD, but parse defensively
+            // in case an older session persisted a raw DD/MM/YYYY string.
+            const minRaw = flowData.flowVars[d.dateMin];
+            const minStr = minRaw
+              ? (/^\d{4}-\d{2}-\d{2}$/.test(minRaw)
+                  ? minRaw
+                  : parseGuestDateStr(minRaw, hotelTz))
+              : null;
+            if (minStr && dateStr <= minStr) {
               await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
               return d.validationError || `Please enter a date after *${minRaw}*.`;
             }
           }
 
           if (d.dateMaxDays) {
-            const maxDate = new Date(todayUTC().getTime() + d.dateMaxDays * 86_400_000);
-            if (parsed > maxDate) {
+            if (daysBetween(todayStr, dateStr) > d.dateMaxDays) {
               await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
               return d.validationError || `Please enter a date within the next *${d.dateMaxDays} days*.`;
             }
           }
 
-          const dateStr = toDateStr(parsed);
           flowData.flowVars = safeSetVar(flowData.flowVars, d.variableName, dateStr);
-          // Set canonical booking aliases if var name suggests check-in / check-out
+          // Set canonical booking aliases if var name suggests check-in / check-out.
+          // `??=` keeps the first writer, EXCEPT on a step-level retry: the guest is
+          // here precisely to correct this field, so the new answer must overwrite
+          // the stale alias rather than being silently discarded.
           const vl = d.variableName.toLowerCase();
-          if (vl.includes("checkin") || vl.includes("check_in") || vl === "checkin")
-            flowData.flowVars["bookingCheckIn"] ??= dateStr;
-          if (vl.includes("checkout") || vl.includes("check_out") || vl === "checkout")
-            flowData.flowVars["bookingCheckOut"] ??= dateStr;
+          const isCheckIn  = vl.includes("checkin")  || vl.includes("check_in");
+          const isCheckOut = vl.includes("checkout") || vl.includes("check_out");
+          if (isCheckIn)  flowData.flowVars["bookingCheckIn"]  = flowData.flowVars["bookingCheckIn"]  ?? dateStr;
+          if (isCheckOut) flowData.flowVars["bookingCheckOut"] = flowData.flowVars["bookingCheckOut"] ?? dateStr;
+
+          // The step succeeded — refund its retry budget so a guest who later
+          // returns to this node isn't starting from an exhausted tally.
+          flowData.flowVars = clearRetryCount(flowData.flowVars, d.variableName);
+          if (isCheckIn)  flowData.flowVars = clearRetryCount(flowData.flowVars, "bookingCheckIn");
+          if (isCheckOut) flowData.flowVars = clearRetryCount(flowData.flowVars, "bookingCheckOut");
 
           delete flowData.waitingFor;
           const next = nextNodeId(currentNodeId, adjacency);
@@ -974,7 +1056,7 @@ export async function executeFlowStep(
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
           return d.validationError || "Please provide a valid email address.";
         }
-        if (rule === "date"    && !(await parseGuestDate(input))) {
+        if (rule === "date"    && !(await parseGuestDate(input, hotelCfg?.timezone ?? "UTC"))) {
           await updateSession(guestId, hotelId, `FLOW:${flowId}:${currentNodeId}`, { ...sessionData, flow: { ...flowData } });
           return d.validationError || "Please provide a valid date.";
         }
@@ -1302,6 +1384,7 @@ export async function executeFlowStep(
           safeMenu: (h, g) => safeMenu(h, g, channel),
           fetchRoomTypes,
           getCalendarData,
+          retryStep,
           interpretModification: interpretAllocationModification,
           sendPlanList:     (a) => trySendPlanList({ ...a, channel }),
           sendRoomCarousel: (a) => trySendRoomTypeCarousel({ ...a, channel }),
@@ -1387,10 +1470,19 @@ export async function executeFlowStep(
               return finishMulti("⚠️ Could not create booking — missing required details. Please contact us directly.");
             }
 
-            // 3. Dates (same reversed-date handling as single-room).
+            // 3. Dates (same reversed-date handling as single-room — retry the
+            // offending date first, only then fall through to the terminal path).
             const checkInDate  = parseFlexDate(checkIn);
             const checkOutDate = parseFlexDate(checkOut);
             if (!checkInDate || !checkOutDate || checkOutDate <= checkInDate) {
+              const field = chooseDateFieldToRetry(varProducers, d.checkInVar || "bookingCheckIn", d.checkOutVar || "bookingCheckOut");
+              if (field) {
+                const retried = await retryStep(
+                  field,
+                  `Your check-out date (${checkOut}) must be *after* your check-in date (${checkIn}). Let's fix just that — everything else is saved. 👍`,
+                );
+                if (retried !== null) return retried;
+              }
               return finishMulti("⚠️ Booking failed — invalid or reversed dates. Please contact us directly.");
             }
 
@@ -1409,6 +1501,11 @@ export async function executeFlowStep(
             const multiNights = nightsBetween(checkInDate, checkOutDate);
             const multiCeiling = await getPlatformMaxStayCeiling();
             if (exceedsMaxStay(multiNights, cfg?.maxStayNights, multiCeiling)) {
+              const field = chooseDateFieldToRetry(varProducers, d.checkInVar || "bookingCheckIn", d.checkOutVar || "bookingCheckOut");
+              if (field) {
+                const retried = await retryStep(field, STAY_TOO_LONG_MESSAGE);
+                if (retried !== null) return retried;
+              }
               return finishMulti(STAY_TOO_LONG_MESSAGE);
             }
 
@@ -1529,6 +1626,16 @@ export async function executeFlowStep(
           const checkOutDate = parseFlexDate(checkOut);
 
           if (!checkInDate || !checkOutDate || checkOutDate <= checkInDate) {
+            // Recoverable: re-ask just the date that's wrong, keeping the guest's
+            // name / room choice / everything else intact.
+            const field = chooseDateFieldToRetry(varProducers, d.checkInVar || "bookingCheckIn", d.checkOutVar || "bookingCheckOut");
+            if (field) {
+              const retried = await retryStep(
+                field,
+                `Your check-out date (${checkOut}) must be *after* your check-in date (${checkIn}). Let's fix just that — everything else is saved. 👍`,
+              );
+              if (retried !== null) return retried;
+            }
             const next = nextNodeId(currentNodeId, adjacency);
             const errMsg = "⚠️ Booking failed — invalid or reversed dates. Please contact us directly.";
             if (!next) { await resetSession(guestId, hotelId); return errMsg; }
@@ -1555,6 +1662,12 @@ export async function executeFlowStep(
           const stayNights = nightsBetween(checkInDate, checkOutDate);
           const stayCeiling = await getPlatformMaxStayCeiling();
           if (exceedsMaxStay(stayNights, config?.maxStayNights, stayCeiling)) {
+            // Recoverable: the stay is too long, so re-ask the check-out date.
+            const field = chooseDateFieldToRetry(varProducers, d.checkInVar || "bookingCheckIn", d.checkOutVar || "bookingCheckOut");
+            if (field) {
+              const retried = await retryStep(field, STAY_TOO_LONG_MESSAGE);
+              if (retried !== null) return retried;
+            }
             const next = nextNodeId(currentNodeId, adjacency);
             if (!next) { await resetSession(guestId, hotelId); return STAY_TOO_LONG_MESSAGE; }
             await updateSession(guestId, hotelId, `FLOW:${flowId}:${next}`, { ...sessionData, flow: { ...flowData } });
@@ -1568,6 +1681,13 @@ export async function executeFlowStep(
               toDateStr(checkOutDate)
             );
             if (!available) {
+              // Recoverable: a different room type may well be free for these
+              // dates, so re-ask the room choice rather than dumping the session.
+              const soldOut =
+                "❌ Sorry, that room type is fully booked for your selected dates. " +
+                "Let's pick a different room — your other details are saved. 👍";
+              const retried = await retryStep("bookingRoomTypeId", soldOut);
+              if (retried !== null) return retried;
               await resetSession(guestId, hotelId);
               return "❌ Sorry, that room type is fully booked for the selected dates. Please contact us to check alternatives.";
             }
@@ -1625,8 +1745,10 @@ export async function executeFlowStep(
             return advance(cbNext);
           }
 
+          // Booking succeeded — drop the retry bookkeeping so the tallies never
+          // leak into a confirmation message or a later step's budget.
           flowData.flowVars = {
-            ...flowData.flowVars,
+            ...clearAllRetryCounts(flowData.flowVars),
             bookingRef:    booking.referenceNumber ?? booking.id.slice(0, 8).toUpperCase(),
             bookingStatus: BookingStatus.PENDING,
             bookingId:     booking.id,

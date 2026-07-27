@@ -269,6 +269,166 @@ describe("handleAdvancedRoomAllocation — handler", () => {
     expect(deps.flowData.flowVars["__araState__"]).toBeUndefined();
   });
 
+  // ── Step-level retry (recoverable input errors must not wipe the session) ───
+  //
+  // The `retryStep` dep is OPTIONAL. Absent (every legacy test above) → callers
+  // reset exactly as before. Present → a recoverable error re-asks one field and
+  // preserves the rest. Both contracts are asserted here.
+  describe("step-level retry", () => {
+    /** Stand-in for flowRuntime's retryStep: records the call, returns a prompt. */
+    function makeRetryStep() {
+      const calls: Array<{ variable: string; message: string }> = [];
+      const fn = vi.fn(async (variable: string, message: string) => {
+        calls.push({ variable, message });
+        return `RETRY_PROMPT:${variable}`;
+      });
+      return { fn, calls };
+    }
+
+    it("reversed check-out re-asks the date instead of resetting the session", async () => {
+      const { fn, calls } = makeRetryStep();
+      const deps = makeDeps({
+        flowVars: {
+          bookingAdults: "2",
+          bookingChildren: "0",
+          bookingCheckIn: "2026-08-10",
+          bookingCheckOut: "2026-08-09", // before check-in
+          bookingGuestName: "Priya",
+        },
+        retryStep: fn,
+      });
+
+      const result = await handleAdvancedRoomAllocation(deps);
+
+      expect(result).toBe("RETRY_PROMPT:bookingCheckOut");
+      expect(calls[0]!.variable).toBe("bookingCheckOut");
+      expect(calls[0]!.message).toMatch(/must be \*after\*/i);
+      // The whole point: no reset, and the guest's other answers survive.
+      expect(deps.resetSession).not.toHaveBeenCalled();
+      expect(deps.flowData.flowVars["bookingGuestName"]).toBe("Priya");
+      expect(deps.flowData.flowVars["bookingCheckIn"]).toBe("2026-08-10");
+    });
+
+    it("never leaves a stale allocation behind when rewinding", async () => {
+      const { fn } = makeRetryStep();
+      const deps = makeDeps({
+        flowVars: {
+          bookingAdults: "2",
+          bookingChildren: "0",
+          bookingCheckIn: "2026-08-10",
+          bookingCheckOut: "2026-08-09",
+          __araState__: JSON.stringify({ phase: "confirm", guests: { adults: 2, children: 0 }, selectedRooms: [] }),
+        },
+        retryStep: fn,
+      });
+
+      await handleAdvancedRoomAllocation(deps);
+
+      // Otherwise phase1's idempotency guard would re-render the OLD allocation
+      // and silently ignore the corrected dates.
+      expect(deps.flowData.flowVars["__araState__"]).toBeUndefined();
+    });
+
+    it("falls back to the old reset when the retry budget is spent", async () => {
+      // retryStep returning null is how flowRuntime signals "no rewind possible".
+      const exhausted = vi.fn(async () => null);
+      const deps = makeDeps({
+        flowVars: {
+          bookingAdults: "2",
+          bookingChildren: "0",
+          bookingCheckIn: "2026-08-10",
+          bookingCheckOut: "2026-08-09",
+        },
+        retryStep: exhausted,
+      });
+
+      const result = await handleAdvancedRoomAllocation(deps);
+
+      expect(exhausted).toHaveBeenCalled();
+      expect(result).toMatch(/Check-out must be after check-in/i);
+      expect(deps.resetSession).toHaveBeenCalledWith("guest_1", "hotel_1");
+    });
+
+    it("missing dates re-ask for them rather than restarting", async () => {
+      const { fn, calls } = makeRetryStep();
+      const deps = makeDeps({
+        flowVars: { bookingAdults: "2", bookingChildren: "0", bookingGuestName: "Ada" },
+        retryStep: fn,
+      });
+      // makeDeps seeds default dates — clear them to exercise the missing-date path.
+      delete deps.flowData.flowVars["bookingCheckIn"];
+      delete deps.flowData.flowVars["bookingCheckOut"];
+
+      const result = await handleAdvancedRoomAllocation(deps);
+
+      expect(result).toBe("RETRY_PROMPT:bookingCheckIn");
+      expect(calls[0]!.variable).toBe("bookingCheckIn");
+      expect(deps.resetSession).not.toHaveBeenCalled();
+      expect(deps.flowData.flowVars["bookingGuestName"]).toBe("Ada");
+    });
+
+    it("a zero/blank guest count is defaulted to 2 adults, never a dead end", async () => {
+      // Documents existing behaviour: `parseInt(x, 10) || 2` turns "0", "" and
+      // any non-numeric value into 2 adults, so the `adults + children === 0`
+      // guard below it is unreachable in practice. The retry wired into that
+      // guard is therefore a safety net, not a live path — asserted here so the
+      // next reader doesn't mistake it for dead code that can be deleted.
+      const { fn } = makeRetryStep();
+      const deps = makeDeps({
+        flowVars: {
+          bookingAdults: "0",
+          bookingChildren: "0",
+          bookingCheckIn: "2026-08-10",
+          bookingCheckOut: "2026-08-12",
+        },
+        retryStep: fn,
+      });
+
+      const result = await handleAdvancedRoomAllocation(deps);
+
+      // Proceeds with the 2-adult default rather than retrying or resetting.
+      expect(fn).not.toHaveBeenCalled();
+      expect(deps.resetSession).not.toHaveBeenCalled();
+      expect(result).toBeTruthy();
+    });
+
+    it("sold-out inventory offers different dates instead of ending the chat", async () => {
+      const { fn, calls } = makeRetryStep();
+      const deps = makeDeps({
+        flowVars: {
+          bookingAdults: "4",
+          bookingChildren: "0",
+          bookingCheckIn: "2026-08-10",
+          bookingCheckOut: "2026-08-12",
+        },
+        rooms: [room({ availableCount: 0 })],
+        retryStep: fn,
+      });
+
+      const result = await handleAdvancedRoomAllocation(deps);
+
+      expect(result).toBe("RETRY_PROMPT:bookingCheckIn");
+      expect(calls[0]!.message).toMatch(/try different dates/i);
+      expect(deps.resetSession).not.toHaveBeenCalled();
+    });
+
+    it("without the dep, every legacy reset path is unchanged", async () => {
+      const deps = makeDeps({
+        flowVars: {
+          bookingAdults: "2",
+          bookingChildren: "0",
+          bookingCheckIn: "2026-08-10",
+          bookingCheckOut: "2026-08-09",
+        },
+      });
+
+      const result = await handleAdvancedRoomAllocation(deps);
+
+      expect(result).toMatch(/Check-out must be after check-in/i);
+      expect(deps.resetSession).toHaveBeenCalledWith("guest_1", "hotel_1");
+    });
+  });
+
   // ── Phase 1 happy path — for subsequent handler tests we need real araState ─
   // Phase 1 now lands in collecting_room_preference (carousel-first, Piece 2A);
   // drive through it with "Mix it up" (no preference) to reach confirm/plan_selection.
