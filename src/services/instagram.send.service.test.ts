@@ -144,6 +144,48 @@ describe("sendInstagramTextMessage — IG-Login messaging endpoint", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("splits text over 950 chars into sequential sends, awaiting each in order", async () => {
+    const long = ("word ".repeat(210)).trim(); // > 950 chars, splits on spaces
+    fetchMock
+      .mockResolvedValueOnce(graphOk({ message_id: "mid.1" }))
+      .mockResolvedValueOnce(graphOk({ message_id: "mid.2" }));
+
+    const result = await sendInstagramTextMessage({ ...INPUT, text: long });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body1 = JSON.parse(fetchMock.mock.calls[0]![1].body);
+    const body2 = JSON.parse(fetchMock.mock.calls[1]![1].body);
+    expect(body1.message.text.length).toBeLessThanOrEqual(950);
+    expect(body2.message.text.length).toBeLessThanOrEqual(950);
+    // Chunks rejoin to the original content (split on spaces, so join with a space).
+    expect(`${body1.message.text} ${body2.message.text}`).toBe(long);
+    // Result reflects the last successful chunk send.
+    expect(result).toEqual({ message_id: "mid.2" });
+  });
+
+  it("stops sending remaining chunks and surfaces the real error when a later chunk fails", async () => {
+    const long = ("word ".repeat(400)).trim(); // splits into 3+ chunks
+    fetchMock
+      .mockResolvedValueOnce(graphOk({ message_id: "mid.1" }))
+      .mockResolvedValueOnce(graphOk({ message_id: "mid.2" }))
+      .mockResolvedValueOnce(graphError(400, { error: { message: "Recipient not reachable", code: 551 } }));
+
+    await expect(sendInstagramTextMessage({ ...INPUT, text: long })).rejects.toThrow(/Recipient not reachable/);
+    // Exactly 3 calls: two succeeded, the third failed and stopped the loop (no 4th send).
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not split text at or under the 950-char limit — single send, unchanged body", async () => {
+    fetchMock.mockResolvedValue(graphOk({ message_id: "mid.SHORT" }));
+    const exact950 = "a".repeat(950);
+
+    await sendInstagramTextMessage({ ...INPUT, text: exact950 });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(fetchMock.mock.calls[0]![1].body);
+    expect(body.message.text).toBe(exact950);
+  });
+
   it("5xx Graph errors are retried, then succeed", async () => {
     vi.useFakeTimers();
     try {

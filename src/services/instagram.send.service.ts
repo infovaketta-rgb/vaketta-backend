@@ -3,6 +3,7 @@ import prisma from "../db/connect";
 // would drag in message.service → realtime/emit → server.ts (heavy chain).
 import { decryptInstagramToken } from "../utils/encryption.utils";
 import { logger } from "../utils/logger";
+import { splitInstagramMessage } from "./instagramMessageSplitter";
 
 const VERSION_TTL_MS = 300_000;
 let _cachedVersion: { value: string; expiresAt: number } | null = null;
@@ -175,12 +176,18 @@ export async function sendInstagramTextMessage(
  }
 ){
  const { toPhone, text, hotelId } = input;
- return dispatchInstagramMessage(
-   hotelId, toPhone,
-   { text },
-   "MOCK INSTAGRAM send",
-   { preview: text?.slice(0, 80) },
- );
+ const chunks = splitInstagramMessage(text);
+
+ let result;
+ for(const chunk of chunks){
+   result = await dispatchInstagramMessage(
+     hotelId, toPhone,
+     { text: chunk },
+     "MOCK INSTAGRAM send",
+     { preview: chunk?.slice(0, 80) },
+   );
+ }
+ return result;
 }
 
 // ── Interactive sends (IG-Login messaging API) ────────────────────────────────
