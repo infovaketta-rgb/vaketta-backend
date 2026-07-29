@@ -504,6 +504,24 @@ export async function sendTemplateMessage(
   }
   if (!guest) throw Object.assign(new Error("Guest not found"), { status: 404 });
 
+  // WhatsApp templates are a Meta WhatsApp Cloud API construct — there is no
+  // Instagram equivalent, and the send below hits the WhatsApp /messages edge
+  // with WhatsApp credentials. Reject before any Meta call so an Instagram
+  // conversation fails fast with a clear reason instead of a 400 from Meta or
+  // a template bubble persisted on an Instagram thread. Channel is derived from
+  // the guest's most recent message, the same source manualReply uses.
+  const lastMsg = await prisma.message.findFirst({
+    where:   { guestId, hotelId },
+    orderBy: { timestamp: "desc" },
+    select:  { channel: true },
+  });
+  if ((lastMsg?.channel ?? MessageChannel.WHATSAPP) === MessageChannel.INSTAGRAM) {
+    throw Object.assign(
+      new Error("WhatsApp templates cannot be sent to Instagram conversations. Send a regular message instead."),
+      { status: 400 }
+    );
+  }
+
   const [{ phoneNumberId, accessToken }, hotel, apiVersion] = await Promise.all([
     getWaCredentials(hotelId),
     prisma.hotel.findUnique({ where: { id: hotelId }, select: { phone: true } }),
