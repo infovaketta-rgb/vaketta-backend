@@ -32,6 +32,11 @@ vi.mock("./echoPersist.service", () => ({
   persistEchoedOutboundMessage: (...a: any[]) => persistEchoedOutboundMessage(...a),
 }));
 
+const maybeEnqueueInstagramProfileJob = vi.fn().mockResolvedValue(undefined);
+vi.mock("./instagram.profile.service", () => ({
+  maybeEnqueueInstagramProfileJob: (...a: any[]) => maybeEnqueueInstagramProfileJob(...a),
+}));
+
 vi.mock("../utils/logger", () => ({
   logger: { child: () => ({ debug: vi.fn(), warn: vi.fn(), info: vi.fn(), error: vi.fn() }) },
 }));
@@ -69,6 +74,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   logIncomingMessage.mockResolvedValue({});
   persistEchoedOutboundMessage.mockResolvedValue({ message: { id: "m1" }, isNew: true });
+  maybeEnqueueInstagramProfileJob.mockResolvedValue(undefined);
 });
 
 describe("normal inbound Instagram message (behaviour preserved)", () => {
@@ -104,6 +110,49 @@ describe("normal inbound Instagram message (behaviour preserved)", () => {
     await processInstagramInboundEvent({ sender: { id: "x" } });
     expect(resolveHotelByChannel).not.toHaveBeenCalled();
     expect(logIncomingMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("profile enrichment hook", () => {
+  it("enqueues enrichment for the guest after a normal inbound message", async () => {
+    resolveHotelByChannel.mockResolvedValue(HOTEL);
+    logIncomingMessage.mockResolvedValue({ hotelId: "hotel_1", guestId: "guest_1" });
+
+    await processInstagramInboundEvent(inboundEvent());
+
+    expect(maybeEnqueueInstagramProfileJob).toHaveBeenCalledWith({
+      hotelId: "hotel_1",
+      guestId: "guest_1",
+      igsid:   "996345286534670",   // the SENDER — the guest, not the business account
+    });
+  });
+
+  it("never enqueues for echo events — consent comes from the guest messaging us", async () => {
+    resolveHotelByChannel.mockResolvedValue(HOTEL);
+
+    await processInstagramInboundEvent(echoEvent());
+
+    expect(maybeEnqueueInstagramProfileJob).not.toHaveBeenCalled();
+  });
+
+  it("does not enqueue when the pipeline returned no guestId (dedup/empty message)", async () => {
+    resolveHotelByChannel.mockResolvedValue(HOTEL);
+    logIncomingMessage.mockResolvedValue({});
+
+    await processInstagramInboundEvent(inboundEvent());
+
+    expect(maybeEnqueueInstagramProfileJob).not.toHaveBeenCalled();
+  });
+
+  it("an enqueue failure never breaks the inbound path", async () => {
+    resolveHotelByChannel.mockResolvedValue(HOTEL);
+    logIncomingMessage.mockResolvedValue({ hotelId: "hotel_1", guestId: "guest_1" });
+    maybeEnqueueInstagramProfileJob.mockRejectedValueOnce(new Error("unexpected"));
+
+    // The helper swallows its own errors, and the call site catches too — a
+    // regression in either layer must not turn a stored message into a retry.
+    await expect(processInstagramInboundEvent(inboundEvent())).resolves.toBeUndefined();
+    expect(logIncomingMessage).toHaveBeenCalledTimes(1); // message was still persisted
   });
 });
 

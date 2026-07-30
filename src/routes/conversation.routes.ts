@@ -1,7 +1,25 @@
 import { Router, Request, Response, json as expressJson } from "express";
-import { getConversations, updateGuestName } from "../controllers/conversation.controller";
+import { rateLimit } from "express-rate-limit";
+import {
+  getConversations,
+  getConversation,
+  refreshGuestProfile,
+  updateGuestName,
+} from "../controllers/conversation.controller";
 import { normalizePhone } from "../utils/phone";
 import prisma from "../db/connect";
+
+// Per-guest limiter — a profile refresh hits the Graph API and R2, so the
+// key is the guest id (not the caller IP): several staff members watching one
+// conversation share the budget for that guest.
+const refreshProfileLimiter = rateLimit({
+  windowMs:        10 * 60 * 1000, // 10 min
+  max:             5,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  keyGenerator:    (req) => `${(req as any).user?.hotelId ?? "anon"}:${req.params["guestId"]}`,
+  message:         { error: "Too many profile refreshes for this guest. Please try again later." },
+});
 
 const router = Router();
 
@@ -92,6 +110,17 @@ router.delete("/:guestId/messages", async (req: Request, res: Response) => {
     return res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// ── GET /conversations/:guestId ───────────────────────────────────────────────
+// Chat-header metadata (name/channel + Instagram profile fields). Declared
+// after the literal DELETE paths above; GET has no literal sibling route.
+router.get("/:guestId", getConversation);
+
+// ── POST /conversations/:guestId/refresh-profile ──────────────────────────────
+// Staff-triggered Instagram profile re-enqueue, bypassing the TTL. Rate-limited
+// per guest. Declared before /initiate is irrelevant (distinct literal path),
+// but kept adjacent to the other :guestId routes.
+router.post("/:guestId/refresh-profile", refreshProfileLimiter, refreshGuestProfile);
 
 // POST /conversations/initiate
 // Body: { guestId: string } | { phone: string; name?: string }

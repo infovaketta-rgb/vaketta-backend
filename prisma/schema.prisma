@@ -227,6 +227,20 @@ model Guest {
 
   lastHandledByStaff Boolean @default(false)
 
+  // Instagram profile enrichment — populated by the instagram-profile worker
+  // from the Graph API. `name` above stays STAFF-owned (PATCH /conversations/
+  // :guestId) and is never overwritten by Graph data.
+  igName             String?
+  igUsername         String?
+  igProfilePicUrl    String? // OUR mirrored URL (R2 / local) — never a cdninstagram URL (those expire)
+  igProfilePicKey    String? // storage key, so the previous object can be deleted
+  igProfilePicHash   String? // sha256 of mirrored bytes — skip re-upload when unchanged
+  igFollowerCount    Int?
+  igFollowsBusiness  Boolean? // is_user_follow_business — guest follows the hotel
+  igBusinessFollows  Boolean? // is_business_follow_user — hotel follows the guest
+  igProfileFetchedAt DateTime?
+  igProfileStatus    String? // OK | NO_CONSENT | NOT_FOUND | TOKEN_EXPIRED | ERROR
+
   hotelId String
   hotel   Hotel  @relation(fields: [hotelId], references: [id])
 
@@ -236,6 +250,7 @@ model Guest {
   pausedFlows          PausedFlow[]
 
   @@unique([phone, hotelId])
+  @@index([hotelId, igProfileFetchedAt]) // stale-profile sweeps
 }
 
 enum BookingStatus {

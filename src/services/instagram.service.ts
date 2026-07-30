@@ -2,6 +2,7 @@ import { MessageChannel } from "@prisma/client";
 import { logIncomingMessage, resolveHotelByChannel } from "./message.service";
 import { persistEchoedOutboundMessage } from "./echoPersist.service";
 import { buildReplyMetadata, type MessageMetadata } from "./interactiveReply.service";
+import { maybeEnqueueInstagramProfileJob } from "./instagram.profile.service";
 import { logger } from "../utils/logger";
 export { encryptInstagramToken, decryptInstagramToken } from "../utils/encryption.utils";
 
@@ -92,7 +93,7 @@ export async function processInstagramInboundEvent(event: any): Promise<void> {
   // Delegate to the shared inbound pipeline — this gives Instagram the same
   // guest upsert, socket emit, bot auto-reply, push notification, and usage
   // tracking that WhatsApp receives via the same function.
-  await logIncomingMessage({
+  const result = await logIncomingMessage({
     fromPhone:   senderId,
     toPhone:     recipientId,
     body,
@@ -102,4 +103,16 @@ export async function processInstagramInboundEvent(event: any): Promise<void> {
     ...(botBody  ? { botBody }  : {}),
     ...(metadata ? { metadata } : {}),
   });
+
+  // ── Profile enrichment (normal inbound only, never echoes) ──────────────────
+  // Consent to read the profile comes from the guest messaging us; echo events
+  // are our own outbound. The helper is TTL-gated, feature-gated, and never
+  // throws — enrichment must never break the inbound message path.
+  if (result?.guestId) {
+    await maybeEnqueueInstagramProfileJob({
+      hotelId: hotel.id,
+      guestId: result.guestId,
+      igsid:   senderId,
+    }).catch((err) => log.warn({ err, mid }, "instagram profile enqueue threw — inbound path unaffected"));
+  }
 }

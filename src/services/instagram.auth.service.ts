@@ -1,5 +1,6 @@
 import prisma from "../db/connect";
 import { encryptInstagramToken } from "./instagram.service";
+import { getMetaVersion } from "../utils/metaApi.utils";
 
 const INSTAGRAM_TOKEN_URL   = "https://api.instagram.com/oauth/access_token";
 const INSTAGRAM_GRAPH_BASE  = "https://graph.instagram.com";
@@ -109,7 +110,8 @@ export async function subscribeInstagramWebhook(
   igUserId: string,
   accessToken: string,
 ): Promise<void> {
-  const url = new URL(`${INSTAGRAM_GRAPH_BASE}/v25.0/${igUserId}/subscribed_apps`);
+  const version = await getMetaVersion();
+  const url = new URL(`${INSTAGRAM_GRAPH_BASE}/${version}/${igUserId}/subscribed_apps`);
   url.searchParams.set("subscribed_fields", "messages");
   url.searchParams.set("access_token",      accessToken);
 

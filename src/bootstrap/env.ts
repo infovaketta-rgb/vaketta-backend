@@ -54,4 +54,15 @@ export function validateEnv(): void {
   if (!process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY) {
     log.warn("R2 credentials not set — media uploads fall back to local disk");
   }
+  // Instagram guest profile enrichment — all three default to a working state,
+  // so these are informational only.
+  if (process.env.INSTAGRAM_PROFILE_ENRICHMENT_ENABLED === "false") {
+    log.warn("INSTAGRAM_PROFILE_ENRICHMENT_ENABLED=false — Instagram guest profiles will not be fetched");
+  }
+  if (!process.env.INSTAGRAM_PROFILE_TTL_HOURS) {
+    log.warn("INSTAGRAM_PROFILE_TTL_HOURS not set — defaulting to 24 h between profile refreshes");
+  }
+  if (process.env.MOCK_INSTAGRAM_PROFILE === "true") {
+    log.warn("MOCK_INSTAGRAM_PROFILE=true — Instagram profile fetches return a fixture, no Graph call");
+  }
 }
