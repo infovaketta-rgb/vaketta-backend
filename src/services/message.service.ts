@@ -4,7 +4,7 @@ import { emitToHotel } from "../realtime/emit";
 import { shouldAutoReply } from "../automation/shouldAutoReply";
 import { processMessage as botProcess } from "../automation/botEngine";
 import { resetSession } from "./session.service";
-import { incrementConversationUsage, isConversationOverQuota } from "./usage.service";
+import { incrementConversationUsage, isSuspended, isOverQuota } from "./usage.service";
 import { sendPushToHotelStaff } from "./push.service";
 import { logger } from "../utils/logger";
 import { MessageChannel } from "@prisma/client";
@@ -163,8 +163,11 @@ export async function logIncomingMessage(
   // We exclude the message we just created so we're looking at prior history.
   // These two reads are independent — run them together (a real win once the DB
   // connection_limit is raised; harmless when it's 1).
+  // `suspended` (subscription lapsed) and `overQuota` (allowance exhausted) are
+  // now DISTINCT — they used to be one boolean, so an unpaid account logged
+  // "conversation quota exceeded", which sent every investigation the wrong way.
   const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const [lastMessage, overQuota] = await Promise.all([
+  const [lastMessage, suspended, overQuota] = await Promise.all([
     prisma.message.findFirst({
       where: {
         guestId: guest.id,
@@ -174,9 +177,13 @@ export async function logIncomingMessage(
       orderBy: { timestamp: "desc" },
       select:  { timestamp: true },
     }),
-    isConversationOverQuota(hotel.id),
+    isSuspended(hotel.id),
+    isOverQuota(hotel.id),
   ]);
-  if (!lastMessage || lastMessage.timestamp < twentyFourHoursAgo) {
+
+  // Don't meter a hotel we aren't serving — billing an expired tenant for
+  // conversations its bot never answered is not a bill we can defend.
+  if (!suspended && (!lastMessage || lastMessage.timestamp < twentyFourHoursAgo)) {
     incrementConversationUsage(hotel.id).catch((err) => log.error({ err, hotelId: hotel.id }, "incrementConversationUsage failed"));
   }
 
@@ -185,21 +192,33 @@ export async function logIncomingMessage(
     return { hotelId: hotel.id, guestId: guest.id, autoReply: false, autoReplyMessage: null };
   }
 
-  if (overQuota) {
-    log.warn({ hotelId: hotel.id }, "conversation quota exceeded — bot silenced");
-    return { hotelId: hotel.id, guestId: guest.id, autoReply: false, autoReplyMessage: null };
+  // The bot is off, but the message is already persisted and emitted, and staff
+  // still get notified below — this early-return used to sit ABOVE the
+  // notification block, so a suspended hotel's staff were never told a guest had
+  // written in. Silence from the bot AND silence from the dashboard.
+  const botSilenced = suspended || overQuota;
+  if (botSilenced) {
+    log.warn(
+      { hotelId: hotel.id, reason: suspended ? "subscription_lapsed" : "conversation_quota_exceeded" },
+      "bot silenced for inbound message",
+    );
   }
 
-  const autoReplyMode = shouldAutoReply(
-    {
-      autoReplyEnabled:  hotel.config.autoReplyEnabled,
-      businessStartHour: hotel.config.businessStartHour,
-      businessEndHour:   hotel.config.businessEndHour,
-      timezone:          hotel.config.timezone,
-      allDay:            (hotel.config as any).allDay ?? false,
-    },
-    guest.lastHandledByStaff
-  );
+  // A silenced bot degrades to OFF rather than returning early, so the guest
+  // still reaches a human: staff get the push + `staff:notification` below,
+  // exactly as they would outside business hours.
+  const autoReplyMode = botSilenced
+    ? "OFF"
+    : shouldAutoReply(
+        {
+          autoReplyEnabled:  hotel.config.autoReplyEnabled,
+          businessStartHour: hotel.config.businessStartHour,
+          businessEndHour:   hotel.config.businessEndHour,
+          timezone:          hotel.config.timezone,
+          allDay:            (hotel.config as any).allDay ?? false,
+        },
+        guest.lastHandledByStaff
+      );
 
   let sentReplyText: string | null = null;
 

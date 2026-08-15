@@ -19,7 +19,7 @@ import { getOrCreateSession, updateSession, resetSession, SessionData } from "..
 import { getHotelConfigCached } from "../services/settings.service";
 import { executeFlowStep } from "./flowRuntime";
 import { getAIReply } from "../services/ai.service";
-import { incrementAIUsage } from "../services/usage.service";
+import { incrementAIUsage, isAIReplyOverQuota } from "../services/usage.service";
 import { sendOutbound } from "../services/outbound/outbound.service";
 import { MessageChannel } from "@prisma/client";
 
@@ -156,9 +156,13 @@ async function handleSelection(
       return showMenu(hotelId, guestId, sessionData, input, channel);
     }
 
-    // Unknown input — try AI fallback if enabled
+    // Unknown input — try AI fallback if enabled AND the hotel has AI replies
+    // left. `aiReplyLimit` was stored, snapshotted and displayed but never once
+    // compared against `aiRepliesUsed`, so any plan could burn unbounded LLM
+    // spend. Over the limit we fall through to the menu below rather than going
+    // silent — the guest still gets a usable reply.
     const cfg = await getHotelConfigCached(hotelId);
-    if ((cfg as any)?.aiEnabled) {
+    if ((cfg as any)?.aiEnabled && !(await isAIReplyOverQuota(hotelId))) {
       const aiResult = await getAIReply(hotelId, guestId, input);
       if (aiResult) {
         incrementAIUsage(hotelId).catch(() => {});

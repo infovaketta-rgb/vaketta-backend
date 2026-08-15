@@ -103,6 +103,24 @@ async function sendViaSmtp(to: string, subject: string, html: string, text: stri
 }
 
 /**
+ * Send an email through whichever transport is configured.
+ *
+ * Extracted so billing notices (renewal reminders, past-due, suspension) reuse
+ * the exact same transport selection as password-reset OTPs — Resend HTTP API
+ * when `RESEND_API_KEY` is set (required on Render, which blocks outbound SMTP),
+ * SMTP otherwise. Behaviour of `sendOtpEmail` is unchanged; it now calls this.
+ *
+ * Throws when no transport is configured, so callers can decide whether that is
+ * fatal (password reset) or merely logged (billing notice).
+ */
+export async function sendEmail(to: string, subject: string, html: string, text: string): Promise<void> {
+  if (RESEND_API_KEY) {
+    return sendViaResend(to, subject, html, text);
+  }
+  return sendViaSmtp(to, subject, html, text);
+}
+
+/**
  * Send a password-reset OTP email. Prefers the Resend HTTP API when configured
  * (required on Render — SMTP ports are blocked); falls back to SMTP otherwise.
  * Throws if no email transport is configured so the caller can surface an error.
@@ -126,8 +144,5 @@ export async function sendOtpEmail(to: string, code: string, name?: string): Pro
       </p>
     </div>`;
 
-  if (RESEND_API_KEY) {
-    return sendViaResend(to, subject, html, text);
-  }
-  return sendViaSmtp(to, subject, html, text);
+  return sendEmail(to, subject, html, text);
 }

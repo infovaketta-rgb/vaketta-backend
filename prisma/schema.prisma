@@ -14,40 +14,210 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
+// ── Billing enums ─────────────────────────────────────────────────────────────
+// subscriptionStatus was a bare String defaulting to "trial", so nothing at the
+// DB level stopped a typo. PAST_DUE is new: it is the grace-period state between
+// a missed invoice and full suspension.
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  EXPIRED
+  CANCELED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  VOID
+  UNCOLLECTIBLE
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
 model Plan {
   id                      String   @id @default(uuid())
   name                    String
-  currency                String   @default("USD") // ISO 4217, e.g. "USD", "EUR", "INR"
-  priceMonthly            Float // in minor units (cents/paise), e.g. 4900 = $49/mo
+  // ISO 4217, e.g. "USD", "EUR", "INR"
+  currency                String   @default("USD")
+  // "ALL" = global, else ISO 3166-1 alpha-2. The admin Plans UI has always sent
+  // and displayed this field; the column simply never existed, so every plan was
+  // silently global and the country picker did nothing.
+  country                 String   @default("ALL")
+  // All money is INTEGER minor units (cents/paise), e.g. 4900 = $49/mo. These
+  // were Float — the original migration created them INTEGER and a later one
+  // widened them, which let rounding drift into MRR sums and overage math.
+  priceMonthly            Int
   conversationLimit       Int // 0 = unlimited
   aiReplyLimit            Int // 0 = unlimited
-  extraConversationCharge Float    @default(0) // minor units per extra conversation
-  extraAiReplyCharge      Float    @default(0) // minor units per extra AI reply
+  extraConversationCharge Int      @default(0) // minor units per extra conversation
+  extraAiReplyCharge      Int      @default(0) // minor units per extra AI reply
   isActive                Boolean  @default(true)
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
 
   hotels        Hotel[]
   subscriptions Subscription[]
+
+  @@index([country, isActive])
 }
 
+/// The commercial agreement between a hotel and a plan — mutable, with AT MOST
+/// ONE live row per hotel (enforced by a partial unique index; see the migration).
+/// Periods roll forward in place on renewal; the immutable per-period record is
+/// `Invoice`. Superseding a subscription (plan change) marks the old row CANCELED.
+///
+/// `startDate`/`endDate` keep their column names but now mean the CURRENT period.
+/// They used to be back-dated to the start of the calendar month, which is what
+/// made a hotel signing up on the 28th expire three days later.
 model Subscription {
-  id                      String    @id @default(uuid())
-  hotelId                 String
-  planId                  String? // soft ref — plan may be updated later
-  planName                String // snapshot at assignment time
-  currency                String    @default("USD") // snapshot
-  price                   Float // snapshot in minor units
-  conversationLimit       Int // snapshot
-  aiReplyLimit            Int // snapshot
-  extraConversationCharge Float     @default(0) // snapshot in minor units
-  extraAiReplyCharge      Float     @default(0) // snapshot in minor units
-  startDate               DateTime
-  endDate                 DateTime?
-  createdAt               DateTime  @default(now())
+  id      String  @id @default(uuid())
+  hotelId String
+  planId  String? // soft ref — plan may be updated later
 
-  hotel Hotel @relation(fields: [hotelId], references: [id])
-  plan  Plan? @relation(fields: [planId], references: [id])
+  status SubscriptionStatus @default(ACTIVE)
+
+  // Snapshot of the plan's terms at assignment time, so editing a Plan never
+  // retroactively changes what a hotel is billed for the current period.
+  planName                String
+  currency                String @default("USD")
+  price                   Int // minor units
+  conversationLimit       Int
+  aiReplyLimit            Int
+  extraConversationCharge Int    @default(0) // minor units
+  extraAiReplyCharge      Int    @default(0) // minor units
+
+  /// Current period start (inclusive).
+  startDate  DateTime
+  /// Current period end (exclusive).
+  endDate    DateTime?
+  autoRenew  Boolean   @default(true)
+  canceledAt DateTime?
+
+  // Gateway seam — null while billing is manual. A future Razorpay/Stripe
+  // subscription is linked here without a schema change.
+  provider               String?
+  providerSubscriptionId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  hotel    Hotel     @relation(fields: [hotelId], references: [id])
+  plan     Plan?     @relation(fields: [planId], references: [id])
+  invoices Invoice[]
+
+  // The table previously had NO indexes at all, so every quota check and every
+  // billing read sequentially scanned it.
+  @@index([hotelId, status])
+  @@index([hotelId, createdAt])
+  @@index([status, endDate])
+}
+
+/// Immutable per-period billing record. One per hotel per period — the
+/// `@@unique([hotelId, periodStart])` is the renewal cron's idempotency key, so
+/// a re-run, restart, or concurrent tick can never double-invoice.
+model Invoice {
+  id             String  @id @default(uuid())
+  hotelId        String
+  subscriptionId String?
+
+  /// Human-facing sequential reference, e.g. "INV-2026-000042".
+  number String        @unique
+  status InvoiceStatus @default(OPEN)
+
+  currency     String
+  // Integer minor units. total = subtotal + overageTotal.
+  subtotal     Int
+  overageTotal Int    @default(0)
+  total        Int
+  amountPaid   Int    @default(0)
+
+  periodStart DateTime
+  periodEnd   DateTime
+  issuedAt    DateTime  @default(now())
+  dueAt       DateTime
+  paidAt      DateTime?
+
+  /// [{ kind, description, quantity, unitAmount, amount }] — amounts in minor units.
+  lineItems Json
+  notes     String?
+
+  // Gateway seam — null while billing is manual.
+  provider          String?
+  providerInvoiceId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  hotel        Hotel         @relation(fields: [hotelId], references: [id])
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id])
+  payments     Payment[]
+
+  @@unique([hotelId, periodStart])
+  @@index([hotelId, issuedAt])
+  @@index([status, dueAt])
+}
+
+/// A payment against an invoice. Today every row is recorded by hand by a
+/// superadmin (`method: "manual_bank_transfer" | "cash"`); `providerPaymentId`
+/// is unique so a future gateway webhook is idempotent on retry.
+model Payment {
+  id        String @id @default(uuid())
+  hotelId   String
+  invoiceId String
+
+  status   PaymentStatus @default(SUCCEEDED)
+  currency String
+  amount   Int // minor units
+  method   String        @default("manual_bank_transfer")
+
+  provider          String?
+  providerPaymentId String? @unique
+
+  /// VakettaAdmin.id for a manually recorded payment; null when gateway-driven.
+  recordedByAdminId String?
+  reference         String? // bank/UTR reference for manual reconciliation
+  notes             String?
+
+  receivedAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  hotel   Hotel   @relation(fields: [hotelId], references: [id])
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+
+  @@index([hotelId, receivedAt])
+  @@index([invoiceId])
+}
+
+/// Server-side audit trail. Replaces `lib/adminAudit.ts`, which was a
+/// `console.info` stub — and which the money-touching actions (assign plan,
+/// start trial) never even called, while renaming a hotel did.
+///
+/// Doubles as the dunning idempotency store: a notice row keyed
+/// (hotelId, type, periodEnd) is what stops a restart re-sending an email.
+model AuditLog {
+  id       String @id @default(uuid())
+  category String // "billing" | "hotel" | "admin"
+  type     String // "plan.assigned" | "subscription.expired" | "invoice.issued" | …
+
+  actorType String  @default("ADMIN") // "ADMIN" | "SYSTEM"
+  actorId   String?
+  hotelId   String?
+
+  data Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([hotelId, createdAt])
+  @@index([category, type, createdAt])
+  @@index([createdAt])
 }
 
 model UsageRecord {
@@ -65,20 +235,20 @@ model UsageRecord {
 }
 
 model Hotel {
-  id                 String    @id @default(uuid())
+  id                 String             @id @default(uuid())
   name               String
-  phone              String    @unique // THIS is the tenant key / WhatsApp number
-  apiKey             String?   @unique
+  phone              String             @unique // THIS is the tenant key / WhatsApp number
+  apiKey             String?            @unique
   // profile fields
   location           String?
   email              String?
   description        String?
-  checkInTime        String    @default("14:00")
-  checkOutTime       String    @default("11:00")
+  checkInTime        String             @default("14:00")
+  checkOutTime       String             @default("11:00")
   website            String?
   // billing
   planId             String?
-  subscriptionStatus String    @default("trial") // "active" | "trial" | "expired"
+  subscriptionStatus SubscriptionStatus @default(TRIALING)
   billingStartDate   DateTime?
   billingEndDate     DateTime?
 
@@ -97,6 +267,8 @@ model Hotel {
   users                User[]
   conversationSessions ConversationSession[]
   subscriptions        Subscription[]
+  invoices             Invoice[]
+  payments             Payment[]
   usageRecords         UsageRecord[]
   flowDefinitions      FlowDefinition[]
   inventory            RoomInventory[]
@@ -110,11 +282,23 @@ model Hotel {
   pausedFlows              PausedFlow[]
   confirmationSequences    ConfirmationSequence[]
   templateVariableMappings TemplateVariableMapping[]
+
+  // The expiry/renewal cron sweeps on exactly this pair every 30 min.
+  @@index([subscriptionStatus, billingEndDate])
 }
 
 model HotelConfig {
   id      String @id @default(uuid())
   hotelId String @unique
+
+  // Locale. The admin hotel-detail page has always PATCHed these three as
+  // `config: { country, currency, dateFormat }`, but the columns did not exist
+  // and `updateHotelHandler` destructured only { name, phone } — so the whole
+  // payload was silently dropped. `country` is also what scopes which Plans a
+  // hotel is offered (see Plan.country).
+  country    String @default("")
+  currency   String @default("INR")
+  dateFormat String @default("DD/MM/YYYY")
 
   autoReplyEnabled    Boolean @default(true)
   bookingEnabled      Boolean @default(true)
@@ -562,12 +746,23 @@ model PlatformSettings {
   // Superadmin-editable. HARD_MAX_STAY_NIGHTS (stayDuration.ts) is the in-code
   // fallback used only if this singleton row is missing.
   maxStayNightsCeiling   Int      @default(3650)
+  // The ONE timezone every billing period boundary and UsageRecord month key is
+  // derived from. Previously each site built "YYYY-MM" from server-local time,
+  // so usage re-bucketed if the container TZ changed and two call sites could
+  // disagree. Superadmin-editable; ToS already states prices are in INR.
+  billingTimezone        String   @default("Asia/Kolkata")
+  // Days after an invoice's due date before a PAST_DUE hotel is suspended.
+  gracePeriodDays        Int      @default(7)
   updatedAt              DateTime @updatedAt
 }
 
 // Platform-wide trial defaults (singleton — only one row ever exists)
 model TrialConfig {
   id                String   @id @default("global") // always "global"
+  // Trials are free, so this is cosmetic — but startTrial used to hardcode
+  // "USD" onto the snapshot, so a ₹-priced product rendered in dollars on the
+  // hotel's Subscription page for the whole trial.
+  currency          String   @default("INR")
   durationDays      Int      @default(14)
   conversationLimit Int      @default(500) // 0 = unlimited
   aiReplyLimit      Int      @default(200) // 0 = unlimited

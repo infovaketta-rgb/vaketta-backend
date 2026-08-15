@@ -32,6 +32,9 @@ export async function listHotelsService(page = 1, limit = 20, search?: string) {
       where,
       include: {
         config: true,
+        // The admin hotels list shows plan + subscription status per row, so a
+        // superadmin can see who is paying without opening each hotel.
+        plan: { select: { id: true, name: true, currency: true, priceMonthly: true } },
         _count: { select: { users: true, guests: true, bookings: true } },
       },
       orderBy: { createdAt: "desc" },
@@ -60,10 +63,32 @@ export async function getHotelService(id: string) {
 
 export async function updateHotelService(
   id: string,
-  data: { name?: string; phone?: string }
+  data: { name?: string; phone?: string },
+  /**
+   * Locale settings. The admin UI has always sent these as `config: {...}`, but
+   * the handler dropped them and the columns did not exist — so the locale
+   * editor appeared to save and changed nothing.
+   */
+  config?: { country?: string; currency?: string; dateFormat?: string }
 ) {
   const hotel = await prisma.hotel.findUnique({ where: { id } });
   if (!hotel) throw new Error("Hotel not found");
+
+  const cfg = config
+    ? Object.fromEntries(Object.entries(config).filter(([, v]) => v !== undefined && v !== null))
+    : {};
+
+  if (Object.keys(cfg).length > 0) {
+    await prisma.hotelConfig.upsert({
+      where: { hotelId: id },
+      update: cfg,
+      create: { hotelId: id, ...cfg },
+    });
+    // The hotel config cache keys off hotelId and is read on every inbound message.
+    const { invalidateHotelConfigCache } = await import("./settings.service");
+    invalidateHotelConfigCache(id);
+  }
+
   return prisma.hotel.update({ where: { id }, data });
 }
 

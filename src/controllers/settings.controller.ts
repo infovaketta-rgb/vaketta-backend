@@ -288,14 +288,23 @@ export async function patchPlatformSettingsHandler(req: Request, res: Response) 
       metaApiVersion,
       whatsappConfigId,
       instagramEmbedUrl,
+      billingTimezone,
+      gracePeriodDays,
     } = req.body;
     const ceilingValid =
       maxStayNightsCeiling !== undefined && Number.isFinite(Number(maxStayNightsCeiling));
+    const graceValid =
+      gracePeriodDays !== undefined && Number.isFinite(Number(gracePeriodDays));
     const result = await updatePlatformSettings({
       ...(whatsappEmbedSignupUrl !== undefined && { whatsappEmbedSignupUrl: String(whatsappEmbedSignupUrl).trim() }),
       ...(metaApiVersion         !== undefined && { metaApiVersion:         String(metaApiVersion).trim() }),
       ...(whatsappConfigId       !== undefined && { whatsappConfigId:       String(whatsappConfigId).trim() }),
       ...(instagramEmbedUrl      !== undefined && { instagramEmbedUrl:      String(instagramEmbedUrl).trim() }),
+      // The zone every billing period boundary and usage month key derives from.
+      // Validated as a real IANA zone in updatePlatformSettings.
+      ...(billingTimezone        !== undefined && { billingTimezone:        String(billingTimezone).trim() }),
+      // Days past an invoice's due date before a PAST_DUE hotel is suspended.
+      ...(graceValid && { gracePeriodDays: Math.min(90, Math.max(0, Math.round(Number(gracePeriodDays)))) }),
       // Floor at 1, no hard ceiling here — this IS the crash cap. (UI shows a soft
       // warning above 3650.) Existing hotel rows are NOT retroactively re-clamped;
       // a lowered ceiling takes effect on each hotel's next write + at booking time.
@@ -305,7 +314,10 @@ export async function patchPlatformSettingsHandler(req: Request, res: Response) 
     res.json(result);
   } catch (err: any) {
     // Validation errors from updatePlatformSettings are user-facing (400), not 500
-    const status = err.message?.startsWith("Invalid Instagram Embed URL") ? 400 : 500;
+    const status =
+      err.message?.startsWith("Invalid Instagram Embed URL") || err.message?.startsWith("Invalid billing timezone")
+        ? 400
+        : 500;
     res.status(status).json({ error: err.message });
   }
 }

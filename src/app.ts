@@ -10,6 +10,7 @@ import whatsappRoutes from "./routes/whatsapp.routes";
 import messageRoutes from "./routes/message.routes";
 import conversationRoutes from "./routes/conversation.routes";
 import { auth } from "./middleware/auth.middleware";
+import { requireActiveSubscription } from "./middleware/requireActiveSubscription";
 import bookingRoutes from "./routes/booking.routes";
 import roomTypeRoutes from "./routes/roomType.routes";
 import authRoutes from "./routes/auth.routes";
@@ -141,7 +142,7 @@ app.use("/admin/login", loginLimiter);
 app.use("/admin",       hotelRoutes);
 
 // ── Conversations ─────────────────────────────────────────────────────────────
-app.use("/conversations", auth, conversationRoutes);
+app.use("/conversations", auth, requireActiveSubscription, conversationRoutes);
 
 // ── WhatsApp webhook ──────────────────────────────────────────────────────────
 // GET: Meta webhook verification challenge — no body, no signature needed
@@ -161,16 +162,20 @@ app.use(
 );
 
 // ── Protected API routes ──────────────────────────────────────────────────────
-app.use("/messages",       auth, messageRoutes);
-app.use("/bookings",       auth, bookingRoutes);
-app.use("/room-types",     auth, roomTypeRoutes);
-app.use("/dashboard",      auth, dashboardRoutes);
-app.use("/hotel-settings",  auth, settingsRoutes);
-app.use("/hotel-templates", auth, templateRoutes);
-app.use("/saved-replies",  auth, savedReplyRoutes);
-app.use("/confirmation-sequences", auth, confirmationSequenceRoutes);
-app.use("/api/instagram",  auth, instagramConnectRoutes);
-app.use("/guests",         auth, guestRoutes);
+// `requireActiveSubscription` is a SOFT paywall: a lapsed hotel keeps read
+// access (GET/HEAD/OPTIONS) everywhere and always keeps `/hotel-settings/billing/*`
+// so it can see its plan and renew. Writes return 402. Previously `auth` itself
+// 402'd every route, which locked expired customers out of the upgrade screen.
+app.use("/messages",       auth, requireActiveSubscription, messageRoutes);
+app.use("/bookings",       auth, requireActiveSubscription, bookingRoutes);
+app.use("/room-types",     auth, requireActiveSubscription, roomTypeRoutes);
+app.use("/dashboard",      auth, requireActiveSubscription, dashboardRoutes);
+app.use("/hotel-settings",  auth, requireActiveSubscription, settingsRoutes);
+app.use("/hotel-templates", auth, requireActiveSubscription, templateRoutes);
+app.use("/saved-replies",  auth, requireActiveSubscription, savedReplyRoutes);
+app.use("/confirmation-sequences", auth, requireActiveSubscription, confirmationSequenceRoutes);
+app.use("/api/instagram",  auth, requireActiveSubscription, instagramConnectRoutes);
+app.use("/guests",         auth, requireActiveSubscription, guestRoutes);
 
 // ── Push notification endpoints ───────────────────────────────────────────────
 app.use("/push", pushRoutes);
