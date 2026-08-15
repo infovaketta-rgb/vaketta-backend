@@ -14,6 +14,7 @@ export async function updateTrialConfig(data: {
   durationDays?:      number;
   conversationLimit?: number;
   aiReplyLimit?:      number;
+  currency?:          string;
   autoStartOnCreate?: boolean;
   trialMessage?:      string;
 }) {

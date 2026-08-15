@@ -24,7 +24,16 @@ import {
   updatePlanHandler,
   assignPlanHandler,
   startTrialHandler,
+  cancelSubscriptionHandler,
+  extendSubscriptionHandler,
 } from "../controllers/plan.controller";
+import { requireBillingAdmin, requireSuperAdmin } from "../middleware/requireVakettaRole";
+import {
+  listInvoicesHandler,
+  recordPaymentHandler,
+  voidInvoiceHandler,
+  listAuditLogHandler,
+} from "../controllers/adminBilling.controller";
 import { getAnalytics, listHotelsWithBilling } from "../controllers/analytics.controller";
 import { getTrialConfigHandler, updateTrialConfigHandler } from "../controllers/trialConfig.controller";
 import { getPlatformSettingsHandler, patchPlatformSettingsHandler, setHotelMaxStayHandler } from "../controllers/settings.controller";
@@ -69,17 +78,32 @@ router.post("/admins",       vakettaAdminAuth, createAdminHandler);
 router.delete("/admins/:id", vakettaAdminAuth, deleteAdminHandler);
 router.patch("/settings",    vakettaAdminAuth, updateSettingsHandler);
 
+// ── Billing ───────────────────────────────────────────────────────────────────
+// Reads are open to any authenticated Vaketta admin (SUPPORT included — they
+// need to answer "what plan is this hotel on?"). WRITES require a billing role:
+// `vakettaAdminAuth` never checked VakettaAdminRole, so a SUPPORT admin could
+// rewrite prices and grant free trials.
+
 // Plan management
 router.get("/plans",             vakettaAdminAuth, listPlans);
-router.post("/plans",            vakettaAdminAuth, createPlanHandler);
-router.patch("/plans/:id",       vakettaAdminAuth, updatePlanHandler);
+router.post("/plans",            vakettaAdminAuth, requireBillingAdmin, createPlanHandler);
+router.patch("/plans/:id",       vakettaAdminAuth, requireBillingAdmin, updatePlanHandler);
 
-// Assign plan to hotel
-router.patch("/hotels/:id/plan",  vakettaAdminAuth, assignPlanHandler);
-// Start trial for hotel
-router.post("/hotels/:id/trial",  vakettaAdminAuth, startTrialHandler);
+// Subscription lifecycle for a hotel
+router.patch("/hotels/:id/plan",   vakettaAdminAuth, requireBillingAdmin, assignPlanHandler);
+router.post("/hotels/:id/trial",   vakettaAdminAuth, requireBillingAdmin, startTrialHandler);
+router.post("/hotels/:id/cancel",  vakettaAdminAuth, requireBillingAdmin, cancelSubscriptionHandler);
+router.post("/hotels/:id/extend",  vakettaAdminAuth, requireBillingAdmin, extendSubscriptionHandler);
 // Superadmin sets a hotel's max-stay override (clamped to platform ceiling)
-router.patch("/hotels/:hotelId/max-stay", vakettaAdminAuth, setHotelMaxStayHandler);
+router.patch("/hotels/:hotelId/max-stay", vakettaAdminAuth, requireBillingAdmin, setHotelMaxStayHandler);
+
+// Invoices & payments
+router.get("/invoices",                 vakettaAdminAuth, listInvoicesHandler);
+router.post("/invoices/:id/payments",   vakettaAdminAuth, requireBillingAdmin, recordPaymentHandler);
+router.post("/invoices/:id/void",       vakettaAdminAuth, requireBillingAdmin, voidInvoiceHandler);
+
+// Audit trail
+router.get("/audit-log",         vakettaAdminAuth, listAuditLogHandler);
 
 // Analytics / MRR dashboard
 router.get("/analytics",         vakettaAdminAuth, getAnalytics);
@@ -87,11 +111,11 @@ router.get("/hotels-billing",    vakettaAdminAuth, listHotelsWithBilling);
 
 // Trial plan configuration (global defaults)
 router.get("/trial-config",      vakettaAdminAuth, getTrialConfigHandler);
-router.patch("/trial-config",    vakettaAdminAuth, updateTrialConfigHandler);
+router.patch("/trial-config",    vakettaAdminAuth, requireBillingAdmin, updateTrialConfigHandler);
 
-// Platform-wide settings (Instagram embed URL, etc.)
+// Platform-wide settings (Instagram embed URL, billing timezone, grace period…)
 router.get("/platform-settings",   vakettaAdminAuth, getPlatformSettingsHandler);
-router.patch("/platform-settings", vakettaAdminAuth, patchPlatformSettingsHandler);
+router.patch("/platform-settings", vakettaAdminAuth, requireSuperAdmin, patchPlatformSettingsHandler);
 
 // Hotel user management
 router.post("/hotels/:id/users",           vakettaAdminAuth, createHotelUserHandler);

@@ -113,8 +113,18 @@ export async function updateHotelHandler(req: Request, res: Response) {
   try {
     const { id } = req.params;
     if (!id) return res.status(400).json({ error: "id required" });
-    const { name, phone } = req.body;
-    const hotel = await updateHotelService(id, { name, phone });
+    const { name, phone, config } = req.body;
+    const hotel = await updateHotelService(
+      id,
+      { name, phone },
+      config && typeof config === "object"
+        ? {
+            ...(config.country    !== undefined && { country:    String(config.country).trim().toUpperCase() }),
+            ...(config.currency   !== undefined && { currency:   String(config.currency).trim().toUpperCase() }),
+            ...(config.dateFormat !== undefined && { dateFormat: String(config.dateFormat).trim() }),
+          }
+        : undefined,
+    );
     res.json(hotel);
     const { emitToAdmin } = await import("../realtime/emit");
     emitToAdmin("admin:hotel_updated", { hotel });

@@ -111,6 +111,7 @@ export async function listPublicPlans(_req: Request, res: Response) {
         id:                      true,
         name:                    true,
         currency:                true,
+        country:                 true,
         priceMonthly:            true,
         conversationLimit:       true,
         aiReplyLimit:            true,

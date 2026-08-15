@@ -1,7 +1,44 @@
 import { Request, Response, NextFunction } from "express";
+import { SubscriptionStatus } from "@prisma/client";
 import { verifyToken } from "../utils/jwt";
 import { isTokenBlocked } from "../utils/tokenBlocklist";
+import { getSubscriptionStatus } from "../services/billing.service";
 import prisma from "../db/connect";
+
+/**
+ * Hotel staff auth.
+ *
+ * WHAT CHANGED: this used to return **402 for every authenticated route** when a
+ * hotel's subscription had lapsed — including `/hotel-settings/billing/*`. The
+ * paywall locked customers out of the paywall screen: an expired hotel could not
+ * view its plan, its usage, or the plans available to upgrade to, and the
+ * dashboard fell back to a static "email support" page. It also contradicted the
+ * product's own Help copy, which promises staff keep read access.
+ *
+ * Now `auth` only authenticates. It records the subscription status on the
+ * request and lets `requireActiveSubscription` (mounted on mutating routes only)
+ * make the entitlement decision. See requireActiveSubscription.ts.
+ *
+ * Also: the subscription status now comes from a Redis read-through cache rather
+ * than a Postgres join **on every single authenticated request**.
+ */
+
+export type RequestSubscription = {
+  status: SubscriptionStatus;
+  /** Lapsed — writes are blocked and the bot is off. */
+  suspended: boolean;
+  /** In the dunning grace window; still fully served. */
+  pastDue: boolean;
+};
+
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      subscription?: RequestSubscription;
+    }
+  }
+}
 
 export async function auth(req: Request, res: Response, next: NextFunction) {
   const header = req.headers.authorization;
@@ -17,23 +54,23 @@ export async function auth(req: Request, res: Response, next: NextFunction) {
     const blocked = await isTokenBlocked(decoded.jti, decoded.id, decoded.iat);
     if (blocked) return res.status(401).json({ error: "Token has been revoked" });
 
-    // Check user is still active and hotel subscription has not expired
     const user = await prisma.user.findUnique({
-      where:  { id: decoded.id },
-      select: {
-        isActive: true,
-        hotelId:  true,
-        hotel:    { select: { subscriptionStatus: true } },
-      },
+      where: { id: decoded.id },
+      select: { isActive: true, hotelId: true },
     });
     if (!user || !user.isActive) {
       return res.status(401).json({ error: "Account is inactive" });
     }
-    if (user.hotel.subscriptionStatus === "expired") {
-      return res.status(402).json({ error: "Subscription has expired" });
-    }
+
+    const status = (await getSubscriptionStatus(user.hotelId)) ?? SubscriptionStatus.EXPIRED;
 
     (req as any).user = decoded;
+    req.subscription = {
+      status,
+      suspended: status === SubscriptionStatus.EXPIRED || status === SubscriptionStatus.CANCELED,
+      pastDue: status === SubscriptionStatus.PAST_DUE,
+    };
+
     next();
   } catch {
     res.sendStatus(401);

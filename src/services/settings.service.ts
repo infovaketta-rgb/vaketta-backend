@@ -556,17 +556,37 @@ export async function updatePlatformSettings(data: {
   whatsappConfigId?:       string;
   maxStayNightsCeiling?:   number;
   instagramEmbedUrl?:      string;
+  billingTimezone?:        string;
+  gracePeriodDays?:        number;
 }) {
   // Validate instagramEmbedUrl if provided and non-empty
   if (data.instagramEmbedUrl !== undefined && data.instagramEmbedUrl !== "") {
     const err = validateInstagramEmbedUrl(data.instagramEmbedUrl);
     if (err) throw new Error(`Invalid Instagram Embed URL: ${err}`);
   }
-  return prisma.platformSettings.upsert({
+
+  // A bad IANA zone would silently re-bucket every hotel's usage into a
+  // different month, so reject it here rather than letting period.ts fall back.
+  if (data.billingTimezone !== undefined) {
+    try {
+      new Intl.DateTimeFormat("en-CA", { timeZone: data.billingTimezone }).format(new Date());
+    } catch {
+      throw new Error(`Invalid billing timezone: ${data.billingTimezone}`);
+    }
+  }
+
+  const row = (await prisma.platformSettings.upsert({
     where:  { id: "global" },
     update: data,
     create: { id: "global", ...data },
-  }) as unknown as PlatformRow & { updatedAt: Date };
+  })) as unknown as PlatformRow & { updatedAt: Date };
+
+  if (data.billingTimezone !== undefined || data.gracePeriodDays !== undefined) {
+    const { invalidateBillingConfigCache } = await import("./billing.service");
+    invalidateBillingConfigCache();
+  }
+
+  return row;
 }
 
 // ── Platform max-stay ceiling (cached, read on every booking) ────────────────

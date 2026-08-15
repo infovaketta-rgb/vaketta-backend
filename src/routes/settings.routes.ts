@@ -3,6 +3,7 @@ import {
   getSubscription,
   getUsage,
   getAvailablePlans,
+  getInvoices,
 } from "../controllers/hotelBilling.controller";
 import {
   getSettings,
@@ -62,6 +63,7 @@ router.patch("/instagram",                     patchInstagramHandler);
 router.get("/billing/subscription", getSubscription);
 router.get("/billing/usage",        getUsage);
 router.get("/billing/plans",        getAvailablePlans);
+router.get("/billing/invoices",     getInvoices);
 
 router.get("/menu",                 getMenuHandler);
 router.patch("/menu",               updateMenuTitleHandler);
