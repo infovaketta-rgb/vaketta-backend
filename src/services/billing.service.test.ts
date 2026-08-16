@@ -49,7 +49,13 @@ function matchDate(value: Date | null, filter: any): boolean {
 
 const db = {
   $transaction: async (fn: any) => (typeof fn === "function" ? fn(db) : Promise.all(fn)),
+  // `issueInvoice` takes an advisory lock via $executeRaw. This stub existing
+  // only as $queryRaw is how the production P2010 slipped through: the real
+  // call returns `void`, which $queryRaw cannot deserialize, but a mock that
+  // answers `[]` to anything hides that entirely. Both are stubbed now so the
+  // shape of the call is at least pinned to the one the service really makes.
   $queryRaw: async () => [],
+  $executeRaw: async () => 0,
 
   hotel: {
     findUnique: async ({ where }: any) => hotels.get(where.id) ?? null,

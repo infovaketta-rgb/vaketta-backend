@@ -134,7 +134,18 @@ export async function issueInvoice(
     if (existing) return existing;
 
     // Serialise number generation the same way booking references are.
-    await db.$queryRaw`SELECT pg_advisory_xact_lock(hashtext('vaketta:invoice_number'))`;
+    //
+    // MUST be $executeRaw, not $queryRaw. `pg_advisory_xact_lock()` returns
+    // `void`, and $queryRaw tries to deserialize the result set — which fails
+    // with P2010 "Failed to deserialize column of type 'void'", aborting the
+    // transaction before a single invoice row is written. That is why no
+    // invoice had ever been created in production despite plans being assigned:
+    // `assignPlanToHotel` swallowed the error, and `renewDueSubscriptions`
+    // rolled the whole period back. $executeRaw runs the statement for its side
+    // effect and returns a row count instead, which is what every other
+    // advisory-lock call site here already does (booking.service.ts,
+    // booking.controller.ts, flowRuntime.ts ×2). Lock semantics are identical.
+    await db.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('vaketta:invoice_number'))`;
 
     const { lineItems, overageTotal } = buildLineItems(input);
     const subtotal = Math.max(0, Math.round(input.subscriptionAmount));
