@@ -31,9 +31,13 @@ export type AuditActorType = "ADMIN" | "SYSTEM";
 /** Billing event types. Kept as a union so typos surface at compile time. */
 export type BillingEventType =
   | "plan.assigned"
+  /** A paid plan queued to begin at a trial's exclusive end. */
+  | "plan.scheduled"
   | "plan.created"
   | "plan.updated"
   | "trial.started"
+  /** A scheduled plan materialised into a live paid subscription. */
+  | "trial.converted"
   | "subscription.renewed"
   | "subscription.canceled"
   | "subscription.past_due"

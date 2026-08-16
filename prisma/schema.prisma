@@ -101,6 +101,23 @@ model Subscription {
   autoRenew  Boolean   @default(true)
   canceledAt DateTime?
 
+  /// Day-of-month this subscription recurs on (1–31), in PlatformSettings.billingTimezone.
+  ///
+  /// STORED, not re-derived from startDate: a short month clamps the period
+  /// start (31 Jan → 28 Feb) but must NOT clamp the anchor, or an anchor of 31
+  /// would ratchet down to 28 permanently after one February.
+  /// Null on pre-anchor rows → derived from the period boundaries at read time,
+  /// which reproduces the old calendar-aligned behaviour exactly.
+  billingAnchorDay Int?
+
+  /// Plan that takes effect at EXACTLY `endDate` when this is a trial.
+  ///
+  /// This is what makes trial → paid gapless: the paid period's start IS the
+  /// trial's exclusive end, so entitlement is continuous across the boundary
+  /// and no background job has to run for the customer to keep working.
+  /// Soft reference (like `planId`) — no FK, no second Plan relation.
+  scheduledPlanId String?
+
   // Gateway seam — null while billing is manual. A future Razorpay/Stripe
   // subscription is linked here without a schema change.
   provider               String?
@@ -220,17 +237,36 @@ model AuditLog {
   @@index([createdAt])
 }
 
+/// Metered usage for ONE billing period.
+///
+/// Buckets used to be calendar months, keyed by `month` — so a hotel billed
+/// 15 Aug → 14 Sep had its allowance reset on the 1st, halfway through its own
+/// cycle, and the renewal invoice read a month that included usage from before
+/// the period (trial traffic billed as paid overage). The bucket identity is now
+/// `periodStart`, which is exactly the subscription's period boundary.
+///
+/// `month` is RETAINED and still written (derived from periodStart) because
+/// platform-wide analytics genuinely want calendar months. It is no longer
+/// unique: a trial and the paid period it converts into can both start in the
+/// same calendar month (trial 15 Aug → 29 Aug, paid from 29 Aug), which the old
+/// `@@unique([hotelId, month])` would have rejected outright.
 model UsageRecord {
   id                String   @id @default(uuid())
   hotelId           String
-  month             String // "YYYY-MM", e.g. "2026-04"
+  month             String // "YYYY-MM" — calendar label for analytics, NOT the identity
+  /// Billing-period start (inclusive) — the bucket identity.
+  /// Nullable so the migration is additive; backfilled for every existing row.
+  periodStart       DateTime?
+  /// Billing-period end (exclusive).
+  periodEnd         DateTime?
   conversationsUsed Int      @default(0)
   aiRepliesUsed     Int      @default(0)
   updatedAt         DateTime @updatedAt
 
   hotel Hotel @relation(fields: [hotelId], references: [id])
 
-  @@unique([hotelId, month])
+  @@unique([hotelId, periodStart])
+  @@index([hotelId, month])
   @@index([month])
 }
 

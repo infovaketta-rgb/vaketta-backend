@@ -130,7 +130,15 @@ export async function sendRenewalReminders(now: Date = new Date()): Promise<numb
       status: { in: [SubscriptionStatus.TRIALING, SubscriptionStatus.ACTIVE] },
       endDate: { gt: now, lte: horizon },
     },
-    select: { hotelId: true, status: true, endDate: true, planName: true, startDate: true, autoRenew: true },
+    select: {
+      hotelId: true,
+      status: true,
+      endDate: true,
+      planName: true,
+      startDate: true,
+      autoRenew: true,
+      scheduledPlanId: true,
+    },
   });
 
   let sent = 0;
@@ -140,23 +148,35 @@ export async function sendRenewalReminders(now: Date = new Date()): Promise<numb
     if (!REMINDER_DAYS.includes(days)) continue;
 
     const isTrial = sub.status === SubscriptionStatus.TRIALING;
+    // A trial with a plan already queued for its boundary is not at risk, so it
+    // gets a handover notice rather than "choose a plan before your bot stops"
+    // — telling a customer to do something they have already done reads as a
+    // system that does not know its own state.
+    const isScheduledTrial = isTrial && !!sub.scheduledPlanId;
     const when = days === 1 ? "tomorrow" : `in ${days} days`;
 
-    const subject = isTrial
-      ? `Your ${APP_NAME} trial ends ${when}`
-      : `Your ${APP_NAME} subscription renews ${when}`;
+    const subject = isScheduledTrial
+      ? `Your ${APP_NAME} plan starts ${when}`
+      : isTrial
+        ? `Your ${APP_NAME} trial ends ${when}`
+        : `Your ${APP_NAME} subscription renews ${when}`;
 
     const html = shell(
       subject,
-      isTrial
-        ? para(`Your free trial ends <strong>${when}</strong>. To keep your WhatsApp and Instagram automation running, choose a plan before then.`) +
-            para(`If your trial ends without a plan, your bot stops replying to guests. Your conversations and bookings stay available to your team.`)
-        : para(`Your <strong>${sub.planName}</strong> plan renews <strong>${when}</strong>. No action is needed — we'll email your invoice once the new period starts.`),
+      isScheduledTrial
+        ? para(`Your free trial ends <strong>${when}</strong>, and your paid plan starts at that exact moment — there is no gap and nothing to do.`) +
+            para(`We'll email your first invoice once the new billing period begins.`)
+        : isTrial
+          ? para(`Your free trial ends <strong>${when}</strong>. To keep your WhatsApp and Instagram automation running, choose a plan before then.`) +
+              para(`If your trial ends without a plan, your bot stops replying to guests. Your conversations and bookings stay available to your team.`)
+          : para(`Your <strong>${sub.planName}</strong> plan renews <strong>${when}</strong>. No action is needed — we'll email your invoice once the new period starts.`),
     );
 
-    const text = isTrial
-      ? `Your ${APP_NAME} trial ends ${when}. Choose a plan to keep your automation running.`
-      : `Your ${APP_NAME} ${sub.planName} plan renews ${when}. No action needed.`;
+    const text = isScheduledTrial
+      ? `Your ${APP_NAME} trial ends ${when} and your paid plan starts immediately after. No action needed.`
+      : isTrial
+        ? `Your ${APP_NAME} trial ends ${when}. Choose a plan to keep your automation running.`
+        : `Your ${APP_NAME} ${sub.planName} plan renews ${when}. No action needed.`;
 
     // Scoped to this period, so the same hotel can be reminded again next cycle.
     if (await notifyOnce("notice.renewal_upcoming", sub.hotelId, sub.startDate, subject, html, text)) {

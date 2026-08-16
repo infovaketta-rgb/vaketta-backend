@@ -27,18 +27,41 @@
  * 5. **MRR reads the snapshot, per currency.** It summed `plan.priceMonthly`
  *    across mixed-currency plans into one number the UI rendered with a hardcoded
  *    "$", and editing a plan's price silently rewrote current MRR.
+ *
+ * 6. **Periods are ANCHORED, and entitlement is derived from the clock.**
+ *    Periods used to be whole calendar months after the first, so a
+ *    subscription starting on the 15th was shown as "15 Aug → 01 Sep" and then
+ *    billed 1st-to-1st forever. They now recur on the subscription's own
+ *    billing day (billing/period.ts). Separately, `Hotel.subscriptionStatus`
+ *    is no longer the authority on access: `billing/effectiveStatus.ts` derives
+ *    the live state from `now`, and this service's cron functions only
+ *    MATERIALISE that state (persist the roll, issue invoices, notify).
+ *
+ * 7. **Trials convert instead of expiring.** `scheduledPlanId` on a trial row
+ *    makes the paid period begin at exactly the trial's exclusive end, so there
+ *    is no instant at which the customer is neither trialing nor paid.
  */
 import { Prisma, SubscriptionStatus, InvoiceStatus } from "@prisma/client";
 import prisma from "../db/connect";
 import { redis } from "../queue/redis";
 import { logger } from "../utils/logger";
 import {
-  computeFirstPeriod,
-  computeNextPeriod,
-  proratePeriod,
+  anchorDayOf,
+  addDaysInTZ,
+  computeAnchoredPeriod,
+  nextAnchoredPeriod,
+  startOfDayInTZ,
   monthKey,
   DEFAULT_BILLING_TIMEZONE,
+  type Period,
 } from "../billing/period";
+import {
+  resolveEffectiveState,
+  boundedCacheTtlSeconds,
+  paidPeriodAfterTrial,
+  type EffectiveState,
+  type SubscriptionState,
+} from "../billing/effectiveStatus";
 import { issueInvoice } from "./invoice.service";
 import { recordBillingEvent } from "./audit.service";
 
@@ -111,50 +134,240 @@ export function invalidateBillingConfigCache(): void {
   redis.del(BILLING_CONFIG_KEY).catch((err) => log.warn({ err }, "billing config cache DEL failed"));
 }
 
-// ── Subscription status cache (read on EVERY authenticated request) ──────────
+// ── Effective subscription state (read on EVERY authenticated request) ───────
 
-const statusKey = (hotelId: string) => `billing:status:${hotelId}`;
-const STATUS_TTL = 300; // 5 min
+const statusKey = (hotelId: string) => `billing:sub:${hotelId}`;
+const STATUS_TTL = 300; // 5 min ceiling — clamped down near a boundary
 
 /**
- * A hotel's subscription status, cached.
+ * The billed terms a meter is measured against.
  *
- * `auth.middleware` previously hit Postgres on **every single authenticated
- * request** (a user+hotel join) purely to read this one enum. Same read-through
- * shape as `getPlatformMaxStayCeiling`; never throws.
- *
- * Returns null only when the hotel genuinely does not exist.
+ * Carried on the effective state so ENTITLEMENT AND LIMITS COME FROM ONE READ.
+ * They used to come from different places: limits from the live subscription
+ * row, usage from the effective period. In the window between a trial's
+ * boundary and the cron materialising the conversion, that meant the trial's
+ * limits were applied to the fresh paid period's usage.
  */
-export async function getSubscriptionStatus(hotelId: string): Promise<SubscriptionStatus | null> {
-  try {
-    const cached = await redis.get(statusKey(hotelId));
-    if (cached && cached in SubscriptionStatus) return cached as SubscriptionStatus;
-  } catch (err) {
-    log.warn({ err, hotelId }, "subscription status cache GET failed");
-  }
+export type BilledTerms = {
+  planName: string;
+  currency: string;
+  price: number;
+  conversationLimit: number;
+  aiReplyLimit: number;
+  extraConversationCharge: number;
+  extraAiReplyCharge: number;
+};
 
-  let status: SubscriptionStatus | null = null;
-  try {
-    const hotel = await prisma.hotel.findUnique({
-      where: { id: hotelId },
-      select: { subscriptionStatus: true },
-    });
-    status = hotel?.subscriptionStatus ?? null;
-  } catch (err) {
-    // Fail OPEN: a DB blip must not lock every tenant out of the dashboard.
-    log.error({ err, hotelId }, "subscription status DB read failed — treating as ACTIVE");
-    return SubscriptionStatus.ACTIVE;
-  }
+/** What we cache: the subscription's raw fields, never a derived verdict. */
+type CachedSubscription = {
+  status: SubscriptionStatus;
+  startDate: string;
+  endDate: string | null;
+  autoRenew: boolean;
+  billingAnchorDay: number | null;
+  scheduledPlanId: string | null;
+  /** The row's own snapshot terms. Null when there is no subscription row. */
+  terms: BilledTerms | null;
+  /**
+   * Terms of the plan queued at a trial's boundary. Read from the live Plan —
+   * which is exactly what `convertScheduledTrial` will snapshot moments later,
+   * so the pre- and post-materialisation answers agree.
+   */
+  scheduledTerms?: BilledTerms | null;
+};
 
-  if (status) {
-    redis
-      .set(statusKey(hotelId), status, "EX", STATUS_TTL)
-      .catch((err) => log.warn({ err, hotelId }, "subscription status cache SET failed"));
-  }
-  return status;
+export type EffectiveSubscription = EffectiveState & {
+  hotelId: string;
+  /**
+   * The terms in force at `now`. After a trial converts these are the SCHEDULED
+   * plan's, not the trial's. Null for a hotel with no subscription row — the
+   * legacy "free forever" state, which is metered as unlimited.
+   */
+  terms: BilledTerms | null;
+};
+
+const termsOf = (row: {
+  planName: string;
+  currency: string;
+  price: number;
+  conversationLimit: number;
+  aiReplyLimit: number;
+  extraConversationCharge: number;
+  extraAiReplyCharge: number;
+}): BilledTerms => ({
+  planName: row.planName,
+  currency: row.currency,
+  price: row.price,
+  conversationLimit: row.conversationLimit,
+  aiReplyLimit: row.aiReplyLimit,
+  extraConversationCharge: row.extraConversationCharge,
+  extraAiReplyCharge: row.extraAiReplyCharge,
+});
+
+function toState(row: CachedSubscription): SubscriptionState {
+  return {
+    status: row.status,
+    startDate: new Date(row.startDate),
+    endDate: row.endDate ? new Date(row.endDate) : null,
+    autoRenew: row.autoRenew,
+    billingAnchorDay: row.billingAnchorDay,
+    scheduledPlanId: row.scheduledPlanId,
+  };
 }
 
-/** Call after ANY write that changes Hotel.subscriptionStatus. */
+/**
+ * Read the hotel's subscription row (or, failing that, its denormalised status)
+ * in the shape the resolver consumes. Null when the hotel does not exist.
+ */
+async function loadSubscriptionRow(hotelId: string): Promise<CachedSubscription | null> {
+  const sub = await prisma.subscription.findFirst({
+    where: { hotelId, status: { in: LIVE_STATUSES } },
+    orderBy: { createdAt: "desc" },
+    select: {
+      status: true,
+      startDate: true,
+      endDate: true,
+      autoRenew: true,
+      billingAnchorDay: true,
+      scheduledPlanId: true,
+      planName: true,
+      currency: true,
+      price: true,
+      conversationLimit: true,
+      aiReplyLimit: true,
+      extraConversationCharge: true,
+      extraAiReplyCharge: true,
+    },
+  });
+
+  if (sub) {
+    // Only a trialing hotel can have one, so this costs nothing in the common case.
+    let scheduledTerms: BilledTerms | null = null;
+    if (sub.scheduledPlanId) {
+      const plan = await prisma.plan.findUnique({ where: { id: sub.scheduledPlanId } });
+      if (plan) scheduledTerms = termsOf({ ...plan, planName: plan.name, price: plan.priceMonthly });
+    }
+
+    return {
+      status: sub.status,
+      startDate: sub.startDate.toISOString(),
+      endDate: sub.endDate?.toISOString() ?? null,
+      autoRenew: sub.autoRenew,
+      billingAnchorDay: sub.billingAnchorDay ?? null,
+      scheduledPlanId: sub.scheduledPlanId ?? null,
+      terms: termsOf(sub),
+      scheduledTerms,
+    };
+  }
+
+  // No live subscription row: legacy "free forever" tenants, and hotels whose
+  // subscription was closed. Fall back to the hotel's own status with no time
+  // logic — inventing a period for a row that never existed would be worse.
+  const hotel = await prisma.hotel.findUnique({
+    where: { id: hotelId },
+    select: { subscriptionStatus: true, billingStartDate: true, billingEndDate: true },
+  });
+  if (!hotel) return null;
+
+  return {
+    status: hotel.subscriptionStatus,
+    startDate: (hotel.billingStartDate ?? new Date(0)).toISOString(),
+    endDate: null, // treated as open-ended by the resolver
+    autoRenew: false,
+    billingAnchorDay: null,
+    scheduledPlanId: null,
+    // No terms = no meter. Metering a tenant who was never given a subscription
+    // would cut off live customers with no warning.
+    terms: null,
+  };
+}
+
+/**
+ * The hotel's entitlement RIGHT NOW.
+ *
+ * The cached value is the subscription's raw fields; the verdict is recomputed
+ * against a live `now` on every call, so a warm cache can never serve a stale
+ * status across a trial or period boundary. The TTL is additionally clamped to
+ * the next boundary (`boundedCacheTtlSeconds`) as defence in depth.
+ *
+ * Never throws. Returns null only when the hotel genuinely does not exist.
+ */
+export async function getEffectiveSubscription(
+  hotelId: string,
+  now: Date = new Date(),
+): Promise<EffectiveSubscription | null> {
+  const { timezone } = await getBillingConfig();
+
+  let row: CachedSubscription | null = null;
+  let fromCache = false;
+
+  try {
+    const cached = await redis.get(statusKey(hotelId));
+    if (cached) {
+      row = JSON.parse(cached) as CachedSubscription;
+      fromCache = true;
+    }
+  } catch (err) {
+    log.warn({ err, hotelId }, "subscription cache GET failed — falling back to Postgres");
+  }
+
+  if (!row) {
+    try {
+      row = await loadSubscriptionRow(hotelId);
+    } catch (err) {
+      // Fail OPEN: a DB blip must not lock every tenant out of the dashboard.
+      log.error({ err, hotelId }, "subscription DB read failed — treating as ACTIVE");
+      return {
+        hotelId,
+        status: SubscriptionStatus.ACTIVE,
+        suspended: false,
+        pastDue: false,
+        periodStart: now,
+        periodEnd: null,
+        anchorDay: anchorDayOf(now, timezone),
+        needsMaterialization: false,
+        trialConverted: false,
+        nextBoundary: null,
+        reason: "open_ended",
+        // Unmetered rather than metered against limits we could not read.
+        terms: null,
+      };
+    }
+  }
+
+  if (!row) return null;
+
+  const state = resolveEffectiveState(toState(row), now, timezone);
+
+  if (!fromCache) {
+    const ttl = boundedCacheTtlSeconds(state, now, STATUS_TTL);
+    redis
+      .set(statusKey(hotelId), JSON.stringify(row), "EX", ttl)
+      .catch((err) => log.warn({ err, hotelId }, "subscription cache SET failed"));
+  }
+
+  // Once a trial has converted, the SCHEDULED plan's terms are the ones in
+  // force — the trial's limits stopped applying at the boundary, not whenever
+  // the cron next runs. Falls back to the row's own terms if the plan has since
+  // been deleted, which is the conservative direction.
+  const terms = state.trialConverted ? (row.scheduledTerms ?? row.terms) : row.terms;
+
+  return { ...state, hotelId, terms: terms ?? null };
+}
+
+/**
+ * A hotel's effective subscription status.
+ *
+ * Kept as the narrow entry point every existing caller already uses
+ * (auth.middleware, usage.service). It is now COMPUTED, not read from a column
+ * a cron job maintains — see billing/effectiveStatus.ts.
+ */
+export async function getSubscriptionStatus(hotelId: string): Promise<SubscriptionStatus | null> {
+  const effective = await getEffectiveSubscription(hotelId);
+  return effective ? (effective.status as SubscriptionStatus) : null;
+}
+
+/** Call after ANY write that changes a hotel's subscription. */
 export function invalidateSubscriptionStatusCache(hotelId: string): void {
   redis.del(statusKey(hotelId)).catch((err) => log.warn({ err, hotelId }, "status cache DEL failed"));
 }
@@ -206,20 +419,55 @@ async function cancelLiveSubscriptions(tx: Prisma.TransactionClient, hotelId: st
 export type AssignPlanOptions = {
   /** VakettaAdmin.id, for the audit trail. */
   actorId?: string | null;
-  /** Issue the prorated first invoice immediately. Default true. */
+  /** Issue the first invoice immediately. Default true. */
   issueFirstInvoice?: boolean;
+  /**
+   * When the paid period begins.
+   *   "trial_end" — schedule it for the trial's exclusive end (gapless).
+   *   "now"       — start today, ending the trial early.
+   * Omitted = "trial_end" while trialing, "now" otherwise. The default never
+   * shortens a trial the customer was promised.
+   */
+  startAt?: "now" | "trial_end";
 };
 
 /**
  * Put a hotel on a paid plan.
  *
  * The subscription snapshots the plan's terms so a later price edit never
- * retroactively changes what this hotel is billed for the current period, and
- * the first (partial) period is invoiced pro rata.
+ * retroactively changes what this hotel is billed for the current period.
+ *
+ * The period is ANCHORED to the day it starts and runs a whole anchored month,
+ * so there is nothing to prorate — the old model's partial first period (signup
+ * → 1st of next month) is gone, and with it the "15 Aug → 01 Sep" display.
  */
 export async function assignPlanToHotel(hotelId: string, planId: string, opts: AssignPlanOptions = {}) {
   const { timezone } = await getBillingConfig();
   const now = new Date();
+
+  // Default to converting at the trial boundary rather than truncating a trial.
+  if (opts.startAt !== "now") {
+    const current = await getCurrentSubscription(hotelId);
+    const trialing =
+      current?.status === SubscriptionStatus.TRIALING &&
+      current.endDate != null &&
+      current.endDate.getTime() > now.getTime();
+
+    if (trialing) {
+      return schedulePlanAtTrialEnd(hotelId, planId, opts.actorId ?? null);
+    }
+    if (opts.startAt === "trial_end") {
+      // Asked to defer, but there is no live trial to defer to.
+      throw new Error("Hotel is not on a trial");
+    }
+  }
+
+  // Boundaries are clean local midnights, so every downstream day-count
+  // (reminders, proration, display) is stable regardless of what time of day an
+  // admin happened to click the button.
+  const periodStart = startOfDayInTZ(now, timezone);
+  const anchorDay = anchorDayOf(periodStart, timezone);
+  const { periodEnd } = computeAnchoredPeriod(periodStart, anchorDay, timezone);
 
   const result = await prisma.$transaction(async (tx) => {
     const plan = await tx.plan.findUniqueOrThrow({ where: { id: planId } });
@@ -227,8 +475,6 @@ export async function assignPlanToHotel(hotelId: string, planId: string, opts: A
     if (!hotel) throw new Error("Hotel not found");
 
     await cancelLiveSubscriptions(tx, hotelId, now);
-
-    const { periodStart, periodEnd } = computeFirstPeriod(now, timezone);
 
     const subscription = await tx.subscription.create({
       data: {
@@ -244,6 +490,7 @@ export async function assignPlanToHotel(hotelId: string, planId: string, opts: A
         extraAiReplyCharge: plan.extraAiReplyCharge,
         startDate: periodStart,
         endDate: periodEnd,
+        billingAnchorDay: anchorDay,
         autoRenew: true,
       },
     });
@@ -258,30 +505,26 @@ export async function assignPlanToHotel(hotelId: string, planId: string, opts: A
       },
     });
 
-    return { subscription, plan, periodStart, periodEnd };
+    return { subscription, plan };
   });
 
   invalidateSubscriptionStatusCache(hotelId);
 
-  // Prorated first charge — the fix for "signed up on the 28th, billed a full month".
-  const proratedAmount = proratePeriod(result.plan.priceMonthly, {
-    periodStart: result.periodStart,
-    periodEnd: result.periodEnd,
-  }, timezone);
-
-  if (opts.issueFirstInvoice !== false && proratedAmount > 0) {
+  // A full anchored month of service — charged in full. `Invoice`'s
+  // @@unique([hotelId, periodStart]) keeps this idempotent against the renewal
+  // cron, which will find this invoice already present when the period closes.
+  if (opts.issueFirstInvoice !== false && result.plan.priceMonthly > 0) {
     try {
       await issueInvoice({
         hotelId,
         subscriptionId: result.subscription.id,
         currency: result.plan.currency,
-        subscriptionAmount: proratedAmount,
+        subscriptionAmount: result.plan.priceMonthly,
         // No usage has accrued in a period that just began.
         usage: { conversationsUsed: 0, aiRepliesUsed: 0 },
         terms: result.subscription,
-        periodStart: result.periodStart,
-        periodEnd: result.periodEnd,
-        prorated: proratedAmount < result.plan.priceMonthly,
+        periodStart,
+        periodEnd,
       });
     } catch (err) {
       // The subscription is live and correct; a failed invoice is recoverable
@@ -298,9 +541,9 @@ export async function assignPlanToHotel(hotelId: string, planId: string, opts: A
       planName: result.plan.name,
       price: result.plan.priceMonthly,
       currency: result.plan.currency,
-      proratedAmount,
-      periodStart: result.periodStart.toISOString(),
-      periodEnd: result.periodEnd.toISOString(),
+      billingAnchorDay: anchorDay,
+      periodStart: periodStart.toISOString(),
+      periodEnd: periodEnd.toISOString(),
     },
   });
 
@@ -309,7 +552,66 @@ export async function assignPlanToHotel(hotelId: string, planId: string, opts: A
     hotelId,
     planId,
     status: SubscriptionStatus.ACTIVE,
-    billingEndDate: result.periodEnd,
+    billingEndDate: periodEnd,
+  });
+
+  return result.subscription;
+}
+
+/**
+ * Schedule a paid plan to begin at EXACTLY the trial's exclusive end.
+ *
+ * Nothing about the trial changes — same end instant, same limits — so the
+ * customer keeps every day they were promised. At `trialEnd` the resolver
+ * already reports ACTIVE (see billing/effectiveStatus.ts); the cron merely
+ * materialises the paid Subscription row afterwards. That ordering is the whole
+ * point: access does not wait for a background job.
+ */
+export async function schedulePlanAtTrialEnd(hotelId: string, planId: string, actorId?: string | null) {
+  const { timezone } = await getBillingConfig();
+  const now = new Date();
+
+  const result = await prisma.$transaction(async (tx) => {
+    const plan = await tx.plan.findUniqueOrThrow({ where: { id: planId } });
+
+    const trial = await tx.subscription.findFirst({
+      where: { hotelId, status: SubscriptionStatus.TRIALING },
+      orderBy: { createdAt: "desc" },
+    });
+    if (!trial || !trial.endDate) throw new Error("Hotel is not on a trial");
+
+    const subscription = await tx.subscription.update({
+      where: { id: trial.id },
+      data: { scheduledPlanId: planId },
+    });
+
+    return { subscription, plan, trialEnd: trial.endDate };
+  });
+
+  invalidateSubscriptionStatusCache(hotelId);
+
+  const { period, anchorDay } = paidPeriodAfterTrial(result.trialEnd, timezone);
+
+  await recordBillingEvent("plan.scheduled", {
+    hotelId,
+    actorId: actorId ?? null,
+    data: {
+      planId,
+      planName: result.plan.name,
+      price: result.plan.priceMonthly,
+      currency: result.plan.currency,
+      billingAnchorDay: anchorDay,
+      startsAt: period.periodStart.toISOString(),
+      periodEnd: period.periodEnd.toISOString(),
+    },
+  });
+
+  const { emitToAdmin } = await import("../realtime/emit");
+  emitToAdmin("admin:subscription_changed", {
+    hotelId,
+    planId,
+    status: SubscriptionStatus.TRIALING,
+    billingEndDate: result.trialEnd,
   });
 
   return result.subscription;
@@ -332,7 +634,17 @@ export type TrialOverrides = {
  * exactly the "free forever" state this fixes.
  */
 export async function startTrial(hotelId: string, overrides?: TrialOverrides, tx?: Prisma.TransactionClient) {
+  const { timezone } = await getBillingConfig();
   const now = new Date();
+
+  // Clean local-midnight boundaries, both ends. `now + days * 86_400_000` gave
+  // a trial that ended at whatever time of day it started — which made the
+  // reminder-day arithmetic and the paid anchor depend on a button-click
+  // timestamp, and drifted by an hour across a DST transition.
+  //
+  // Half-open: a 14-day trial started on 15 Aug ends at 29 Aug 00:00, i.e.
+  // 15 Aug 00:00 <= t < 29 Aug 00:00 is TRIAL, and 29 Aug 00:00 is already paid.
+  const startDate = startOfDayInTZ(now, timezone);
 
   const run = async (db: Prisma.TransactionClient) => {
     const config = await db.trialConfig.upsert({
@@ -344,7 +656,7 @@ export async function startTrial(hotelId: string, overrides?: TrialOverrides, tx
     const days = overrides?.durationDays ?? config.durationDays;
     const convLim = overrides?.conversationLimit ?? config.conversationLimit;
     const aiLim = overrides?.aiReplyLimit ?? config.aiReplyLimit;
-    const endDate = new Date(now.getTime() + days * 86_400_000);
+    const endDate = addDaysInTZ(startDate, days, timezone);
 
     await cancelLiveSubscriptions(db, hotelId, now);
 
@@ -362,9 +674,11 @@ export async function startTrial(hotelId: string, overrides?: TrialOverrides, tx
         aiReplyLimit: aiLim,
         extraConversationCharge: 0,
         extraAiReplyCharge: 0,
-        startDate: now,
+        startDate,
         endDate,
-        // A trial must never silently roll into a paid period.
+        billingAnchorDay: anchorDayOf(startDate, timezone),
+        // A trial never rolls into a paid period by itself. Conversion is
+        // explicit and opt-in: an admin sets `scheduledPlanId`.
         autoRenew: false,
       },
     });
@@ -374,7 +688,7 @@ export async function startTrial(hotelId: string, overrides?: TrialOverrides, tx
       data: {
         planId: null,
         subscriptionStatus: SubscriptionStatus.TRIALING,
-        billingStartDate: now,
+        billingStartDate: startDate,
         billingEndDate: endDate,
       },
     });
@@ -414,7 +728,7 @@ export async function startTrial(hotelId: string, overrides?: TrialOverrides, tx
 
   return {
     subscriptionStatus: SubscriptionStatus.TRIALING,
-    billingStartDate: now,
+    billingStartDate: startDate,
     billingEndDate: result.endDate,
     conversationLimit: result.convLim,
     aiReplyLimit: result.aiLim,
@@ -473,10 +787,22 @@ export async function cancelSubscription(hotelId: string, immediate = false, act
   return updated;
 }
 
-/** Push a hotel's current period end out by `days` — a goodwill/manual override. */
+/**
+ * Push a hotel's current period end out by `days` — a goodwill/manual override.
+ *
+ * The ANCHOR IS PINNED FIRST. An extension moves only this period's end; the
+ * recurring billing day must not move with it. On a row that predates the anchor
+ * column the anchor would otherwise be re-derived from the *extended* end, which
+ * would permanently re-anchor the customer onto a one-off goodwill date. Pinning
+ * it from the CURRENT end before moving anything keeps the schedule intact, and
+ * `nextAnchorAfter` then realigns with a single short period rather than
+ * overshooting to the following month.
+ */
 export async function extendSubscription(hotelId: string, days: number, actorId?: string | null) {
   const extendBy = Math.round(days);
   if (!Number.isFinite(extendBy) || extendBy === 0) throw new Error("days must be a non-zero whole number");
+
+  const { timezone } = await getBillingConfig();
 
   const updated = await prisma.$transaction(async (tx) => {
     const current = await tx.subscription.findFirst({
@@ -486,10 +812,11 @@ export async function extendSubscription(hotelId: string, days: number, actorId?
 
     const base = current.endDate ?? new Date();
     const newEnd = new Date(base.getTime() + extendBy * 86_400_000);
+    const anchorDay = current.billingAnchorDay ?? anchorDayOf(base, timezone);
 
     const sub = await tx.subscription.update({
       where: { id: current.id },
-      data: { endDate: newEnd },
+      data: { endDate: newEnd, billingAnchorDay: anchorDay },
     });
 
     await tx.hotel.update({
@@ -515,18 +842,166 @@ export async function extendSubscription(hotelId: string, days: number, actorId?
   return updated;
 }
 
-// ── Renewal ──────────────────────────────────────────────────────────────────
+// ── Materialisation (the cron's job — NOT the source of entitlement) ─────────
 
 /**
- * Roll every due subscription into its next period, issuing an invoice for the
- * period just closed.
+ * Ceiling on how many periods one subscription may roll in a single pass.
+ * A subscription 3 years stale is a data problem, not a billing run.
+ */
+const MAX_CATCHUP_PERIODS = 36;
+
+/**
+ * Convert one trial whose scheduled plan has come into force.
  *
- * Idempotent on two levels: the `endDate <= now` filter stops matching once the
- * period rolls, and `Invoice.@@unique([hotelId, periodStart])` means even a
- * concurrent tick converges on one invoice.
+ * The customer has ALREADY been ACTIVE since `trialEnd` — `resolveEffectiveState`
+ * said so the instant the boundary passed. This only writes it down: the paid
+ * subscription starts at exactly `trialEnd`, so the trial period and the paid
+ * period share one boundary and no time is unaccounted for.
+ */
+async function convertScheduledTrial(
+  trial: { id: string; hotelId: string; endDate: Date; scheduledPlanId: string },
+  timezone: string,
+  now: Date,
+): Promise<boolean> {
+  const { period, anchorDay } = paidPeriodAfterTrial(trial.endDate, timezone);
+
+  const result = await prisma.$transaction(async (tx) => {
+    const plan = await tx.plan.findUnique({ where: { id: trial.scheduledPlanId } });
+    if (!plan) throw new Error(`Scheduled plan ${trial.scheduledPlanId} no longer exists`);
+
+    // Re-read under the transaction: another tick may have converted already.
+    const live = await tx.subscription.findFirst({
+      where: { id: trial.id, status: SubscriptionStatus.TRIALING },
+    });
+    if (!live) return null;
+
+    await cancelLiveSubscriptions(tx, trial.hotelId, now);
+
+    const subscription = await tx.subscription.create({
+      data: {
+        hotelId: trial.hotelId,
+        planId: plan.id,
+        status: SubscriptionStatus.ACTIVE,
+        planName: plan.name,
+        currency: plan.currency,
+        price: plan.priceMonthly,
+        conversationLimit: plan.conversationLimit,
+        aiReplyLimit: plan.aiReplyLimit,
+        extraConversationCharge: plan.extraConversationCharge,
+        extraAiReplyCharge: plan.extraAiReplyCharge,
+        startDate: period.periodStart,
+        endDate: period.periodEnd,
+        billingAnchorDay: anchorDay,
+        autoRenew: true,
+      },
+    });
+
+    await tx.hotel.update({
+      where: { id: trial.hotelId },
+      data: {
+        planId: plan.id,
+        subscriptionStatus: SubscriptionStatus.ACTIVE,
+        billingStartDate: period.periodStart,
+        billingEndDate: period.periodEnd,
+      },
+    });
+
+    return { subscription, plan };
+  });
+
+  if (!result) return false;
+
+  invalidateSubscriptionStatusCache(trial.hotelId);
+
+  if (result.plan.priceMonthly > 0) {
+    try {
+      await issueInvoice({
+        hotelId: trial.hotelId,
+        subscriptionId: result.subscription.id,
+        currency: result.plan.currency,
+        subscriptionAmount: result.plan.priceMonthly,
+        // Trial usage lives in the TRIAL period's usage bucket and is never
+        // read here — the first paid invoice only ever sees paid-period usage.
+        usage: { conversationsUsed: 0, aiRepliesUsed: 0 },
+        terms: result.subscription,
+        periodStart: period.periodStart,
+        periodEnd: period.periodEnd,
+      });
+    } catch (err) {
+      log.error({ err, hotelId: trial.hotelId }, "trial conversion invoice failed — subscription is still active");
+    }
+  }
+
+  await recordBillingEvent("trial.converted", {
+    hotelId: trial.hotelId,
+    actorType: "SYSTEM",
+    data: {
+      planId: result.plan.id,
+      planName: result.plan.name,
+      trialEnd: trial.endDate.toISOString(),
+      periodStart: period.periodStart.toISOString(),
+      periodEnd: period.periodEnd.toISOString(),
+      billingAnchorDay: anchorDay,
+    },
+  });
+
+  const { emitToAdmin } = await import("../realtime/emit");
+  emitToAdmin("admin:subscription_changed", {
+    hotelId: trial.hotelId,
+    planId: result.plan.id,
+    status: SubscriptionStatus.ACTIVE,
+    billingEndDate: period.periodEnd,
+  });
+
+  return true;
+}
+
+/** Materialise every trial whose scheduled plan is now in force. */
+export async function convertDueTrials(now: Date = new Date()): Promise<number> {
+  const { timezone } = await getBillingConfig();
+
+  const due = await prisma.subscription.findMany({
+    where: {
+      status: SubscriptionStatus.TRIALING,
+      endDate: { lte: now, not: null },
+      scheduledPlanId: { not: null },
+    },
+    select: { id: true, hotelId: true, endDate: true, scheduledPlanId: true },
+  });
+
+  let converted = 0;
+  for (const trial of due) {
+    try {
+      const ok = await convertScheduledTrial(
+        { id: trial.id, hotelId: trial.hotelId, endDate: trial.endDate!, scheduledPlanId: trial.scheduledPlanId! },
+        timezone,
+        now,
+      );
+      if (ok) converted++;
+    } catch (err) {
+      // The customer is already ACTIVE per the resolver; a failed write is
+      // retried next tick and must not stop the rest of the batch.
+      log.error({ err, hotelId: trial.hotelId, subscriptionId: trial.id }, "trial conversion failed");
+    }
+  }
+
+  return converted;
+}
+
+/**
+ * Roll every due subscription into its next period, issuing an invoice for each
+ * period closed along the way.
  *
- * Trials are excluded — `autoRenew: false` on every trial subscription, so a
- * free trial can never silently become a paid period.
+ * This no longer decides whether the customer has access — `getEffectiveSubscription`
+ * already reported the rolled period from the clock alone. What this adds is the
+ * durable record: the persisted period and the invoice.
+ *
+ * Idempotent on three levels: the `endDate <= now` filter stops matching once
+ * the period rolls, `Invoice.@@unique([hotelId, periodStart])` means even a
+ * concurrent tick converges on one invoice, and each period rolls in its own
+ * transaction so a mid-catch-up failure resumes cleanly on the next tick.
+ *
+ * Trials are excluded (`autoRenew: false`); conversion is `convertDueTrials`.
  */
 export async function renewDueSubscriptions(now: Date = new Date()): Promise<number> {
   const { timezone } = await getBillingConfig();
@@ -549,74 +1024,97 @@ export async function renewDueSubscriptions(now: Date = new Date()): Promise<num
       extraAiReplyCharge: true,
       startDate: true,
       endDate: true,
+      billingAnchorDay: true,
     },
   });
 
   let renewed = 0;
 
   for (const sub of due) {
-    const closingStart = sub.startDate;
-    const closingEnd = sub.endDate!;
-    const next = computeNextPeriod(closingEnd, timezone);
+    // Legacy rows predate the anchor column; their start date IS their anchor,
+    // which reproduces the calendar-aligned schedule they already have.
+    const anchorDay = sub.billingAnchorDay ?? anchorDayOf(sub.endDate ?? sub.startDate, timezone);
+    let closing: Period = { periodStart: sub.startDate, periodEnd: sub.endDate! };
+    let rolled = false;
 
-    try {
-      // Usage for the month the closing period belongs to. Billing periods are
-      // calendar-aligned precisely so this key lines up exactly.
-      const usage = await prisma.usageRecord.findUnique({
-        where: { hotelId_month: { hotelId: sub.hotelId, month: monthKey(closingStart, timezone) } },
-        select: { conversationsUsed: true, aiRepliesUsed: true },
-      });
+    // Catch up period by period so no closed period goes un-invoiced, however
+    // long the cron was down.
+    for (let i = 0; i < MAX_CATCHUP_PERIODS && closing.periodEnd.getTime() <= now.getTime(); i++) {
+      const next = nextAnchoredPeriod(closing, anchorDay, timezone);
+      const closed = closing;
 
-      await prisma.$transaction(async (tx) => {
-        await issueInvoice(
-          {
-            hotelId: sub.hotelId,
+      try {
+        // Usage for the period being closed, keyed by its own start — NOT by a
+        // calendar month, which used to pull in usage from before the period.
+        const usage = await prisma.usageRecord.findUnique({
+          where: { hotelId_periodStart: { hotelId: sub.hotelId, periodStart: closed.periodStart } },
+          select: { conversationsUsed: true, aiRepliesUsed: true },
+        });
+
+        await prisma.$transaction(async (tx) => {
+          await issueInvoice(
+            {
+              hotelId: sub.hotelId,
+              subscriptionId: sub.id,
+              currency: sub.currency,
+              subscriptionAmount: sub.price,
+              usage: usage ?? { conversationsUsed: 0, aiRepliesUsed: 0 },
+              terms: sub,
+              periodStart: closed.periodStart,
+              periodEnd: closed.periodEnd,
+            },
+            tx,
+          );
+
+          await tx.subscription.update({
+            where: { id: sub.id },
+            data: {
+              startDate: next.periodStart,
+              endDate: next.periodEnd,
+              // Backfill the anchor onto legacy rows as they roll.
+              billingAnchorDay: anchorDay,
+            },
+          });
+
+          await tx.hotel.update({
+            where: { id: sub.hotelId },
+            data: { billingStartDate: next.periodStart, billingEndDate: next.periodEnd },
+          });
+        });
+
+        await recordBillingEvent("subscription.renewed", {
+          hotelId: sub.hotelId,
+          actorType: "SYSTEM",
+          data: {
             subscriptionId: sub.id,
-            currency: sub.currency,
-            subscriptionAmount: sub.price,
-            usage: usage ?? { conversationsUsed: 0, aiRepliesUsed: 0 },
-            terms: sub,
-            periodStart: closingStart,
-            periodEnd: closingEnd,
+            closedPeriodStart: closed.periodStart.toISOString(),
+            newPeriodStart: next.periodStart.toISOString(),
+            newPeriodEnd: next.periodEnd.toISOString(),
+            billingAnchorDay: anchorDay,
           },
-          tx,
-        );
-
-        await tx.subscription.update({
-          where: { id: sub.id },
-          data: { startDate: next.periodStart, endDate: next.periodEnd },
         });
 
-        await tx.hotel.update({
-          where: { id: sub.hotelId },
-          data: { billingStartDate: next.periodStart, billingEndDate: next.periodEnd },
-        });
-      });
-
-      invalidateSubscriptionStatusCache(sub.hotelId);
-      renewed++;
-
-      await recordBillingEvent("subscription.renewed", {
-        hotelId: sub.hotelId,
-        actorType: "SYSTEM",
-        data: {
-          subscriptionId: sub.id,
-          closedPeriodStart: closingStart.toISOString(),
-          newPeriodEnd: next.periodEnd.toISOString(),
-        },
-      });
-
-      const { emitToAdmin } = await import("../realtime/emit");
-      emitToAdmin("admin:subscription_changed", {
-        hotelId: sub.hotelId,
-        planId: sub.planId,
-        status: SubscriptionStatus.ACTIVE,
-        billingEndDate: next.periodEnd,
-      });
-    } catch (err) {
-      // One hotel's bad row must not stop the rest of the batch renewing.
-      log.error({ err, hotelId: sub.hotelId, subscriptionId: sub.id }, "renewal failed for hotel");
+        closing = next;
+        rolled = true;
+      } catch (err) {
+        // One hotel's bad row must not stop the rest of the batch renewing.
+        log.error({ err, hotelId: sub.hotelId, subscriptionId: sub.id }, "renewal failed for hotel");
+        break;
+      }
     }
+
+    if (!rolled) continue;
+
+    invalidateSubscriptionStatusCache(sub.hotelId);
+    renewed++;
+
+    const { emitToAdmin } = await import("../realtime/emit");
+    emitToAdmin("admin:subscription_changed", {
+      hotelId: sub.hotelId,
+      planId: sub.planId,
+      status: SubscriptionStatus.ACTIVE,
+      billingEndDate: closing.periodEnd,
+    });
   }
 
   return renewed;
@@ -625,17 +1123,26 @@ export async function renewDueSubscriptions(now: Date = new Date()): Promise<num
 // ── Suspension ───────────────────────────────────────────────────────────────
 
 /**
- * Suspend hotels whose paid period or trial has lapsed.
+ * Suspend hotels whose paid period or trial has genuinely lapsed.
  *
  * Unlike the old `expireOverdueSubscriptions`, this also closes the subscription
  * row (which used to be left dangling as if still live), emits the socket event
  * the admin panel needs, and writes an audit record.
+ *
+ * CRITICALLY, it asks `resolveEffectiveState` — the SAME resolver the API and
+ * the middleware use — whether the hotel is actually expired. A stale
+ * `billingEndDate` is no longer proof of anything: a trial with a scheduled plan
+ * and a paid subscription mid-renewal both have one, and expiring either would
+ * suspend a customer who is entitled to service. One source of truth, no second
+ * opinion in the cron.
  *
  * NULL `billingEndDate` is still deliberately not matched: those are the legacy
  * "free forever" hotels, and suspending live tenants from a cron with no warning
  * is not a decision a background job gets to make. See scripts/billingBackfillReport.ts.
  */
 export async function expireOverdueSubscriptions(now: Date = new Date()): Promise<number> {
+  const { timezone } = await getBillingConfig();
+
   const lapsed = await prisma.hotel.findMany({
     where: {
       subscriptionStatus: { in: [SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING, SubscriptionStatus.PAST_DUE] },
@@ -648,6 +1155,24 @@ export async function expireOverdueSubscriptions(now: Date = new Date()): Promis
 
   for (const hotel of lapsed) {
     try {
+      const sub = await getCurrentSubscription(hotel.id);
+      if (sub) {
+        const state = resolveEffectiveState(
+          {
+            status: sub.status,
+            startDate: sub.startDate,
+            endDate: sub.endDate,
+            autoRenew: sub.autoRenew,
+            billingAnchorDay: sub.billingAnchorDay,
+            scheduledPlanId: sub.scheduledPlanId,
+          },
+          now,
+          timezone,
+        );
+        // Converting or renewing — materialisation will catch up. Not expired.
+        if (state.status !== SubscriptionStatus.EXPIRED) continue;
+      }
+
       await prisma.$transaction(async (tx) => {
         await tx.hotel.update({
           where: { id: hotel.id },

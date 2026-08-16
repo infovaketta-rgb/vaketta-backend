@@ -21,13 +21,25 @@
  *
  * 5. `/billing/plans` no longer leaks `_count.hotels` to tenants, and filters to
  *    plans available in the hotel's country.
+ *
+ * 6. **Status and period come from the RESOLVER, not the stored columns.**
+ *    `Hotel.subscriptionStatus` / `billingEndDate` are maintained by a cron that
+ *    runs every 30 minutes, so between a trial boundary and the next tick this
+ *    endpoint reported a state the customer was no longer in. It now reports
+ *    what `billing/effectiveStatus.ts` says is true at this instant — the same
+ *    answer the middleware enforces.
+ *
+ * 7. **Periods are exposed as half-open `[start, end)`.** `periodEnd` is the
+ *    exclusive boundary; `periodEndInclusive` is the last instant that belongs
+ *    to the period, which is what a UI should format ("15 Aug → 14 Sep").
  */
 import { Request, Response } from "express";
-import { getHotelBilling } from "../services/billing.service";
-import { getCurrentUsage, getUsageHistory } from "../services/usage.service";
-import { getPlans } from "../services/plan.service";
+import { getHotelBilling, getEffectiveSubscription } from "../services/billing.service";
+import { getCurrentUsage, getUsageHistory, resolveUsagePeriod } from "../services/usage.service";
+import { getPlans, getPlanById } from "../services/plan.service";
 import { listHotelInvoices } from "../services/invoice.service";
 import { computeOverage } from "../billing/overage";
+import { inclusiveEnd } from "../billing/period";
 import { getTrialConfig } from "../services/trialConfig.service";
 import { serverError } from "../utils/serverError";
 import prisma from "../db/connect";
@@ -40,11 +52,16 @@ function hotelId(req: Request): string {
 export async function getSubscription(req: Request, res: Response) {
   try {
     const hid = hotelId(req);
-    const { hotel, subscription } = await getHotelBilling(hid);
+    const [{ hotel, subscription }, effective] = await Promise.all([
+      getHotelBilling(hid),
+      getEffectiveSubscription(hid),
+    ]);
+
+    const status = effective?.status ?? hotel.subscriptionStatus;
 
     // Only fetched while trialing — no reason to hit the table otherwise.
     let trialMessage: string | null = null;
-    if (hotel.subscriptionStatus === "TRIALING") {
+    if (status === "TRIALING") {
       try {
         trialMessage = (await getTrialConfig()).trialMessage || null;
       } catch {
@@ -52,10 +69,44 @@ export async function getSubscription(req: Request, res: Response) {
       }
     }
 
+    // The plan queued to take over the instant the trial ends. Surfaced so the
+    // customer can see the handover is arranged rather than fearing a cut-off.
+    let scheduledPlan: { id: string; name: string; currency: string; priceMonthly: number } | null = null;
+    if (subscription?.scheduledPlanId) {
+      try {
+        const plan = await getPlanById(subscription.scheduledPlanId);
+        if (plan) {
+          scheduledPlan = {
+            id: plan.id,
+            name: plan.name,
+            currency: plan.currency,
+            priceMonthly: plan.priceMonthly,
+          };
+        }
+      } catch {
+        scheduledPlan = null; // cosmetic
+      }
+    }
+
+    const periodStart = effective?.periodStart ?? hotel.billingStartDate;
+    const periodEnd = effective?.periodEnd ?? hotel.billingEndDate;
+
     res.json({
-      status: hotel.subscriptionStatus,
-      billingStartDate: hotel.billingStartDate,
-      billingEndDate: hotel.billingEndDate,
+      status,
+      // Kept for back-compat with anything reading the old field names; both
+      // now carry the EFFECTIVE period rather than the last-materialised one.
+      billingStartDate: periodStart,
+      billingEndDate: periodEnd,
+      periodStart,
+      /** Exclusive boundary. */
+      periodEnd,
+      /** Last instant of the period — format this for an inclusive end date. */
+      periodEndInclusive: periodEnd ? inclusiveEnd(periodEnd) : null,
+      billingAnchorDay: effective?.anchorDay ?? null,
+      /** True while the trial has converted but the cron has not yet caught up. */
+      trialConverted: effective?.trialConverted ?? false,
+      trialEndsAt: subscription?.status === "TRIALING" ? subscription.endDate : null,
+      scheduledPlan,
       trialMessage,
       plan: hotel.plan
         ? {
@@ -79,8 +130,10 @@ export async function getSubscription(req: Request, res: Response) {
             aiReplyLimit: subscription.aiReplyLimit,
             extraConversationCharge: subscription.extraConversationCharge,
             extraAiReplyCharge: subscription.extraAiReplyCharge,
-            startDate: subscription.startDate,
-            endDate: subscription.endDate,
+            // The effective period, so a lapsed-but-renewing subscription shows
+            // the cycle the customer is actually in.
+            startDate: periodStart ?? subscription.startDate,
+            endDate: periodEnd ?? subscription.endDate,
             autoRenew: subscription.autoRenew,
           }
         : null,
@@ -97,27 +150,37 @@ export async function getSubscription(req: Request, res: Response) {
 export async function getUsage(req: Request, res: Response) {
   try {
     const hid = hotelId(req);
-    const [current, history, { subscription }] = await Promise.all([
+    const [current, history, effective, period] = await Promise.all([
       getCurrentUsage(hid),
       getUsageHistory(hid, 6),
-      getHotelBilling(hid),
+      getEffectiveSubscription(hid),
+      resolveUsagePeriod(hid),
     ]);
 
-    // Computed server-side from the SNAPSHOT terms, using the same function the
+    // Computed server-side from the terms IN FORCE, using the same function the
     // invoice generator uses — so what a hotel sees mid-cycle is what it is
-    // billed. Previously the browser did this arithmetic.
-    const overage = subscription
-      ? computeOverage(current, subscription)
+    // billed. Previously the browser did this arithmetic; and reading the raw
+    // subscription row here would show trial limits against the paid period's
+    // usage in the window before a conversion is materialised.
+    const terms = effective?.terms ?? null;
+    const overage = terms
+      ? computeOverage(current, terms)
       : { conversationOverage: 0, aiReplyOverage: 0, conversationCharge: 0, aiReplyCharge: 0, total: 0 };
 
     res.json({
       current,
       history,
       overage,
-      currency: subscription?.currency ?? null,
-      limits: subscription
-        ? { conversations: subscription.conversationLimit, aiReplies: subscription.aiReplyLimit }
-        : null,
+      // The usage window, which now tracks the BILLING period rather than the
+      // calendar month — so "resets at the start of each billing cycle" is true.
+      period: {
+        periodStart: period.periodStart,
+        periodEnd: period.periodEnd,
+        periodEndInclusive: inclusiveEnd(period.periodEnd),
+        month: period.month,
+      },
+      currency: terms?.currency ?? null,
+      limits: terms ? { conversations: terms.conversationLimit, aiReplies: terms.aiReplyLimit } : null,
     });
   } catch (err) {
     return serverError(res, err, "Failed to load usage");

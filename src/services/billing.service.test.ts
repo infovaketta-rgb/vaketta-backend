@@ -88,7 +88,9 @@ const db = {
     findFirst: async ({ where, orderBy }: any) => {
       let rows = subscriptions.filter(
         (s) =>
-          (!where.hotelId || s.hotelId === where.hotelId) && matchStatus(s.status, where.status),
+          (!where.id || s.id === where.id) &&
+          (!where.hotelId || s.hotelId === where.hotelId) &&
+          matchStatus(s.status, where.status),
       );
       if (orderBy?.createdAt === "desc") rows = [...rows].reverse();
       return rows[0] ?? null;
@@ -99,6 +101,9 @@ const db = {
           (!where.hotelId || s.hotelId === where.hotelId) &&
           matchStatus(s.status, where.status) &&
           (where.autoRenew === undefined || s.autoRenew === where.autoRenew) &&
+          // `{ not: null }` on scheduledPlanId — the trial-conversion sweep.
+          (where.scheduledPlanId === undefined ||
+            (where.scheduledPlanId?.not === null ? s.scheduledPlanId != null : true)) &&
           matchDate(s.endDate ?? null, where.endDate),
       ),
     update: async ({ where, data }: any) => {
@@ -170,13 +175,20 @@ const db = {
   },
 
   usageRecord: {
+    // Buckets are keyed by the BILLING PERIOD's start, not a calendar month —
+    // this is what stops a paid invoice reading trial-period usage.
     findUnique: async ({ where }: any) => {
-      const { hotelId, month } = where.hotelId_month;
-      return usageRecords.find((u) => u.hotelId === hotelId && u.month === month) ?? null;
+      const { hotelId, periodStart } = where.hotelId_periodStart;
+      return (
+        usageRecords.find(
+          (u) => u.hotelId === hotelId && u.periodStart?.getTime() === periodStart.getTime(),
+        ) ?? null
+      );
     },
   },
 
   plan: {
+    findUnique: async ({ where }: any) => plans.get(where.id) ?? null,
     findUniqueOrThrow: async ({ where }: any) => {
       const p = plans.get(where.id);
       if (!p) throw new Error("Plan not found");
@@ -241,11 +253,15 @@ vi.mock("../utils/logger", () => ({
 
 import {
   assignPlanToHotel,
+  schedulePlanAtTrialEnd,
   startTrial,
+  convertDueTrials,
   renewDueSubscriptions,
   expireOverdueSubscriptions,
   getCurrentSubscription,
+  getEffectiveSubscription,
   cancelSubscription,
+  extendSubscription,
   getAdminBillingAnalytics,
 } from "./billing.service";
 
@@ -284,40 +300,58 @@ beforeEach(() => {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-describe("assignPlanToHotel — the back-dating + proration bug", () => {
-  it("starts the period at signup, not at the start of the month", async () => {
+describe("assignPlanToHotel — anchored periods", () => {
+  it("anchors the period to the day it starts, NOT the calendar month", async () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-06-28T10:00:00Z"));
+    vi.setSystemTime(new Date("2026-08-15T10:00:00Z"));
 
     await assignPlanToHotel("h1", PLAN_INR.id);
 
     const hotel = hotels.get("h1")!;
-    // The old code set this to 2026-06-01, three days BEFORE `now` — which is
-    // why the expiry cron killed late-month signups almost immediately.
-    expect(hotel.billingStartDate.toISOString()).toBe("2026-06-28T10:00:00.000Z");
-    expect(hotel.billingEndDate.toISOString()).toBe("2026-07-01T00:00:00.000Z");
+    // Boundaries are clean local midnights, so nothing downstream depends on
+    // what time of day an admin clicked the button.
+    expect(hotel.billingStartDate.toISOString()).toBe("2026-08-15T00:00:00.000Z");
+    // THE REPORTED BUG: the old model produced 2026-09-01 here.
+    expect(hotel.billingEndDate.toISOString()).toBe("2026-09-15T00:00:00.000Z");
     expect(hotel.billingEndDate.getTime()).toBeGreaterThan(Date.now());
+
+    const sub = await getCurrentSubscription("h1");
+    expect(sub!.billingAnchorDay).toBe(15);
   });
 
-  it("prorates the first invoice instead of charging a full month", async () => {
+  it("charges a FULL month — an anchored first period is not partial", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-28T00:00:00Z"));
 
     await assignPlanToHotel("h1", PLAN_INR.id);
 
     expect(invoices).toHaveLength(1);
-    // 3 of 30 days.
-    expect(invoices[0]!.total).toBe(Math.round((249900 * 3) / 30));
-    expect(invoices[0]!.total).toBeLessThan(PLAN_INR.priceMonthly);
+    // The old model gave 3 of 30 days here, because the period was truncated at
+    // the 1st. It now runs 28 Jun → 28 Jul: a whole month, charged in full.
+    expect(invoices[0]!.total).toBe(PLAN_INR.priceMonthly);
     expect(invoices[0]!.currency).toBe("INR");
+    expect(invoices[0]!.periodStart.toISOString()).toBe("2026-06-28T00:00:00.000Z");
+    expect(invoices[0]!.periodEnd.toISOString()).toBe("2026-07-28T00:00:00.000Z");
   });
 
-  it("charges the full price when the period is a whole month", async () => {
+  it("charges the full price when assigned on the 1st (unchanged behaviour)", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-01T00:00:00Z"));
 
     await assignPlanToHotel("h1", PLAN_INR.id);
     expect(invoices[0]!.subtotal).toBe(PLAN_INR.priceMonthly);
+    expect(hotels.get("h1")!.billingEndDate.toISOString()).toBe("2026-07-01T00:00:00.000Z");
+  });
+
+  it("anchors on the 31st and survives February", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-31T09:00:00Z"));
+
+    await assignPlanToHotel("h1", PLAN_INR.id);
+
+    const sub = await getCurrentSubscription("h1");
+    expect(sub!.billingAnchorDay).toBe(31);
+    expect(sub!.endDate!.toISOString()).toBe("2026-02-28T00:00:00.000Z");
   });
 
   it("snapshots the plan's terms so a later price edit does not change this period", async () => {
@@ -398,46 +432,223 @@ describe("startTrial", () => {
     await startTrial("h1");
     expect(invoices).toHaveLength(0);
   });
+
+  it("uses clean midnight boundaries, whatever time of day it was started", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T17:42:13.918Z"));
+
+    await startTrial("h1", { durationDays: 14 });
+    const sub = await getCurrentSubscription("h1");
+
+    // Half-open: 15 Aug 00:00 <= TRIAL < 29 Aug 00:00.
+    expect(sub!.startDate.toISOString()).toBe("2026-08-15T00:00:00.000Z");
+    expect(sub!.endDate!.toISOString()).toBe("2026-08-29T00:00:00.000Z");
+  });
+});
+
+describe("trial → paid — scheduling and conversion", () => {
+  async function trialingHotel(now = "2026-08-15T00:00:00Z") {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+    await startTrial("h1", { durationDays: 14 }); // ends 2026-08-29T00:00Z
+  }
+
+  it("assigning a plan to a TRIALING hotel schedules it instead of truncating the trial", async () => {
+    await trialingHotel();
+
+    await assignPlanToHotel("h1", PLAN_INR.id);
+
+    const sub = await getCurrentSubscription("h1");
+    expect(sub!.status).toBe("TRIALING");
+    expect(sub!.scheduledPlanId).toBe(PLAN_INR.id);
+    // The trial keeps every day it was promised.
+    expect(sub!.endDate!.toISOString()).toBe("2026-08-29T00:00:00.000Z");
+    // Nothing is billed until the paid period actually starts.
+    expect(invoices).toHaveLength(0);
+    expect(auditLogs.some((a) => a.type === "plan.scheduled")).toBe(true);
+  });
+
+  it("startAt:'now' overrides the default and starts the paid period today", async () => {
+    await trialingHotel();
+
+    await assignPlanToHotel("h1", PLAN_INR.id, { startAt: "now" });
+
+    const sub = await getCurrentSubscription("h1");
+    expect(sub!.status).toBe("ACTIVE");
+    expect(sub!.startDate.toISOString()).toBe("2026-08-15T00:00:00.000Z");
+    expect(sub!.endDate!.toISOString()).toBe("2026-09-15T00:00:00.000Z");
+  });
+
+  it("rejects startAt:'trial_end' when the hotel has no live trial", async () => {
+    await expect(assignPlanToHotel("h1", PLAN_INR.id, { startAt: "trial_end" }))
+      .rejects.toThrow("Hotel is not on a trial");
+  });
+
+  it("converts at the boundary with ZERO gap between trial and paid", async () => {
+    await trialingHotel();
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    const trialEnd = (await getCurrentSubscription("h1"))!.endDate!;
+
+    const converted = await convertDueTrials(new Date("2026-08-29T00:00:00Z"));
+    expect(converted).toBe(1);
+
+    const sub = await getCurrentSubscription("h1");
+    expect(sub!.status).toBe("ACTIVE");
+    expect(sub!.planId).toBe(PLAN_INR.id);
+    // The paid period opens on the trial's exclusive end — one shared instant.
+    expect(sub!.startDate.toISOString()).toBe(trialEnd.toISOString());
+    expect(sub!.endDate!.toISOString()).toBe("2026-09-29T00:00:00.000Z");
+    expect(sub!.billingAnchorDay).toBe(29);
+    expect(sub!.autoRenew).toBe(true);
+  });
+
+  it("invoices the converted period in full, with no trial usage in it", async () => {
+    await trialingHotel();
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    // Heavy trial usage, in the TRIAL period's own bucket.
+    usageRecords.push({
+      hotelId: "h1",
+      month: "2026-08",
+      periodStart: new Date("2026-08-15T00:00:00Z"),
+      periodEnd: new Date("2026-08-29T00:00:00Z"),
+      conversationsUsed: 5000,
+      aiRepliesUsed: 5000,
+    });
+
+    await convertDueTrials(new Date("2026-08-29T00:00:00Z"));
+
+    expect(invoices).toHaveLength(1);
+    expect(invoices[0]!.periodStart.toISOString()).toBe("2026-08-29T00:00:00.000Z");
+    expect(invoices[0]!.subtotal).toBe(PLAN_INR.priceMonthly);
+    // Trial traffic is NEVER billed as paid overage.
+    expect(invoices[0]!.overageTotal).toBe(0);
+    expect(invoices[0]!.total).toBe(PLAN_INR.priceMonthly);
+  });
+
+  it("closes the trial row, leaving exactly one live subscription", async () => {
+    await trialingHotel();
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    await convertDueTrials(new Date("2026-08-29T00:00:00Z"));
+
+    const live = subscriptions.filter((s) => s.hotelId === "h1" && LIVE.includes(s.status));
+    expect(live).toHaveLength(1);
+    expect(live[0]!.status).toBe("ACTIVE");
+    expect(auditLogs.some((a) => a.type === "trial.converted")).toBe(true);
+  });
+
+  it("is idempotent — a second tick converts nothing more", async () => {
+    await trialingHotel();
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    const now = new Date("2026-08-29T00:00:00Z");
+
+    expect(await convertDueTrials(now)).toBe(1);
+    expect(await convertDueTrials(now)).toBe(0);
+    expect(invoices).toHaveLength(1);
+  });
+
+  it("does not convert before the boundary", async () => {
+    await trialingHotel();
+    await assignPlanToHotel("h1", PLAN_INR.id);
+
+    expect(await convertDueTrials(new Date("2026-08-28T23:59:59Z"))).toBe(0);
+    expect((await getCurrentSubscription("h1"))!.status).toBe("TRIALING");
+  });
+
+  it("does not convert a trial with no scheduled plan", async () => {
+    await trialingHotel();
+    expect(await convertDueTrials(new Date("2026-08-29T00:00:00Z"))).toBe(0);
+    expect(invoices).toHaveLength(0);
+  });
+
+  it("renewal then chains the converted subscription on its new anchor", async () => {
+    await trialingHotel();
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    await convertDueTrials(new Date("2026-08-29T00:00:00Z"));
+    invoices.length = 0;
+
+    await renewDueSubscriptions(new Date("2026-09-29T00:10:00Z"));
+
+    const sub = await getCurrentSubscription("h1");
+    // 29 Sep → 28 Oct displayed; 29 Sep → 29 Oct half-open.
+    expect(sub!.startDate.toISOString()).toBe("2026-09-29T00:00:00.000Z");
+    expect(sub!.endDate!.toISOString()).toBe("2026-10-29T00:00:00.000Z");
+  });
 });
 
 describe("renewDueSubscriptions", () => {
+  /** A hotel anchored on the 15th whose first period has just closed. */
   async function setupDueSubscription() {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-06-01T00:00:00Z"));
+    vi.setSystemTime(new Date("2026-06-15T00:00:00Z"));
     await assignPlanToHotel("h1", PLAN_INR.id);
     invoices.length = 0; // ignore the first-period invoice
-    vi.setSystemTime(new Date("2026-07-01T00:30:00Z")); // period has ended
+    vi.setSystemTime(new Date("2026-07-15T00:30:00Z")); // period has ended
   }
 
-  it("issues an invoice for the closed period and rolls to the next", async () => {
+  it("issues an invoice for the closed period and rolls to the next anchored one", async () => {
     await setupDueSubscription();
 
-    const count = await renewDueSubscriptions(new Date("2026-07-01T00:30:00Z"));
+    const count = await renewDueSubscriptions(new Date("2026-07-15T00:30:00Z"));
 
     expect(count).toBe(1);
     expect(invoices).toHaveLength(1);
     expect(invoices[0]!.subtotal).toBe(PLAN_INR.priceMonthly);
+    expect(invoices[0]!.periodStart.toISOString()).toBe("2026-06-15T00:00:00.000Z");
 
     const sub = await getCurrentSubscription("h1");
-    expect(sub!.startDate.toISOString()).toBe("2026-07-01T00:00:00.000Z");
-    expect(sub!.endDate!.toISOString()).toBe("2026-08-01T00:00:00.000Z");
-    expect(hotels.get("h1")!.billingEndDate.toISOString()).toBe("2026-08-01T00:00:00.000Z");
+    expect(sub!.startDate.toISOString()).toBe("2026-07-15T00:00:00.000Z");
+    expect(sub!.endDate!.toISOString()).toBe("2026-08-15T00:00:00.000Z");
+    expect(hotels.get("h1")!.billingEndDate.toISOString()).toBe("2026-08-15T00:00:00.000Z");
   });
 
-  it("bills overage from the closed period's usage", async () => {
+  it("the closed period and the new one share a boundary — no gap, no overlap", async () => {
     await setupDueSubscription();
-    usageRecords.push({ hotelId: "h1", month: "2026-06", conversationsUsed: 2500, aiRepliesUsed: 1200 });
+    await renewDueSubscriptions(new Date("2026-07-15T00:30:00Z"));
 
-    await renewDueSubscriptions(new Date("2026-07-01T00:30:00Z"));
+    const sub = await getCurrentSubscription("h1");
+    expect(invoices[0]!.periodEnd.toISOString()).toBe(sub!.startDate.toISOString());
+  });
+
+  it("bills overage from the closed PERIOD's usage, keyed by periodStart", async () => {
+    await setupDueSubscription();
+    usageRecords.push({
+      hotelId: "h1",
+      month: "2026-06",
+      periodStart: new Date("2026-06-15T00:00:00Z"),
+      periodEnd: new Date("2026-07-15T00:00:00Z"),
+      conversationsUsed: 2500,
+      aiRepliesUsed: 1200,
+    });
+
+    await renewDueSubscriptions(new Date("2026-07-15T00:30:00Z"));
 
     // 500 extra conversations × 50 + 200 extra AI replies × 200
     expect(invoices[0]!.overageTotal).toBe(500 * 50 + 200 * 200);
     expect(invoices[0]!.total).toBe(PLAN_INR.priceMonthly + 500 * 50 + 200 * 200);
   });
 
+  it("ignores usage from a DIFFERENT period that shares the calendar month", async () => {
+    await setupDueSubscription();
+    // A trial bucket that started earlier in the same month. The old
+    // month-keyed lookup would have billed this traffic as paid overage.
+    usageRecords.push({
+      hotelId: "h1",
+      month: "2026-06",
+      periodStart: new Date("2026-06-01T00:00:00Z"),
+      periodEnd: new Date("2026-06-15T00:00:00Z"),
+      conversationsUsed: 9999,
+      aiRepliesUsed: 9999,
+    });
+
+    await renewDueSubscriptions(new Date("2026-07-15T00:30:00Z"));
+
+    expect(invoices[0]!.overageTotal).toBe(0);
+    expect(invoices[0]!.total).toBe(PLAN_INR.priceMonthly);
+  });
+
   it("is idempotent — a second tick does not double-invoice", async () => {
     await setupDueSubscription();
-    const now = new Date("2026-07-01T00:30:00Z");
+    const now = new Date("2026-07-15T00:30:00Z");
 
     await renewDueSubscriptions(now);
     const afterFirst = invoices.length;
@@ -445,6 +656,73 @@ describe("renewDueSubscriptions", () => {
 
     expect(invoices).toHaveLength(afterFirst);
     expect(invoices).toHaveLength(1);
+  });
+
+  it("catches up across several missed periods, invoicing each one exactly once", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-15T00:00:00Z"));
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    invoices.length = 0;
+
+    // The cron was down for three months.
+    await renewDueSubscriptions(new Date("2026-09-20T00:00:00Z"));
+
+    const periods = invoices.map((i) => i.periodStart.toISOString()).sort();
+    expect(periods).toEqual([
+      "2026-06-15T00:00:00.000Z",
+      "2026-07-15T00:00:00.000Z",
+      "2026-08-15T00:00:00.000Z",
+    ]);
+
+    const sub = await getCurrentSubscription("h1");
+    expect(sub!.startDate.toISOString()).toBe("2026-09-15T00:00:00.000Z");
+    expect(sub!.endDate!.toISOString()).toBe("2026-10-15T00:00:00.000Z");
+  });
+
+  it("preserves an anchor of 31 while rolling through February", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-31T00:00:00Z"));
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    invoices.length = 0;
+
+    await renewDueSubscriptions(new Date("2026-04-05T00:00:00Z"));
+
+    const sub = await getCurrentSubscription("h1");
+    expect(sub!.billingAnchorDay).toBe(31);
+    // 31 Jan → 28 Feb → 31 Mar → 30 Apr: the anchor never ratchets down to 28.
+    expect(sub!.startDate.toISOString()).toBe("2026-03-31T00:00:00.000Z");
+    expect(sub!.endDate!.toISOString()).toBe("2026-04-30T00:00:00.000Z");
+  });
+
+  it("renews a legacy row with no stored anchor on its existing schedule", async () => {
+    // Pre-migration shape: calendar-aligned, billingAnchorDay null.
+    subscriptions.push({
+      id: "legacy_1",
+      hotelId: "h1",
+      planId: PLAN_INR.id,
+      status: "ACTIVE",
+      planName: "Starter",
+      currency: "INR",
+      price: PLAN_INR.priceMonthly,
+      conversationLimit: 2000,
+      aiReplyLimit: 1000,
+      extraConversationCharge: 50,
+      extraAiReplyCharge: 200,
+      startDate: new Date("2026-08-01T00:00:00Z"),
+      endDate: new Date("2026-09-01T00:00:00Z"),
+      billingAnchorDay: null,
+      scheduledPlanId: null,
+      autoRenew: true,
+      createdAt: new Date("2026-08-01T00:00:00Z"),
+    });
+
+    await renewDueSubscriptions(new Date("2026-09-02T00:00:00Z"));
+
+    const sub = await getCurrentSubscription("h1");
+    // Renewal date does NOT move: still the 1st.
+    expect(sub!.startDate.toISOString()).toBe("2026-09-01T00:00:00.000Z");
+    expect(sub!.endDate!.toISOString()).toBe("2026-10-01T00:00:00.000Z");
+    expect(sub!.billingAnchorDay).toBe(1);
   });
 
   it("skips trials — autoRenew is false, so a trial never becomes a paid period", async () => {
@@ -516,6 +794,197 @@ describe("expireOverdueSubscriptions", () => {
 
     expect(await expireOverdueSubscriptions(now)).toBe(1);
     expect(await expireOverdueSubscriptions(now)).toBe(0);
+  });
+
+  it("NEVER expires a trial whose scheduled plan has taken over", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T00:00:00Z"));
+    await startTrial("h1", { durationDays: 14 });
+    await assignPlanToHotel("h1", PLAN_INR.id); // schedules at trial end
+
+    // Trial end has passed and the conversion has NOT been materialised yet —
+    // the exact window the old date-only check would have suspended.
+    const count = await expireOverdueSubscriptions(new Date("2026-08-29T00:05:00Z"));
+
+    expect(count).toBe(0);
+    expect(hotels.get("h1")!.subscriptionStatus).toBe("TRIALING");
+    expect((await getCurrentSubscription("h1"))!.status).toBe("TRIALING");
+  });
+
+  it("NEVER expires a paid subscription that is merely due for renewal", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T00:00:00Z"));
+    await assignPlanToHotel("h1", PLAN_INR.id);
+
+    const count = await expireOverdueSubscriptions(new Date("2026-09-16T00:00:00Z"));
+
+    expect(count).toBe(0);
+    expect((await getCurrentSubscription("h1"))!.status).toBe("ACTIVE");
+  });
+
+  it("DOES expire a subscription that was cancelled at period end", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T00:00:00Z"));
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    await cancelSubscription("h1", false); // autoRenew off, serve to period end
+
+    expect(await expireOverdueSubscriptions(new Date("2026-09-15T00:00:01Z"))).toBe(1);
+    expect(hotels.get("h1")!.subscriptionStatus).toBe("EXPIRED");
+  });
+});
+
+describe("getEffectiveSubscription — access without waiting for the cron", () => {
+  it("reports ACTIVE at the trial boundary before anything is materialised", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T00:00:00Z"));
+    await startTrial("h1", { durationDays: 14 });
+    await assignPlanToHotel("h1", PLAN_INR.id);
+
+    const atBoundary = await getEffectiveSubscription("h1", new Date("2026-08-29T00:00:00Z"));
+
+    expect(atBoundary!.status).toBe("ACTIVE");
+    expect(atBoundary!.suspended).toBe(false);
+    expect(atBoundary!.trialConverted).toBe(true);
+    expect(atBoundary!.needsMaterialization).toBe(true);
+    expect(atBoundary!.periodStart.toISOString()).toBe("2026-08-29T00:00:00.000Z");
+    // Nothing has been written yet — the DB still holds the trial.
+    expect((await getCurrentSubscription("h1"))!.status).toBe("TRIALING");
+  });
+
+  it("suspends an unscheduled trial at the boundary instant, not 30 minutes later", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T00:00:00Z"));
+    await startTrial("h1", { durationDays: 14 });
+
+    const before = await getEffectiveSubscription("h1", new Date("2026-08-28T23:59:59.999Z"));
+    const after = await getEffectiveSubscription("h1", new Date("2026-08-29T00:00:00Z"));
+
+    expect(before!.status).toBe("TRIALING");
+    expect(before!.suspended).toBe(false);
+    expect(after!.status).toBe("EXPIRED");
+    expect(after!.suspended).toBe(true);
+  });
+
+  it("reports the rolled period for a paid subscription the cron has not renewed", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T00:00:00Z"));
+    await assignPlanToHotel("h1", PLAN_INR.id);
+
+    const effective = await getEffectiveSubscription("h1", new Date("2026-09-20T00:00:00Z"));
+
+    expect(effective!.status).toBe("ACTIVE");
+    expect(effective!.periodStart.toISOString()).toBe("2026-09-15T00:00:00.000Z");
+    expect(effective!.periodEnd!.toISOString()).toBe("2026-10-15T00:00:00.000Z");
+  });
+
+  it("a warm cache cannot serve a stale verdict across a boundary", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T00:00:00Z"));
+    await startTrial("h1", { durationDays: 14 });
+    await assignPlanToHotel("h1", PLAN_INR.id);
+
+    // Warm the cache while still trialing…
+    expect((await getEffectiveSubscription("h1", new Date("2026-08-20T00:00:00Z")))!.status).toBe("TRIALING");
+    // …then read past the boundary WITHOUT invalidating. The cached value is the
+    // raw row; the verdict is recomputed against the clock every time.
+    expect((await getEffectiveSubscription("h1", new Date("2026-08-29T00:00:00Z")))!.status).toBe("ACTIVE");
+  });
+
+  it("returns null for a hotel that does not exist", async () => {
+    expect(await getEffectiveSubscription("nope")).toBeNull();
+  });
+});
+
+describe("schedulePlanAtTrialEnd", () => {
+  it("refuses when the hotel is not trialing", async () => {
+    await expect(schedulePlanAtTrialEnd("h1", PLAN_INR.id)).rejects.toThrow("Hotel is not on a trial");
+  });
+
+  it("can be re-pointed at a different plan before the boundary", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T00:00:00Z"));
+    await startTrial("h1", { durationDays: 14 });
+
+    await schedulePlanAtTrialEnd("h1", PLAN_INR.id);
+    await schedulePlanAtTrialEnd("h1", PLAN_USD.id);
+
+    expect((await getCurrentSubscription("h1"))!.scheduledPlanId).toBe(PLAN_USD.id);
+
+    await convertDueTrials(new Date("2026-08-29T00:00:00Z"));
+    expect((await getCurrentSubscription("h1"))!.currency).toBe("USD");
+  });
+});
+
+describe("extendSubscription — goodwill without moving the billing day", () => {
+  it("moves only this period's end and pins the anchor", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T00:00:00Z"));
+    await assignPlanToHotel("h1", PLAN_INR.id); // 15 Aug → 15 Sep, anchor 15
+
+    await extendSubscription("h1", 20);
+
+    const sub = await getCurrentSubscription("h1");
+    expect(sub!.endDate!.toISOString()).toBe("2026-10-05T00:00:00.000Z");
+    // The recurring day must NOT follow the extension.
+    expect(sub!.billingAnchorDay).toBe(15);
+  });
+
+  it("does not hand out a free month when the extension lands before the anchor", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T00:00:00Z"));
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    await extendSubscription("h1", 20); // ends 5 Oct, before anchor day 15
+    invoices.length = 0;
+
+    await renewDueSubscriptions(new Date("2026-10-06T00:00:00Z"));
+
+    const sub = await getCurrentSubscription("h1");
+    // Realigns with a 10-day catch-up period, NOT a 41-day one.
+    expect(sub!.startDate.toISOString()).toBe("2026-10-05T00:00:00.000Z");
+    expect(sub!.endDate!.toISOString()).toBe("2026-10-15T00:00:00.000Z");
+  });
+
+  it("returns to exact monthly periods on the original anchor afterwards", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T00:00:00Z"));
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    await extendSubscription("h1", 20);
+
+    await renewDueSubscriptions(new Date("2026-11-20T00:00:00Z"));
+
+    const sub = await getCurrentSubscription("h1");
+    expect(sub!.startDate.toISOString()).toBe("2026-11-15T00:00:00.000Z");
+    expect(sub!.endDate!.toISOString()).toBe("2026-12-15T00:00:00.000Z");
+  });
+
+  it("pins the anchor from the PRE-extension end on a legacy row", async () => {
+    // Null anchor + an extension: deriving the anchor afterwards would read the
+    // goodwill date and re-anchor the customer onto it permanently.
+    subscriptions.push({
+      id: "legacy_x",
+      hotelId: "h1",
+      planId: PLAN_INR.id,
+      status: "ACTIVE",
+      planName: "Starter",
+      currency: "INR",
+      price: PLAN_INR.priceMonthly,
+      conversationLimit: 2000,
+      aiReplyLimit: 1000,
+      extraConversationCharge: 50,
+      extraAiReplyCharge: 200,
+      startDate: new Date("2026-08-01T00:00:00Z"),
+      endDate: new Date("2026-09-01T00:00:00Z"),
+      billingAnchorDay: null,
+      scheduledPlanId: null,
+      autoRenew: true,
+      createdAt: new Date("2026-08-01T00:00:00Z"),
+    });
+
+    await extendSubscription("h1", 7);
+
+    const sub = await getCurrentSubscription("h1");
+    expect(sub!.billingAnchorDay).toBe(1); // NOT 8
+    expect(sub!.endDate!.toISOString()).toBe("2026-09-08T00:00:00.000Z");
   });
 });
 
