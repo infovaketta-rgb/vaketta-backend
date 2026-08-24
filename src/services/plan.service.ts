@@ -10,6 +10,9 @@ export type PlanInput = {
   aiReplyLimit: number;
   extraConversationCharge?: number;
   extraAiReplyCharge?: number;
+  /** Tax rate in basis points (1800 = 18%). 0 = untaxed, the default. */
+  taxRate?: number;
+  taxLabel?: string;
 };
 
 export async function createPlan(data: PlanInput) {

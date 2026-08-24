@@ -59,6 +59,18 @@ model Plan {
   aiReplyLimit            Int // 0 = unlimited
   extraConversationCharge Int      @default(0) // minor units per extra conversation
   extraAiReplyCharge      Int      @default(0) // minor units per extra AI reply
+
+  /// Tax applied on top of the plan price, in BASIS POINTS (1800 = 18% GST).
+  ///
+  /// Basis points, not a Float percentage: `subtotal * 0.18` on integer minor
+  /// units reintroduces exactly the float drift the money columns were converted
+  /// to Int to eliminate. `Math.round(base * rateBp / 10_000)` stays in integers
+  /// the whole way. 0 = no tax, which is what every existing plan gets, so no
+  /// invoice total changes as a result of this column existing.
+  taxRate                 Int      @default(0)
+  /// Human-facing label for the tax line, e.g. "GST 18%". Null = "Tax".
+  taxLabel                String?
+
   isActive                Boolean  @default(true)
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
@@ -93,6 +105,13 @@ model Subscription {
   aiReplyLimit            Int
   extraConversationCharge Int    @default(0) // minor units
   extraAiReplyCharge      Int    @default(0) // minor units
+  /// Tax rate in basis points, snapshotted with the rest of the terms.
+  ///
+  /// Snapshotted for the same reason `price` is: a superadmin raising GST on a
+  /// Plan must not retroactively change what this hotel owes for the period it
+  /// is already inside. Renewal reads THIS, not the live Plan.
+  taxRate                 Int    @default(0)
+  taxLabel                String?
 
   /// Current period start (inclusive).
   startDate  DateTime
@@ -120,8 +139,13 @@ model Subscription {
 
   // Gateway seam — null while billing is manual. A future Razorpay/Stripe
   // subscription is linked here without a schema change.
+  //
+  // `providerSubscriptionId` is UNIQUE so a redelivered gateway webhook cannot
+  // create a second subscription for the same remote object. Postgres treats
+  // NULLs as distinct, so every manually-billed row (all of them today) is
+  // exempt — same exemption `Message.wamid` relies on.
   provider               String?
-  providerSubscriptionId String?
+  providerSubscriptionId String? @unique
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -150,9 +174,21 @@ model Invoice {
   status InvoiceStatus @default(OPEN)
 
   currency     String
-  // Integer minor units. total = subtotal + overageTotal.
+  // Integer minor units. total = subtotal + overageTotal + taxTotal.
   subtotal     Int
   overageTotal Int    @default(0)
+  /// Tax charged on (subtotal + overageTotal), integer minor units.
+  ///
+  /// Defaults to 0, so `total` for every invoice issued before this column
+  /// existed remains exactly `subtotal + overageTotal` — the backfill is a
+  /// no-op by construction and no historical total is rewritten.
+  taxTotal     Int    @default(0)
+  /// The rate actually applied, in basis points, SNAPSHOTTED at issue time.
+  /// Editing Plan.taxRate must never re-tax an invoice that has already been
+  /// sent — same reasoning as the Subscription term snapshot.
+  taxRate      Int    @default(0)
+  /// Label shown on the tax line, snapshotted alongside the rate.
+  taxLabel     String?
   total        Int
   amountPaid   Int    @default(0)
 
@@ -167,8 +203,16 @@ model Invoice {
   notes     String?
 
   // Gateway seam — null while billing is manual.
+  //
+  // Both ids are UNIQUE: a gateway webhook is only idempotent if the remote id
+  // can appear at most once locally. `providerOrderId` is the id a checkout
+  // session is created against, and is what a `payment.captured` event carries
+  // back — without uniqueness, a redelivered event could open a second invoice
+  // for one order. NULLs stay distinct in Postgres, so manual invoices are
+  // unaffected.
   provider          String?
-  providerInvoiceId String?
+  providerInvoiceId String? @unique
+  providerOrderId   String? @unique
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -185,18 +229,35 @@ model Invoice {
 /// A payment against an invoice. Today every row is recorded by hand by a
 /// superadmin (`method: "manual_bank_transfer" | "cash"`); `providerPaymentId`
 /// is unique so a future gateway webhook is idempotent on retry.
+///
+/// STATUS IS A REAL LIFECYCLE, not a formality. It used to be hardcoded to
+/// SUCCEEDED at the single creation site, which made PENDING and FAILED
+/// unreachable enum members and meant "a Payment row exists" was synonymous
+/// with "the money arrived". A gateway payment is PENDING between checkout and
+/// the captured webhook, and an offline payment is PENDING until an admin
+/// verifies it — in both cases a row must exist that does NOT count as paid.
+/// Only SUCCEEDED rows are ever added to `Invoice.amountPaid`.
 model Payment {
   id        String @id @default(uuid())
   hotelId   String
   invoiceId String
 
-  status   PaymentStatus @default(SUCCEEDED)
+  /// Defaults to PENDING — the safe direction. A caller that forgets to set a
+  /// status now under-credits (visible, fixable) instead of silently marking
+  /// money received that never arrived.
+  status   PaymentStatus @default(PENDING)
   currency String
   amount   Int // minor units
   method   String        @default("manual_bank_transfer")
 
   provider          String?
   providerPaymentId String? @unique
+  /// The gateway order/checkout id this payment settles. Unique for the same
+  /// idempotency reason as `providerPaymentId`.
+  providerOrderId   String? @unique
+
+  /// Gateway or admin reason a payment moved to FAILED. Null otherwise.
+  failureReason String?
 
   /// VakettaAdmin.id for a manually recorded payment; null when gateway-driven.
   recordedByAdminId String?
@@ -205,12 +266,17 @@ model Payment {
 
   receivedAt DateTime @default(now())
   createdAt  DateTime @default(now())
+  updatedAt  DateTime @default(now()) @updatedAt
 
   hotel   Hotel   @relation(fields: [hotelId], references: [id])
   invoice Invoice @relation(fields: [invoiceId], references: [id])
 
   @@index([hotelId, receivedAt])
   @@index([invoiceId])
+  // Drives the (future) admin verification queue and any "does this hotel still
+  // owe money" check, both of which filter on status.
+  @@index([hotelId, status])
+  @@index([status, receivedAt])
 }
 
 /// Server-side audit trail. Replaces `lib/adminAudit.ts`, which was a

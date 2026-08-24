@@ -42,9 +42,17 @@ export type BillingEventType =
   | "subscription.canceled"
   | "subscription.past_due"
   | "subscription.expired"
+  /** Service restored after a settled invoice cleared the outstanding balance. */
+  | "subscription.reactivated"
   | "invoice.issued"
   | "invoice.paid"
+  /** A money-destroying admin action that previously left no trail at all. */
+  | "invoice.voided"
   | "payment.recorded"
+  /** PENDING → SUCCEEDED, i.e. money confirmed after the row was created. */
+  | "payment.succeeded"
+  /** PENDING → FAILED, with the gateway/admin reason in `data`. */
+  | "payment.failed"
   | "notice.renewal_upcoming"
   | "notice.past_due"
   | "notice.expired";

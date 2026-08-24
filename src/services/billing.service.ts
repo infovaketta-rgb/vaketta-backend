@@ -488,6 +488,8 @@ export async function assignPlanToHotel(hotelId: string, planId: string, opts: A
         aiReplyLimit: plan.aiReplyLimit,
         extraConversationCharge: plan.extraConversationCharge,
         extraAiReplyCharge: plan.extraAiReplyCharge,
+        taxRate: plan.taxRate,
+        taxLabel: plan.taxLabel,
         startDate: periodStart,
         endDate: periodEnd,
         billingAnchorDay: anchorDay,
@@ -523,6 +525,8 @@ export async function assignPlanToHotel(hotelId: string, planId: string, opts: A
         // No usage has accrued in a period that just began.
         usage: { conversationsUsed: 0, aiRepliesUsed: 0 },
         terms: result.subscription,
+        taxRate: result.plan.taxRate,
+        taxLabel: result.plan.taxLabel,
         periodStart,
         periodEnd,
       });
@@ -842,6 +846,128 @@ export async function extendSubscription(hotelId: string, days: number, actorId?
   return updated;
 }
 
+// ── Reactivation after payment ───────────────────────────────────────────────
+
+export type ReactivateResult =
+  | { reactivated: true; subscriptionId: string }
+  | { reactivated: false; reason: "not_suspended" | "balance_outstanding" | "no_subscription" | "terminal_cancel" | "not_renewable" | "live_subscription_exists" };
+
+/**
+ * Restore a suspended hotel once it has actually paid what it owes.
+ *
+ * THE GAP THIS CLOSES: `recordPayment` settled invoices and stopped there. It
+ * never touched `Subscription.status`, `Hotel.subscriptionStatus`, or the Redis
+ * entitlement cache — and `resolveEffectiveState` treats EXPIRED as terminal by
+ * design. So a hotel suspended by dunning for an unpaid invoice remained
+ * suspended after paying it, and the only route back was `assignPlanToHotel`,
+ * which issues a second full-price invoice and permanently moves the customer's
+ * billing anchor to the day support happened to click the button.
+ *
+ * DELIBERATE LIMITS — this reverses a *dunning suspension*, nothing else:
+ *
+ *  • **CANCELED is never resurrected.** Expiry is something that happened to the
+ *    customer; cancellation is something they or an admin chose. Paying an old
+ *    invoice must not silently re-subscribe anyone. Re-subscribing is
+ *    `assignPlanToHotel`, explicitly.
+ *  • **Only when the balance reaches zero.** Paying one of three overdue
+ *    invoices does not buy service back.
+ *  • **Only when the subscription can actually carry forward** — `autoRenew`, or
+ *    a period end still in the future. Reactivating a non-renewing subscription
+ *    whose period already closed would set ACTIVE while `resolveEffectiveState`
+ *    (the authority) still answers EXPIRED, and the next cron tick would undo it.
+ *    Better to leave it suspended and let an admin re-assign a plan.
+ *
+ * It does NOT recompute periods. A revived `autoRenew` subscription with a past
+ * `endDate` is exactly what `renewDueSubscriptions` already handles: it rolls
+ * period by period and invoices each one closed, and `resolveEffectiveState`
+ * serves the customer from the clock in the meantime. Inventing period maths
+ * here would be a second, competing opinion about the customer's schedule.
+ */
+export async function reactivateAfterPayment(
+  hotelId: string,
+  opts: { invoiceId?: string | null; actorId?: string | null } = {},
+): Promise<ReactivateResult> {
+  const { outstandingBalance } = await import("./invoice.service");
+
+  // Anything still owed means this payment did not clear the account.
+  const owed = await outstandingBalance(hotelId);
+  if (owed > 0) return { reactivated: false, reason: "balance_outstanding" };
+
+  const now = new Date();
+
+  const outcome = await prisma.$transaction(async (tx): Promise<ReactivateResult> => {
+    // A live subscription means the hotel was never suspended (or has already
+    // been restored by a concurrent call). Creating a second live row would
+    // violate `Subscription_one_live_per_hotel` anyway — checking first turns a
+    // constraint violation into a clean no-op.
+    const live = await tx.subscription.findFirst({
+      where: { hotelId, status: { in: LIVE_STATUSES } },
+      select: { id: true },
+    });
+    if (live) return { reactivated: false, reason: "live_subscription_exists" };
+
+    const latest = await tx.subscription.findFirst({
+      where: { hotelId },
+      orderBy: { createdAt: "desc" },
+    });
+    if (!latest) return { reactivated: false, reason: "no_subscription" };
+    if (latest.status === SubscriptionStatus.CANCELED) return { reactivated: false, reason: "terminal_cancel" };
+    if (latest.status !== SubscriptionStatus.EXPIRED) return { reactivated: false, reason: "not_suspended" };
+
+    const periodStillOpen = latest.endDate != null && latest.endDate.getTime() > now.getTime();
+    if (!latest.autoRenew && !periodStillOpen) return { reactivated: false, reason: "not_renewable" };
+
+    await tx.subscription.update({
+      where: { id: latest.id },
+      data: { status: SubscriptionStatus.ACTIVE },
+    });
+
+    await tx.hotel.update({
+      where: { id: hotelId },
+      data: {
+        subscriptionStatus: SubscriptionStatus.ACTIVE,
+        // Period boundaries are NOT rewritten — see the note above. The mirror
+        // stays consistent with the subscription row it mirrors.
+        billingStartDate: latest.startDate,
+        billingEndDate: latest.endDate,
+      },
+    });
+
+    return { reactivated: true, subscriptionId: latest.id };
+  });
+
+  if (!outcome.reactivated) {
+    log.info({ hotelId, reason: outcome.reason }, "payment settled but no reactivation needed");
+    return outcome;
+  }
+
+  // Without this the hotel keeps reading EXPIRED from a warm cache for up to the
+  // full TTL after paying — the exact symptom this whole function exists to fix.
+  invalidateSubscriptionStatusCache(hotelId);
+
+  await recordBillingEvent("subscription.reactivated", {
+    hotelId,
+    actorId: opts.actorId ?? null,
+    actorType: opts.actorId ? "ADMIN" : "SYSTEM",
+    data: {
+      subscriptionId: outcome.subscriptionId,
+      ...(opts.invoiceId ? { invoiceId: opts.invoiceId } : {}),
+      reason: "invoice_settled",
+    },
+  });
+
+  const { emitToAdmin } = await import("../realtime/emit");
+  emitToAdmin("admin:subscription_changed", {
+    hotelId,
+    planId: null,
+    status: SubscriptionStatus.ACTIVE,
+    billingEndDate: null,
+  });
+
+  log.info({ hotelId, subscriptionId: outcome.subscriptionId }, "subscription reactivated after payment");
+  return outcome;
+}
+
 // ── Materialisation (the cron's job — NOT the source of entitlement) ─────────
 
 /**
@@ -889,6 +1015,8 @@ async function convertScheduledTrial(
         aiReplyLimit: plan.aiReplyLimit,
         extraConversationCharge: plan.extraConversationCharge,
         extraAiReplyCharge: plan.extraAiReplyCharge,
+        taxRate: plan.taxRate,
+        taxLabel: plan.taxLabel,
         startDate: period.periodStart,
         endDate: period.periodEnd,
         billingAnchorDay: anchorDay,
@@ -924,6 +1052,8 @@ async function convertScheduledTrial(
         // read here — the first paid invoice only ever sees paid-period usage.
         usage: { conversationsUsed: 0, aiRepliesUsed: 0 },
         terms: result.subscription,
+        taxRate: result.plan.taxRate,
+        taxLabel: result.plan.taxLabel,
         periodStart: period.periodStart,
         periodEnd: period.periodEnd,
       });
@@ -1022,6 +1152,10 @@ export async function renewDueSubscriptions(now: Date = new Date()): Promise<num
       aiReplyLimit: true,
       extraConversationCharge: true,
       extraAiReplyCharge: true,
+      // The SNAPSHOT, not the live Plan — a mid-period tax change must not
+      // reprice a period the customer is already inside.
+      taxRate: true,
+      taxLabel: true,
       startDate: true,
       endDate: true,
       billingAnchorDay: true,
@@ -1060,6 +1194,8 @@ export async function renewDueSubscriptions(now: Date = new Date()): Promise<num
               subscriptionAmount: sub.price,
               usage: usage ?? { conversationsUsed: 0, aiRepliesUsed: 0 },
               terms: sub,
+              taxRate: sub.taxRate,
+              taxLabel: sub.taxLabel,
               periodStart: closed.periodStart,
               periodEnd: closed.periodEnd,
             },

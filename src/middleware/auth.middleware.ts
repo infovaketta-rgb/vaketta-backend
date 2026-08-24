@@ -56,7 +56,12 @@ export async function auth(req: Request, res: Response, next: NextFunction) {
 
     const user = await prisma.user.findUnique({
       where: { id: decoded.id },
-      select: { isActive: true, hotelId: true },
+      // `role` is selected here — from the DATABASE, not the token — so
+      // `requireHotelRole` gates on the CURRENT role. Hotel JWTs live 24 h, so a
+      // token-derived role would keep honouring a demotion for up to a day.
+      // This row was already being loaded to check `isActive`, so the extra
+      // column is free.
+      select: { isActive: true, hotelId: true, role: true },
     });
     if (!user || !user.isActive) {
       return res.status(401).json({ error: "Account is inactive" });
@@ -64,7 +69,9 @@ export async function auth(req: Request, res: Response, next: NextFunction) {
 
     const status = (await getSubscriptionStatus(user.hotelId)) ?? SubscriptionStatus.EXPIRED;
 
-    (req as any).user = decoded;
+    // Spread order matters: the DB role overrides whatever the token carried.
+    // Every existing reader of `req.user` (hotelId, id, jti…) is untouched.
+    (req as any).user = { ...decoded, role: user.role };
     req.subscription = {
       status,
       suspended: status === SubscriptionStatus.EXPIRED || status === SubscriptionStatus.CANCELED,

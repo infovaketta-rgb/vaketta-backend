@@ -20,6 +20,7 @@ import { recordBillingEvent } from "../services/audit.service";
 import { serverError } from "../utils/serverError";
 import {
   collect,
+  parseBasisPoints,
   parseBoolean,
   parseCountry,
   parseCurrency,
@@ -54,11 +55,21 @@ export async function createPlanHandler(req: Request, res: Response) {
     aiReplyLimit: parseLimit(b.aiReplyLimit, "aiReplyLimit"),
     extraConversationCharge: parseMinorAmount(b.extraConversationCharge ?? 0, "extraConversationCharge"),
     extraAiReplyCharge: parseMinorAmount(b.extraAiReplyCharge ?? 0, "extraAiReplyCharge"),
+    // Defaults to 0 so an existing caller that never sends it creates an
+    // untaxed plan — identical behaviour to before the column existed.
+    taxRate: parseBasisPoints(b.taxRate ?? 0, "taxRate"),
   });
   if (!parsed.ok) return res.status(400).json({ error: parsed.error });
 
+  let taxLabel: string | undefined;
+  if (b.taxLabel != null) {
+    const label = parseNonEmptyString(b.taxLabel, "taxLabel", 40);
+    if (!label.ok) return res.status(400).json({ error: label.error });
+    taxLabel = label.value;
+  }
+
   try {
-    const plan = await createPlan(parsed.value);
+    const plan = await createPlan({ ...parsed.value, ...(taxLabel !== undefined ? { taxLabel } : {}) });
     await recordBillingEvent("plan.created", {
       actorId: adminId(req),
       data: { planId: plan.id, name: plan.name, price: plan.priceMonthly, currency: plan.currency },
@@ -86,6 +97,8 @@ export async function updatePlanHandler(req: Request, res: Response) {
     ["aiReplyLimit", () => parseLimit(b.aiReplyLimit, "aiReplyLimit")],
     ["extraConversationCharge", () => parseMinorAmount(b.extraConversationCharge, "extraConversationCharge")],
     ["extraAiReplyCharge", () => parseMinorAmount(b.extraAiReplyCharge, "extraAiReplyCharge")],
+    ["taxRate", () => parseBasisPoints(b.taxRate, "taxRate")],
+    ["taxLabel", () => parseNonEmptyString(b.taxLabel, "taxLabel", 40)],
     ["isActive", () => parseBoolean(b.isActive, "isActive")],
   ] as const;
 

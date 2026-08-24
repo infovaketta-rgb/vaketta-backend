@@ -42,6 +42,7 @@ import {
   getToggleHandler,
   patchToggleHandler,
 } from "../controllers/availability.controller";
+import { requireBillingViewer } from "../middleware/requireHotelRole";
 
 const router = Router();
 
@@ -60,10 +61,16 @@ router.get("/instagram",                       getInstagramHandler);
 router.patch("/instagram",                     patchInstagramHandler);
 
 // Billing / subscription (hotel-side, JWT-protected via auth middleware in app.ts)
-router.get("/billing/subscription", getSubscription);
-router.get("/billing/usage",        getUsage);
-router.get("/billing/plans",        getAvailablePlans);
-router.get("/billing/invoices",     getInvoices);
+//
+// OWNER/ADMIN only. These expose what the hotel pays, owes and has been
+// invoiced; MANAGER and STAFF have no need for the commercial relationship and
+// previously could read all of it. `hotelId` still comes from the JWT in every
+// handler, so this narrows access within a hotel and cannot widen it across
+// hotels. Mounted BEFORE the handlers so no billing route can escape the gate.
+router.get("/billing/subscription", requireBillingViewer, getSubscription);
+router.get("/billing/usage",        requireBillingViewer, getUsage);
+router.get("/billing/plans",        requireBillingViewer, getAvailablePlans);
+router.get("/billing/invoices",     requireBillingViewer, getInvoices);
 
 router.get("/menu",                 getMenuHandler);
 router.patch("/menu",               updateMenuTitleHandler);

@@ -177,7 +177,17 @@ const db = {
       const rows = invoices.filter((i) => !prefix || String(i.number).startsWith(prefix));
       return [...rows].sort((a, b) => String(b.number).localeCompare(String(a.number)))[0] ?? null;
     },
-    findMany: async () => invoices,
+    // Honours hotelId + status so `outstandingBalance` (the reactivation gate)
+    // is exercised against a real filter rather than "every invoice ever".
+    findMany: async ({ where = {} }: any = {}) =>
+      invoices.filter(
+        (i) => (!where.hotelId || i.hotelId === where.hotelId) && matchStatus(i.status, where.status),
+      ),
+    update: async ({ where, data }: any) => {
+      const row = invoices.find((i) => i.id === where.id)!;
+      Object.assign(row, data);
+      return row;
+    },
   },
 
   usageRecord: {
@@ -269,6 +279,7 @@ import {
   cancelSubscription,
   extendSubscription,
   getAdminBillingAnalytics,
+  reactivateAfterPayment,
 } from "./billing.service";
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -283,6 +294,8 @@ const PLAN_INR = {
   aiReplyLimit: 1000,
   extraConversationCharge: 50,
   extraAiReplyCharge: 200,
+  taxRate: 0,
+  taxLabel: null,
   isActive: true,
 };
 
@@ -1042,5 +1055,144 @@ describe("getAdminBillingAnalytics — MRR", () => {
     await startTrial("h1");
     const result = await getAdminBillingAnalytics();
     expect(result.mrr).toEqual({});
+  });
+});
+
+// ── Reactivation after payment (the P0 fix) ──────────────────────────────────
+
+/**
+ * Settling an invoice used to change nothing outside Invoice/Payment. Because
+ * `resolveEffectiveState` treats EXPIRED as terminal, a hotel suspended by
+ * dunning stayed suspended after paying the very invoice it was suspended for —
+ * while the dunning email promised "Settle the invoice to resume immediately".
+ * The only recovery was `assignPlanToHotel`, which issues a SECOND full-price
+ * invoice and moves the customer's billing anchor.
+ */
+describe("reactivateAfterPayment", () => {
+  /** Put h1 in the exact state dunning leaves behind: EXPIRED, paid invoice. */
+  async function suspendedWithSettledInvoice(over: Row = {}) {
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    const sub = subscriptions.find((s) => s.hotelId === "h1")!;
+    Object.assign(sub, { status: "EXPIRED", autoRenew: true, ...over });
+    hotels.get("h1")!.subscriptionStatus = "EXPIRED";
+    // The invoice assign issued, now settled in full.
+    for (const inv of invoices) Object.assign(inv, { status: "PAID", amountPaid: inv.total });
+    return sub;
+  }
+
+  it("restores an EXPIRED subscription once the balance is clear", async () => {
+    const sub = await suspendedWithSettledInvoice();
+
+    const result = await reactivateAfterPayment("h1", { invoiceId: invoices[0]!.id });
+
+    expect(result).toEqual({ reactivated: true, subscriptionId: sub.id });
+    expect(sub.status).toBe("ACTIVE");
+    expect(hotels.get("h1")!.subscriptionStatus).toBe("ACTIVE");
+  });
+
+  it("clears the Redis entitlement cache, so the hotel is not served a stale EXPIRED", async () => {
+    await suspendedWithSettledInvoice();
+    // Warm the cache the way a real request would.
+    await getEffectiveSubscription("h1");
+    expect(redisStore.has("billing:sub:h1")).toBe(true);
+
+    await reactivateAfterPayment("h1", {});
+
+    expect(redisStore.has("billing:sub:h1")).toBe(false);
+  });
+
+  it("does NOT reactivate while another invoice is still unpaid", async () => {
+    await suspendedWithSettledInvoice();
+    invoices.push({
+      id: "inv_other",
+      hotelId: "h1",
+      status: "OPEN",
+      total: 500000,
+      amountPaid: 0,
+      periodStart: new Date("2026-07-15T00:00:00Z"),
+    });
+
+    const result = await reactivateAfterPayment("h1", {});
+
+    expect(result).toEqual({ reactivated: false, reason: "balance_outstanding" });
+    expect(hotels.get("h1")!.subscriptionStatus).toBe("EXPIRED");
+  });
+
+  it("never resurrects a CANCELED subscription — cancellation is a choice, expiry is not", async () => {
+    await suspendedWithSettledInvoice({ status: "CANCELED" });
+    hotels.get("h1")!.subscriptionStatus = "CANCELED";
+
+    const result = await reactivateAfterPayment("h1", {});
+
+    expect(result).toEqual({ reactivated: false, reason: "terminal_cancel" });
+    expect(subscriptions.find((s) => s.hotelId === "h1")!.status).toBe("CANCELED");
+  });
+
+  it("leaves a non-renewing subscription whose period already closed alone", async () => {
+    // autoRenew false + past endDate: setting ACTIVE would contradict the
+    // resolver, which is the authority, and the next cron tick would undo it.
+    await suspendedWithSettledInvoice({ autoRenew: false, endDate: new Date("2020-01-01T00:00:00Z") });
+
+    const result = await reactivateAfterPayment("h1", {});
+
+    expect(result).toEqual({ reactivated: false, reason: "not_renewable" });
+    expect(hotels.get("h1")!.subscriptionStatus).toBe("EXPIRED");
+  });
+
+  it("does reactivate a non-renewing subscription whose period is still open", async () => {
+    const future = new Date(Date.now() + 30 * 86_400_000);
+    await suspendedWithSettledInvoice({ autoRenew: false, endDate: future });
+
+    const result = await reactivateAfterPayment("h1", {});
+
+    expect(result.reactivated).toBe(true);
+  });
+
+  it("is a no-op for a hotel that was never suspended", async () => {
+    await assignPlanToHotel("h1", PLAN_INR.id);
+    for (const inv of invoices) Object.assign(inv, { status: "PAID", amountPaid: inv.total });
+
+    const result = await reactivateAfterPayment("h1", {});
+
+    expect(result).toEqual({ reactivated: false, reason: "live_subscription_exists" });
+  });
+
+  it("is a no-op for a hotel with no subscription at all", async () => {
+    const result = await reactivateAfterPayment("h2", {});
+    expect(result).toEqual({ reactivated: false, reason: "no_subscription" });
+  });
+
+  it("does NOT rewrite the period — renewal catch-up owns that", async () => {
+    const sub = await suspendedWithSettledInvoice();
+    const start = sub.startDate;
+    const end = sub.endDate;
+
+    await reactivateAfterPayment("h1", {});
+
+    expect(sub.startDate).toBe(start);
+    expect(sub.endDate).toBe(end);
+    expect(hotels.get("h1")!.billingEndDate).toBe(end);
+  });
+
+  it("audits the reactivation and emits to the admin panel", async () => {
+    await suspendedWithSettledInvoice();
+    emitToAdmin.mockClear();
+
+    await reactivateAfterPayment("h1", { invoiceId: "inv_x", actorId: "admin_9" });
+
+    const ev = auditLogs.find((a) => a.type === "subscription.reactivated")!;
+    expect(ev).toBeTruthy();
+    expect(ev.actorId).toBe("admin_9");
+    expect(ev.actorType).toBe("ADMIN");
+    expect(ev.data.invoiceId).toBe("inv_x");
+    expect(emitToAdmin).toHaveBeenCalledWith(
+      "admin:subscription_changed",
+      expect.objectContaining({ hotelId: "h1", status: "ACTIVE" }),
+    );
+  });
+
+  it("writes no audit event when nothing was reactivated", async () => {
+    await reactivateAfterPayment("h2", {});
+    expect(auditLogs.some((a) => a.type === "subscription.reactivated")).toBe(false);
   });
 });

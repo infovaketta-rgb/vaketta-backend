@@ -228,6 +228,12 @@ export async function getInvoices(req: Request, res: Response) {
         currency: inv.currency,
         subtotal: inv.subtotal,
         overageTotal: inv.overageTotal,
+        // Exposed so the invoice a hotel sees adds up. Without these the tax
+        // columns would be write-only: `total` would exceed
+        // `subtotal + overageTotal` with nothing on screen explaining the gap.
+        // 0 on every existing invoice, so nothing rendered changes today.
+        taxTotal: inv.taxTotal,
+        taxLabel: inv.taxLabel,
         total: inv.total,
         amountPaid: inv.amountPaid,
         periodStart: inv.periodStart,

@@ -63,6 +63,24 @@ export function parseLimit(v: unknown, field: string, max = 100_000_000): Parsed
   return ok(n);
 }
 
+/**
+ * A tax rate in BASIS POINTS — 1800 = 18% GST, 0 = untaxed.
+ *
+ * Basis points rather than a float percentage so tax arithmetic stays in
+ * integers end to end (see `computeTax`); the money columns were migrated Float
+ * → Int precisely to keep rounding out of totals, and a float rate would put it
+ * straight back. Capped at 10 000 (100%) — anything above is a data-entry slip,
+ * not a jurisdiction.
+ */
+export function parseBasisPoints(v: unknown, field: string): Parsed<number> {
+  const n = typeof v === "number" ? v : Number(String(v ?? "").trim());
+  if (!Number.isFinite(n)) return err(`${field} must be a number.`);
+  if (!Number.isInteger(n)) return err(`${field} must be a whole number of basis points (1800 = 18%).`);
+  if (n < 0) return err(`${field} cannot be negative.`);
+  if (n > 10_000) return err(`${field} cannot exceed 10000 basis points (100%).`);
+  return ok(n);
+}
+
 /** A whole count inside [min, max] — trial days, grace days, page sizes. */
 export function parseIntInRange(v: unknown, field: string, min: number, max: number): Parsed<number> {
   const n = typeof v === "number" ? v : Number(String(v ?? "").trim());
