@@ -6,6 +6,7 @@ import { rateLimit } from "express-rate-limit";
 import cookieParser from "cookie-parser";
 import hotelRoutes from "./routes/hotel.routes";
 import instagramRoutes from "./routes/instagram.routes";
+import razorpayWebhookRoutes from "./routes/razorpayWebhook.routes";
 import whatsappRoutes from "./routes/whatsapp.routes";
 import messageRoutes from "./routes/message.routes";
 import conversationRoutes from "./routes/conversation.routes";
@@ -149,6 +150,11 @@ app.use("/conversations", auth, requireActiveSubscription, conversationRoutes);
 
 app.use("/",webhookLimiter,whatsappRoutes);
 app.use("/",webhookLimiter,instagramRoutes);
+
+// Razorpay webhook. MUST stay at /webhook/razorpay: the body-parser skip above
+// is keyed on that prefix, and HMAC needs the raw bytes. webhookLimiter because
+// apiLimiter deliberately skips /webhook/*.
+app.use("/",webhookLimiter,razorpayWebhookRoutes);
 
 
 // ── Static file serving ───────────────────────────────────────────────────────

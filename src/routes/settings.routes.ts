@@ -43,6 +43,10 @@ import {
   patchToggleHandler,
 } from "../controllers/availability.controller";
 import { requireBillingViewer } from "../middleware/requireHotelRole";
+import {
+  createInvoiceOrderHandler,
+  verifyRazorpayPaymentHandler,
+} from "../controllers/razorpay.controller";
 
 const router = Router();
 
@@ -71,6 +75,14 @@ router.get("/billing/subscription", requireBillingViewer, getSubscription);
 router.get("/billing/usage",        requireBillingViewer, getUsage);
 router.get("/billing/plans",        requireBillingViewer, getAvailablePlans);
 router.get("/billing/invoices",     requireBillingViewer, getInvoices);
+
+// ── Razorpay (test mode) ─────────────────────────────────────────────────────
+// Deliberately under /billing/*: requireActiveSubscription exempts this prefix
+// from the 402 paywall for ALL methods, so a SUSPENDED hotel can still pay. Any
+// other mount point would 402 exactly the customer who needs to settle up.
+// requireBillingViewer keeps it OWNER/ADMIN, matching the reads above.
+router.post("/billing/invoices/:invoiceId/razorpay-order", requireBillingViewer, createInvoiceOrderHandler);
+router.post("/billing/razorpay/verify",                    requireBillingViewer, verifyRazorpayPaymentHandler);
 
 router.get("/menu",                 getMenuHandler);
 router.patch("/menu",               updateMenuTitleHandler);

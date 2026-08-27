@@ -62,6 +62,22 @@ export function validateEnv(): void {
   if (!process.env.INSTAGRAM_PROFILE_TTL_HOURS) {
     log.warn("INSTAGRAM_PROFILE_TTL_HOURS not set — defaulting to 24 h between profile refreshes");
   }
+  // Razorpay — optional by design. An unconfigured deployment must keep billing
+  // manually rather than refuse to boot, so these warn and never exit(1).
+  if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+    log.warn("RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET not set — online payment is disabled");
+  } else if (!process.env.RAZORPAY_KEY_ID.startsWith("rzp_test_")) {
+    log.warn("RAZORPAY_KEY_ID is not a test key — this build only supports Razorpay TEST mode");
+  }
+  if (!process.env.RAZORPAY_WEBHOOK_SECRET) {
+    log.warn("RAZORPAY_WEBHOOK_SECRET not set — the Razorpay webhook will reject every delivery");
+  }
+  if (process.env.RAZORPAY_ENABLED === "false") {
+    log.warn("RAZORPAY_ENABLED=false — online payment endpoints will return 503");
+  }
+  if (process.env.MOCK_RAZORPAY === "true") {
+    log.warn("MOCK_RAZORPAY=true — Razorpay orders are fixtures, no API call");
+  }
   if (process.env.MOCK_INSTAGRAM_PROFILE === "true") {
     log.warn("MOCK_INSTAGRAM_PROFILE=true — Instagram profile fetches return a fixture, no Graph call");
   }

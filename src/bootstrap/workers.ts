@@ -20,6 +20,7 @@
  *   whatsapp-out           → outboundSend.worker      (durable delayed staff replies)
  *   history-media          → historyMedia.worker      (backfills media on historical sync messages)
  *   instagram-profile      → instagramProfile.worker  (Instagram guest profile enrichment)
+ *   razorpay-webhook       → razorpay.worker          (verified Razorpay payment events)
  */
 import { logger } from "../utils/logger";
 
@@ -30,6 +31,7 @@ import "../workers/confirmationSequence.worker";
 import "../workers/outboundSend.worker";
 import "../workers/historyMedia.worker";
 import "../workers/instagramProfile.worker";
+import "../workers/razorpay.worker";
 
 const log = logger.child({ service: "workers" });
 
@@ -41,6 +43,7 @@ const WORKER_QUEUES = [
   "whatsapp-out",
   "history-media",
   "instagram-profile",
+  "razorpay-webhook",
 ] as const;
 
 /** No-op initializer — importing this module has already started the workers.

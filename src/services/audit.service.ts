@@ -49,6 +49,12 @@ export type BillingEventType =
   /** A money-destroying admin action that previously left no trail at all. */
   | "invoice.voided"
   | "payment.recorded"
+  /** A Razorpay Order was opened against an invoice (no money moved yet). */
+  | "payment.gateway_order_created"
+  /** A signed gateway payment passed every guard and was credited. */
+  | "payment.gateway_verified"
+  /** A signed gateway payment was REFUSED (amount/currency/void mismatch). */
+  | "payment.gateway_rejected"
   /** PENDING → SUCCEEDED, i.e. money confirmed after the row was created. */
   | "payment.succeeded"
   /** PENDING → FAILED, with the gateway/admin reason in `data`. */
