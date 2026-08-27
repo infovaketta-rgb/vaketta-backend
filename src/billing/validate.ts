@@ -81,6 +81,57 @@ export function parseBasisPoints(v: unknown, field: string): Parsed<number> {
   return ok(n);
 }
 
+/**
+ * Payment methods a hotel may claim for an offline payment.
+ *
+ * A CODE-LEVEL allowlist rather than a Postgres enum, deliberately: adding a
+ * method (NEFT, wallet, a regional rail) is then a one-line change with no
+ * migration and no deploy-ordering constraint. `Payment.method` stays a String,
+ * which also keeps gateway values like "razorpay_upi" expressible in the same
+ * column without polluting a tenant-facing enum.
+ */
+export const MANUAL_PAYMENT_METHODS = [
+  "BANK_TRANSFER",
+  "UPI",
+  "CASH",
+  "CHEQUE",
+  "OTHER",
+] as const;
+
+export type ManualPaymentMethod = (typeof MANUAL_PAYMENT_METHODS)[number];
+
+/** Strict membership check — an unknown method is rejected, never defaulted. */
+export function parsePaymentMethod(v: unknown, field = "method"): Parsed<ManualPaymentMethod> {
+  const s = String(v ?? "").trim().toUpperCase();
+  if (!(MANUAL_PAYMENT_METHODS as readonly string[]).includes(s)) {
+    return err(`${field} must be one of: ${MANUAL_PAYMENT_METHODS.join(", ")}.`);
+  }
+  return ok(s as ManualPaymentMethod);
+}
+
+/**
+ * A calendar date the guest/hotel asserts, as `YYYY-MM-DD` or any Date-parsable
+ * string. Rejects a FUTURE date — you cannot have already paid tomorrow — and
+ * anything absurdly old, which is almost always a typo'd year.
+ */
+export function parseClaimedDate(v: unknown, field: string, now = new Date()): Parsed<Date> {
+  const raw = String(v ?? "").trim();
+  if (!raw) return err(`${field} is required.`);
+
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return err(`${field} must be a valid date.`);
+
+  // Allow the rest of today in any timezone rather than comparing instants —
+  // a hotel in IST submitting "today" must not be rejected by a UTC server.
+  const endOfToday = new Date(now.getTime() + 36 * 60 * 60 * 1000);
+  if (d.getTime() > endOfToday.getTime()) return err(`${field} cannot be in the future.`);
+
+  const twoYearsAgo = new Date(now.getTime() - 2 * 365 * 24 * 60 * 60 * 1000);
+  if (d.getTime() < twoYearsAgo.getTime()) return err(`${field} is too far in the past.`);
+
+  return ok(d);
+}
+
 /** A whole count inside [min, max] — trial days, grace days, page sizes. */
 export function parseIntInRange(v: unknown, field: string, min: number, max: number): Parsed<number> {
   const n = typeof v === "number" ? v : Number(String(v ?? "").trim());

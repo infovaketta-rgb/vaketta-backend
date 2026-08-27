@@ -264,6 +264,33 @@ model Payment {
   reference         String? // bank/UTR reference for manual reconciliation
   notes             String?
 
+  // ── Manual / offline payment claims ────────────────────────────────────────
+  // A hotel-submitted payment is a CLAIM, never evidence. It is created as
+  // PENDING, contributes nothing to Invoice.amountPaid, and only becomes money
+  // when a Vaketta admin approves it via transitionPayment.
+
+  /// User.id of the hotel staff member who submitted the claim. Null for
+  /// admin-created and gateway payments. Plain String with no FK, matching the
+  /// existing `recordedByAdminId` convention.
+  submittedByUserId String?
+
+  /// VakettaAdmin.id who APPROVED or REJECTED. Deliberately distinct from
+  /// `recordedByAdminId`, which only means "an admin created this row" — the
+  /// person who enters a claim and the person who verifies it may differ, and
+  /// conflating them would destroy the separation the review step exists for.
+  reviewedByAdminId String?
+  reviewedAt        DateTime?
+
+  /// The date the HOTEL says it paid. Not `receivedAt`, which is when Vaketta
+  /// credited it. Unverified input — a claim, shown to the reviewer as such.
+  claimedPaidAt DateTime?
+
+  /// Proof of payment (bank slip / UPI screenshot / PDF) mirrored into R2.
+  /// Evidence FOR A HUMAN REVIEWER — never machine-verified, never sufficient
+  /// on its own to settle anything.
+  proofUrl String?
+  proofKey String?
+
   receivedAt DateTime @default(now())
   createdAt  DateTime @default(now())
   updatedAt  DateTime @default(now()) @updatedAt
@@ -277,6 +304,10 @@ model Payment {
   // owe money" check, both of which filter on status.
   @@index([hotelId, status])
   @@index([status, receivedAt])
+  // The admin review queue: PENDING claims, oldest first. `receivedAt` is
+  // rewritten on approval, so it cannot order a queue of unapproved claims —
+  // `createdAt` is the submission time and never moves.
+  @@index([status, createdAt])
 }
 
 /// Server-side audit trail. Replaces `lib/adminAudit.ts`, which was a

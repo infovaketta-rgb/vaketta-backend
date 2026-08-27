@@ -42,9 +42,38 @@ const findInvoice = (where: any): Row | null => {
   return null;
 };
 
+/**
+ * Transactional rollback, faithfully.
+ *
+ * A bare `$transaction: (fn) => fn(db)` keeps every mutation a throwing
+ * callback made, which would let a test "pass" while asserting a rollback that
+ * never happened. Rows are snapshotted by VALUE and restored IN PLACE (rather
+ * than replaced) so object identity survives — tests hold direct references to
+ * these rows and assert on them after the throw.
+ */
+function withRollback<T>(fn: (tx: Row) => Promise<T>): Promise<T> {
+  const tracked = [...invoices, ...payments];
+  const snapshot = tracked.map((row) => [row, { ...row }] as const);
+  const invCount = invoices.length;
+  const payCount = payments.length;
+
+  return fn(db).catch((err) => {
+    for (const [row, original] of snapshot) {
+      for (const key of Object.keys(row)) {
+        if (!(key in original)) delete (row as any)[key];
+      }
+      Object.assign(row, original);
+    }
+    // Discard anything created inside the aborted transaction.
+    invoices.length = invCount;
+    payments.length = payCount;
+    throw err;
+  });
+}
+
 const db: Row = {
   $executeRaw: async () => 1,
-  $transaction: async (fn: any) => fn(db),
+  $transaction: async (fn: any) => withRollback(fn),
   invoice: {
     findUnique: async (args: any) => findInvoice(args.where),
     findMany: async (args: any) =>
@@ -372,8 +401,8 @@ describe("recordPayment", () => {
 // ── transitionPayment ────────────────────────────────────────────────────────
 
 describe("transitionPayment", () => {
-  const pending = (over: Row = {}) => {
-    const row = {
+  const pending = (over: Row = {}): Row => {
+    const row: Row = {
       id: "pay_1",
       hotelId: "hotel_1",
       invoiceId: "inv_1",
@@ -463,6 +492,194 @@ describe("transitionPayment", () => {
     pending({ status: PaymentStatus.SUCCEEDED });
     await transitionPayment({ paymentId: "pay_1", status: PaymentStatus.SUCCEEDED });
     expect(auditEvents).toHaveLength(0);
+  });
+});
+
+// ── GAP 1: over-credit protection ────────────────────────────────────────────
+
+/**
+ * `recordPayment` used to accept any amount: a ₹2,499 invoice could be credited
+ * ₹99,999, creating a phantom credit balance the system has no concept of and
+ * corrupting revenue reporting. The Razorpay path always enforced an exact
+ * match; the manual path — where a typo'd extra zero is most likely — did not.
+ */
+describe("recordPayment — over-credit protection (GAP 1)", () => {
+  it("REJECTS an amount greater than the outstanding balance", async () => {
+    const inv = openInvoice();
+    await expect(recordPayment({ invoiceId: "inv_1", amount: 999999 })).rejects.toThrow(
+      /exceeds the outstanding balance/i,
+    );
+    expect(inv.amountPaid).toBe(0);
+    expect(inv.status).toBe(InvoiceStatus.OPEN);
+  });
+
+  it("rejects rather than silently clamping — the mistake must surface", async () => {
+    openInvoice();
+    await expect(recordPayment({ invoiceId: "inv_1", amount: 250000 })).rejects.toThrow(
+      /exceeds the outstanding/i,
+    );
+    // No payment row was written at all.
+    expect(payments).toHaveLength(0);
+  });
+
+  it("accepts EXACTLY the outstanding balance", async () => {
+    openInvoice();
+    const r = await recordPayment({ invoiceId: "inv_1", amount: 249900 });
+    expect(r.settled).toBe(true);
+  });
+
+  it("allows a PARTIAL payment", async () => {
+    const inv = openInvoice();
+    const r = await recordPayment({ invoiceId: "inv_1", amount: 100000 });
+    expect(r.settled).toBe(false);
+    expect(inv.amountPaid).toBe(100000);
+    expect(inv.status).toBe(InvoiceStatus.OPEN);
+  });
+
+  it("measures against the REMAINING balance on a partly paid invoice", async () => {
+    openInvoice({ amountPaid: 200000 }); // 49,900 left
+    await expect(recordPayment({ invoiceId: "inv_1", amount: 60000 })).rejects.toThrow(
+      /exceeds the outstanding/i,
+    );
+    const ok = await recordPayment({ invoiceId: "inv_1", amount: 49900 });
+    expect(ok.settled).toBe(true);
+  });
+
+  it("still rejects a zero or negative amount", async () => {
+    openInvoice();
+    for (const amount of [0, -100]) {
+      await expect(recordPayment({ invoiceId: "inv_1", amount })).rejects.toThrow(/greater than zero/i);
+    }
+  });
+
+  it("does not break the Razorpay exact-amount path", async () => {
+    openInvoice();
+    const r = await recordPayment({
+      invoiceId: "inv_1",
+      amount: 249900,
+      provider: "razorpay",
+      providerPaymentId: "pay_X",
+      status: PaymentStatus.SUCCEEDED,
+    });
+    expect(r.settled).toBe(true);
+  });
+});
+
+// ── GAP 2: stale PENDING approval ────────────────────────────────────────────
+
+/**
+ * `transitionPayment` blocked VOID invoices but not PAID ones. A claim can sit
+ * PENDING for days awaiting manual verification, during which the invoice may
+ * be settled by a Razorpay payment, an admin, or a second claim. Approving the
+ * stale row then pushed `amountPaid` past `total` and booked money twice.
+ */
+describe("transitionPayment — stale PENDING protection (GAP 2)", () => {
+  const pending = (over: Row = {}): Row => {
+    const row: Row = {
+      id: "pay_1",
+      hotelId: "hotel_1",
+      invoiceId: "inv_1",
+      status: PaymentStatus.PENDING,
+      currency: "INR",
+      amount: 249900,
+      ...over,
+    };
+    payments.push(row);
+    return row;
+  };
+
+  it("REFUSES to approve a payment against an already-PAID invoice", async () => {
+    const inv = openInvoice({ status: InvoiceStatus.PAID, amountPaid: 249900 });
+    pending();
+
+    await expect(
+      transitionPayment({ paymentId: "pay_1", status: PaymentStatus.SUCCEEDED }),
+    ).rejects.toThrow(/already paid/i);
+
+    expect(inv.amountPaid).toBe(249900); // not 499800
+  });
+
+  it("REFUSES when a concurrent payment consumed the balance first", async () => {
+    // Realistic race: two claims for the full amount, first one approved.
+    const inv = openInvoice();
+    pending();
+    pending({ id: "pay_2" });
+
+    const first = await transitionPayment({ paymentId: "pay_1", status: PaymentStatus.SUCCEEDED });
+    expect(first.settled).toBe(true);
+    expect(inv.amountPaid).toBe(249900);
+
+    await expect(
+      transitionPayment({ paymentId: "pay_2", status: PaymentStatus.SUCCEEDED }),
+    ).rejects.toThrow(/already paid/i);
+    expect(inv.amountPaid).toBe(249900);
+  });
+
+  it("REFUSES a claim larger than the remaining balance", async () => {
+    // Invoice still OPEN, so the PAID guard does not fire — the outstanding
+    // check is what prevents this over-credit.
+    const inv = openInvoice({ amountPaid: 200000 }); // 49,900 left
+    pending({ amount: 100000 });
+
+    await expect(
+      transitionPayment({ paymentId: "pay_1", status: PaymentStatus.SUCCEEDED }),
+    ).rejects.toThrow(/exceeds the outstanding/i);
+    expect(inv.amountPaid).toBe(200000);
+  });
+
+  it("leaves the payment PENDING after a refused approval, so it can be rejected", async () => {
+    openInvoice({ status: InvoiceStatus.PAID, amountPaid: 249900 });
+    const p = pending();
+
+    await expect(
+      transitionPayment({ paymentId: "pay_1", status: PaymentStatus.SUCCEEDED }),
+    ).rejects.toThrow();
+
+    // The transaction rolled back, so the atomic claim was reverted.
+    expect(p.status).toBe(PaymentStatus.PENDING);
+  });
+
+  it("still allows REJECTING a superseded claim — the resolution path", async () => {
+    const inv = openInvoice({ status: InvoiceStatus.PAID, amountPaid: 249900 });
+    pending();
+
+    const r = await transitionPayment({
+      paymentId: "pay_1",
+      status: PaymentStatus.FAILED,
+      failureReason: "Superseded — invoice already settled",
+    });
+
+    expect(r.changed).toBe(true);
+    expect(r.payment.failureReason).toMatch(/Superseded/);
+    expect(inv.amountPaid).toBe(249900);
+  });
+
+  it("still refuses a VOID invoice (unchanged behaviour)", async () => {
+    openInvoice({ status: InvoiceStatus.VOID });
+    pending();
+    await expect(
+      transitionPayment({ paymentId: "pay_1", status: PaymentStatus.SUCCEEDED }),
+    ).rejects.toThrow(/voided/i);
+  });
+
+  it("stamps reviewedByAdminId and reviewedAt when a human decides", async () => {
+    openInvoice();
+    const p = pending();
+
+    await transitionPayment({ paymentId: "pay_1", status: PaymentStatus.SUCCEEDED, actorId: "admin_7" });
+
+    expect(p.reviewedByAdminId).toBe("admin_7");
+    expect(p.reviewedAt).toBeInstanceOf(Date);
+  });
+
+  it("does NOT fabricate a reviewer for a machine-driven transition", async () => {
+    openInvoice();
+    const p = pending();
+
+    await transitionPayment({ paymentId: "pay_1", status: PaymentStatus.SUCCEEDED });
+
+    expect(p.reviewedByAdminId).toBeUndefined();
+    expect(p.reviewedAt).toBeUndefined();
   });
 });
 

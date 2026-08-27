@@ -47,6 +47,22 @@ import {
   createInvoiceOrderHandler,
   verifyRazorpayPaymentHandler,
 } from "../controllers/razorpay.controller";
+import {
+  submitManualPaymentHandler,
+  listMyPaymentsHandler,
+} from "../controllers/manualPayment.controller";
+import multer from "multer";
+
+/**
+ * Proof-of-payment upload. Memory storage + a hard 10 MB cap, matching the
+ * pattern in message.routes.ts. The cap is enforced here AND again by
+ * r2.service's per-MIME limits, which also sniff magic bytes — a file that
+ * lies about its type is rejected there regardless of what multer accepted.
+ */
+const proofUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+});
 
 const router = Router();
 
@@ -83,6 +99,18 @@ router.get("/billing/invoices",     requireBillingViewer, getInvoices);
 // requireBillingViewer keeps it OWNER/ADMIN, matching the reads above.
 router.post("/billing/invoices/:invoiceId/razorpay-order", requireBillingViewer, createInvoiceOrderHandler);
 router.post("/billing/razorpay/verify",                    requireBillingViewer, verifyRazorpayPaymentHandler);
+
+// ── Manual / offline payments ────────────────────────────────────────────────
+// Same /billing/* mount, same 402 exemption: a SUSPENDED hotel must be able to
+// report the bank transfer that will un-suspend it. Submission creates a
+// PENDING claim only — a Vaketta admin approves it, which is what settles.
+router.post(
+  "/billing/invoices/:invoiceId/manual-payment",
+  requireBillingViewer,
+  proofUpload.single("proof"),
+  submitManualPaymentHandler,
+);
+router.get("/billing/payments", requireBillingViewer, listMyPaymentsHandler);
 
 router.get("/menu",                 getMenuHandler);
 router.patch("/menu",               updateMenuTitleHandler);

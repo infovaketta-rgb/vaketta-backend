@@ -17,7 +17,7 @@
  * hotel-side billing role gate.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { InvoiceStatus, PaymentStatus, UserRole } from "@prisma/client";
+import { InvoiceStatus, PaymentStatus, UserRole, VakettaAdminRole } from "@prisma/client";
 
 type Row = Record<string, any>;
 
@@ -26,7 +26,21 @@ let payments: Row[];
 let auditEvents: Row[];
 
 const recordPayment = vi.fn(async (input: any) => ({ payment: { id: "pay_1", ...input }, settled: true }));
-const transitionPayment = vi.fn(async (input: any) => ({ payment: { id: input.paymentId }, changed: true }));
+const transitionPayment = vi.fn(async (input: any) => ({
+  // `provider` decides manual-vs-gateway in the audit branch; null = manual.
+  payment: {
+    id: input.paymentId,
+    hotelId: "h1",
+    invoiceId: "inv_1",
+    amount: 249900,
+    currency: "INR",
+    method: "BANK_TRANSFER",
+    reference: "UTR123456",
+    provider: null,
+  },
+  changed: true,
+  settled: input.status === "SUCCEEDED",
+}));
 
 vi.mock("../services/invoice.service", () => ({
   recordPayment: (...a: any[]) => recordPayment(a[0]),
@@ -56,7 +70,14 @@ vi.mock("../db/connect", () => ({
       findMany: async () => payments,
       count: async () => payments.length,
     },
+    // requireVakettaRole reads the role from the DATABASE, not the token.
+    vakettaAdmin: { findUnique: (...a: any[]) => adminFindUnique(a[0]) },
   },
+}));
+
+// Typed as the union, not the literal, so a test can resolve any role.
+const adminFindUnique = vi.fn(async (_args?: any): Promise<{ role: VakettaAdminRole } | null> => ({
+  role: VakettaAdminRole.ADMIN,
 }));
 
 vi.mock("../utils/logger", () => ({
@@ -70,11 +91,13 @@ import {
   listPaymentsHandler,
 } from "./adminBilling.controller";
 import { requireHotelRole, requireBillingViewer } from "../middleware/requireHotelRole";
+import { requireVakettaRole } from "../middleware/requireVakettaRole";
 
 function mockRes() {
   const json = vi.fn();
   const res: any = { json, status: vi.fn(() => ({ json })) };
   res.__json = json;
+  res.__code = () => res.status.mock.calls[0]?.[0];
   return res;
 }
 
@@ -298,6 +321,121 @@ describe("listPaymentsHandler", () => {
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({ data: payments, total: 1, page: 1, limit: 25 }),
     );
+  });
+});
+
+// ── Manual payment approval / rejection ──────────────────────────────────────
+
+/**
+ * Approval must go through the EXISTING transitionPayment — there is no second
+ * settlement path — and must be attributable to a named admin. SUPPORT is
+ * excluded from every money-moving action by requireBillingAdmin.
+ */
+describe("manual payment approval", () => {
+  it("APPROVE routes through transitionPayment with the reviewing admin", async () => {
+    const res = mockRes();
+    await transitionPaymentHandler(req({ params: { id: "pay_1" }, body: { status: "SUCCEEDED" } }), res);
+
+    expect(transitionPayment).toHaveBeenCalledWith(
+      expect.objectContaining({ paymentId: "pay_1", status: PaymentStatus.SUCCEEDED, actorId: "admin_1" }),
+    );
+  });
+
+  it("audits payment.manual_approved for a non-gateway payment", async () => {
+    const res = mockRes();
+    await transitionPaymentHandler(req({ params: { id: "pay_1" }, body: { status: "SUCCEEDED" } }), res);
+
+    const ev = auditEvents.find((e) => e.type === "payment.manual_approved")!;
+    expect(ev.actorId).toBe("admin_1");
+    expect(ev.actorType).toBe("ADMIN");
+    expect(ev.data).toMatchObject({ paymentId: "pay_1", amount: 249900, reference: "UTR123456", settled: true });
+  });
+
+  it("audits payment.manual_rejected with the rejection reason", async () => {
+    const res = mockRes();
+    await transitionPaymentHandler(
+      req({ params: { id: "pay_1" }, body: { status: "FAILED", failureReason: "UTR not found at bank" } }),
+      res,
+    );
+
+    const ev = auditEvents.find((e) => e.type === "payment.manual_rejected")!;
+    expect(ev.data.rejectionReason).toBe("UTR not found at bank");
+    // The rejection reason travels through the EXISTING failureReason field.
+    expect(transitionPayment).toHaveBeenCalledWith(
+      expect.objectContaining({ failureReason: "UTR not found at bank" }),
+    );
+  });
+
+  it("does NOT emit a manual audit event for a gateway payment", async () => {
+    transitionPayment.mockResolvedValueOnce({
+      payment: { id: "pay_rzp", hotelId: "h1", invoiceId: "inv_1", amount: 1, currency: "INR", method: "razorpay_upi", provider: "razorpay" },
+      changed: true,
+      settled: true,
+    } as any);
+    const res = mockRes();
+    await transitionPaymentHandler(req({ params: { id: "pay_rzp" }, body: { status: "SUCCEEDED" } }), res);
+
+    expect(auditEvents.some((e) => String(e.type).startsWith("payment.manual_"))).toBe(false);
+  });
+
+  it("emits nothing when the transition did not change anything", async () => {
+    transitionPayment.mockResolvedValueOnce({
+      payment: { id: "pay_1", provider: null },
+      changed: false,
+      settled: false,
+    } as any);
+    const res = mockRes();
+    await transitionPaymentHandler(req({ params: { id: "pay_1" }, body: { status: "SUCCEEDED" } }), res);
+
+    expect(auditEvents).toHaveLength(0);
+  });
+
+  it("surfaces a stale-PENDING refusal as a 400, not a 500", async () => {
+    transitionPayment.mockRejectedValueOnce(
+      new Error("Cannot apply a payment to an invoice that is already paid"),
+    );
+    const res = mockRes();
+    await transitionPaymentHandler(req({ params: { id: "pay_1" }, body: { status: "SUCCEEDED" } }), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  it("requires a reason to reject — a rejection without one is unauditable", async () => {
+    const res = mockRes();
+    await transitionPaymentHandler(req({ params: { id: "pay_1" }, body: { status: "FAILED" } }), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(transitionPayment).not.toHaveBeenCalled();
+  });
+});
+
+describe("SUPPORT cannot approve payments", () => {
+  it("requireBillingAdmin denies SUPPORT", async () => {
+    adminFindUnique.mockResolvedValueOnce({ role: VakettaAdminRole.SUPPORT });
+    const next = vi.fn();
+    const res = mockRes();
+
+    await requireVakettaRole(VakettaAdminRole.SUPER_ADMIN, VakettaAdminRole.ADMIN)(
+      { vakettaAdmin: { id: "admin_support" } } as any,
+      res,
+      next,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("allows SUPER_ADMIN and ADMIN", async () => {
+    for (const role of [VakettaAdminRole.SUPER_ADMIN, VakettaAdminRole.ADMIN]) {
+      adminFindUnique.mockResolvedValueOnce({ role });
+      const next = vi.fn();
+      await requireVakettaRole(VakettaAdminRole.SUPER_ADMIN, VakettaAdminRole.ADMIN)(
+        { vakettaAdmin: { id: "a" } } as any,
+        mockRes(),
+        next,
+      );
+      expect(next).toHaveBeenCalled();
+    }
   });
 });
 

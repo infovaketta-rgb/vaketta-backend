@@ -49,6 +49,12 @@ export type BillingEventType =
   /** A money-destroying admin action that previously left no trail at all. */
   | "invoice.voided"
   | "payment.recorded"
+  /** A hotel submitted an offline payment CLAIM. No money has moved. */
+  | "payment.manual_submitted"
+  /** An admin verified a claim; settlement follows via transitionPayment. */
+  | "payment.manual_approved"
+  /** An admin rejected a claim; the invoice stays OPEN. */
+  | "payment.manual_rejected"
   /** A Razorpay Order was opened against an invoice (no money moved yet). */
   | "payment.gateway_order_created"
   /** A signed gateway payment passed every guard and was credited. */

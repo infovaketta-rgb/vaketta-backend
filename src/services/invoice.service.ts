@@ -370,6 +370,23 @@ export async function recordPayment(input: RecordPaymentInput) {
     const amount = Math.round(input.amount ?? outstanding);
     if (!Number.isFinite(amount) || amount <= 0) throw new Error("Payment amount must be greater than zero");
 
+    // GAP 1 — never credit more than is owed.
+    //
+    // This used to be uncapped: a ₹2,499 invoice could be credited ₹99,999,
+    // which silently created a phantom credit balance this system has no
+    // concept of and corrupted revenue reporting. The Razorpay path always
+    // enforced an exact match; the manual path did not, and manual is exactly
+    // where a typo (an extra zero) is most likely.
+    //
+    // REJECTED, not clamped. Silently shrinking a number someone deliberately
+    // typed hides the mistake instead of surfacing it — and an over-payment is
+    // a real event that needs a refund decision, not a rounding-away.
+    if (amount > outstanding) {
+      throw new Error(
+        `Payment amount exceeds the outstanding balance of ${outstanding} ${invoice.currency} on this invoice.`,
+      );
+    }
+
     const payment = await tx.payment.create({
       data: {
         hotelId: invoice.hotelId,
@@ -471,10 +488,18 @@ export async function transitionPayment(input: TransitionPaymentInput) {
     }
 
     // Atomic claim: only ONE caller can move this row out of PENDING.
+    //
+    // `reviewedByAdminId`/`reviewedAt` are stamped only when a human actorId is
+    // present — a machine-driven transition (a future gateway webhook) has no
+    // reviewer, and recording one would fabricate an approval that never
+    // happened. `failureReason` carries the REJECTION reason on the FAILED
+    // branch: a rejected claim is a payment that did not succeed, so it reuses
+    // the existing column rather than adding a parallel one.
     const claimed = await tx.payment.updateMany({
       where: { id: payment.id, status: PaymentStatus.PENDING },
       data: {
         status: input.status,
+        ...(input.actorId ? { reviewedByAdminId: input.actorId, reviewedAt: new Date() } : {}),
         ...(input.status === PaymentStatus.FAILED
           ? { failureReason: input.failureReason ?? null }
           : { receivedAt: new Date() }),
@@ -495,6 +520,32 @@ export async function transitionPayment(input: TransitionPaymentInput) {
     // A voided invoice must not be credited — the money needs refunding, which
     // is a separate (P2) flow. Surfacing this loudly beats silently crediting.
     if (invoice.status === InvoiceStatus.VOID) throw new Error("Cannot pay a voided invoice");
+
+    // GAP 2 — the STALE PENDING problem.
+    //
+    // Only VOID was blocked here. A payment can sit PENDING for days awaiting
+    // manual verification, and in the meantime the invoice may be settled by
+    // something else (a Razorpay payment, an admin recording a bank transfer,
+    // or a second manual claim). Approving the stale row then pushed
+    // `amountPaid` past `total` and booked money that was never received twice.
+    //
+    // Throwing rolls the whole transaction back, so the atomic PENDING claim
+    // above is reverted and the payment stays PENDING — an admin can still
+    // REJECT it, which is the correct resolution for a superseded claim (the
+    // FAILED branch returns before this point and never touches the invoice).
+    if (invoice.status === InvoiceStatus.PAID) {
+      throw new Error("Cannot apply a payment to an invoice that is already paid");
+    }
+
+    // The same over-credit guard recordPayment applies, enforced again at
+    // approval time because the balance can move between submission and review
+    // — this is what makes two claims racing one invoice safe.
+    const outstanding = Math.max(0, invoice.total - invoice.amountPaid);
+    if (updatedPayment.amount > outstanding) {
+      throw new Error(
+        `Payment amount exceeds the outstanding balance of ${outstanding} ${invoice.currency} on this invoice.`,
+      );
+    }
 
     const applied = await applyPaymentToInvoice(tx, invoice, updatedPayment.amount);
     return { payment: updatedPayment, invoice: applied.invoice, settled: applied.settled, changed: true };

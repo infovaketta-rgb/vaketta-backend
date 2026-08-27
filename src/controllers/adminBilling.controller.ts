@@ -94,7 +94,13 @@ export async function recordPaymentHandler(req: Request, res: Response) {
     });
     res.status(201).json(result);
   } catch (err) {
-    if (err instanceof Error && /not found|voided|greater than zero/i.test(err.message)) {
+    // Business refusals from the writer are the CALLER's fault, not ours —
+    // surfacing them as 500s would hide "you tried to over-credit this invoice"
+    // behind a generic server error.
+    if (
+      err instanceof Error &&
+      /not found|voided|greater than zero|exceeds the outstanding|already paid/i.test(err.message)
+    ) {
       return res.status(400).json({ error: err.message });
     }
     return serverError(res, err, "Failed to record payment");
@@ -130,9 +136,42 @@ export async function transitionPaymentHandler(req: Request, res: Response) {
       ...(failureReason !== undefined ? { failureReason } : {}),
       actorId: adminId(req),
     });
+
+    // A manual/offline claim is one with no gateway behind it — Razorpay always
+    // stamps `provider`. Recording the human decision separately from the
+    // lifecycle event (payment.succeeded/failed, already emitted by
+    // transitionPayment) is what makes "who approved this money" auditable
+    // rather than inferred.
+    if (result.changed && !result.payment.provider) {
+      await recordBillingEvent(
+        raw === PaymentStatus.SUCCEEDED ? "payment.manual_approved" : "payment.manual_rejected",
+        {
+          hotelId: result.payment.hotelId,
+          actorId: adminId(req),
+          actorType: "ADMIN",
+          data: {
+            paymentId: result.payment.id,
+            invoiceId: result.payment.invoiceId,
+            amount: result.payment.amount,
+            currency: result.payment.currency,
+            method: result.payment.method,
+            settled: result.settled,
+            ...(result.payment.reference ? { reference: result.payment.reference } : {}),
+            ...(failureReason ? { rejectionReason: failureReason } : {}),
+          },
+        },
+      );
+    }
+
     res.json(result);
   } catch (err) {
-    if (err instanceof Error && /not found|voided|Cannot transition/i.test(err.message)) {
+    // Includes the stale-PENDING guards: an invoice settled while this claim
+    // waited for review is a 400 the reviewer must see and act on (reject it),
+    // not an opaque 500.
+    if (
+      err instanceof Error &&
+      /not found|voided|Cannot transition|already paid|exceeds the outstanding/i.test(err.message)
+    ) {
       return res.status(400).json({ error: err.message });
     }
     return serverError(res, err, "Failed to update payment");
@@ -155,7 +194,11 @@ export async function listPaymentsHandler(req: Request, res: Response) {
     const [data, total] = await Promise.all([
       prisma.payment.findMany({
         where,
-        orderBy: { receivedAt: "desc" },
+        // SUBMISSION order, not settlement order. `receivedAt` is rewritten to
+        // now() when a payment is approved, so it cannot order a queue of
+        // unapproved claims; `createdAt` never moves. Backed by the
+        // [status, createdAt] index.
+        orderBy: { createdAt: "desc" },
         skip: (page - 1) * limit,
         take: limit,
         include: {
