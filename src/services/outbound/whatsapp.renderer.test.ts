@@ -56,11 +56,11 @@ afterEach(() => { delete process.env["MOCK_WHATSAPP_SEND"]; });
 describe("kind mapping — identical sender calls to the pre-refactor helpers", () => {
   it("choice → sendListMessage(guestPhone, phoneNumberId, token, {bodyText, buttonLabel, sections, footerText?})", async () => {
     const out = await renderWhatsApp(CTX, {
-      kind: "choice", bodyText: "Pick:", buttonLabel: "View", sections: SECTIONS, footerText: "Type MENU to cancel",
+      kind: "choice", bodyText: "Pick:", buttonLabel: "View", sections: SECTIONS, footerText: "Type 'Hi' to cancel",
     });
     expect(out).toEqual({ ok: true, providerMessageId: "wamid.list" });
     expect(sendListMessage).toHaveBeenCalledWith("G_PHONE", "PN_1", "WA_TOKEN", {
-      bodyText: "Pick:", buttonLabel: "View", sections: SECTIONS, footerText: "Type MENU to cancel",
+      bodyText: "Pick:", buttonLabel: "View", sections: SECTIONS, footerText: "Type 'Hi' to cancel",
     });
   });
 

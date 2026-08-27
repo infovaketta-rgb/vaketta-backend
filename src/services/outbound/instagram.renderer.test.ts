@@ -55,7 +55,7 @@ describe("choice → quick replies", () => {
   it("flattens sections to quick replies with payload ids VERBATIM, footer appended to body", async () => {
     const out = await renderInstagram(CTX, {
       kind: "choice", bodyText: "Pick one:", buttonLabel: "View Options",
-      footerText: "Type MENU to cancel",
+      footerText: "Type 'Hi' to cancel",
       sections: [
         { title: "A", rows: [{ id: "opt_0", title: "First", description: "d" }] },
         { title: "B", rows: [{ id: "MOD_REMOVE_ROOM", title: "Remove this room" }] },
@@ -65,7 +65,7 @@ describe("choice → quick replies", () => {
     expect(sendInstagramQuickReplies).toHaveBeenCalledWith({
       toPhone: "996345286534670",
       hotelId: "h1",
-      text:    "Pick one:\n\nType MENU to cancel",
+      text:    "Pick one:\n\nType 'Hi' to cancel",
       quickReplies: [
         { title: "First",            payload: "opt_0" },
         { title: "Remove this room", payload: "MOD_REMOVE_ROOM" },

@@ -73,7 +73,7 @@ const CAROUSEL_FALLBACK_IMAGE = "https://placehold.co/600x400/png?text=Room";
 
 const MAX_HOPS = 30;
 const DIVIDER  = "━━━━━━━━━━━━━━━━";
-const MENU_FALLBACK = "Reply *MENU* to see our options.";
+const MENU_FALLBACK = "Reply *Hi* to see our options.";
 
 const ACTION_TIMEOUT_MS = 10_000;
 function withActionTimeout<T>(promise: Promise<T>): Promise<T> {

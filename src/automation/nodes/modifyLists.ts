@@ -201,7 +201,7 @@ export async function trySendRoomMenuList(args: {
       kind:        "choice",
       bodyText,
       buttonLabel: "Options",
-      footerText:  "Type MENU to cancel",
+      footerText:  "Type 'Hi' to cancel",
       sections:    buildRoomMenuSections(room, options),
     });
     return res.sent;
@@ -244,7 +244,7 @@ export async function trySendMoveToRoomList(args: {
       kind:        "choice",
       bodyText:    `Move ${moving.join(", ")} to which room?`,
       buttonLabel: "Choose Room",
-      footerText:  "Type MENU to cancel",
+      footerText:  "Type 'Hi' to cancel",
       sections,
     });
     return { sent: res.sent, destIndices: res.sent ? destIndices : [] };
@@ -310,7 +310,7 @@ export async function trySendChangeRoomTypeList(args: {
       kind:        "choice",
       bodyText:    `Change Room ${roomIndex + 1} to which type?`,
       buttonLabel: "Choose Type",
-      footerText:  "Type MENU to cancel",
+      footerText:  "Type 'Hi' to cancel",
       sections:    buildChangeTypeSections(candidates),
     });
     return res.sent;
@@ -350,7 +350,7 @@ export async function trySendManualModeList(args: {
       kind:        "choice",
       bodyText:    summary,
       buttonLabel: "Edit Booking",
-      footerText:  "Type MENU to cancel",
+      footerText:  "Type 'Hi' to cancel",
       sections:    buildManualModeSections(state, addable),
     });
     return res.sent;
