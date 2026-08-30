@@ -753,12 +753,23 @@ export async function extractChildrenAgesAI(
   reply: string,
   childrenCount?: number,
 ): Promise<number[] | null> {
+  // childrenCount is CONTEXT, never a target length. The previous wording —
+  // "there are exactly N children, so return exactly N ages" — handed the model a
+  // quota, and a padded reply is invisible downstream: it lands on "complete" in
+  // accumulateAges, so the guest is never re-prompted and nothing is logged. A
+  // short array is the safe outcome; the caller already knows how to ask again.
   const expected =
     typeof childrenCount === "number" && childrenCount > 0
-      ? `There are exactly ${childrenCount} children, so return exactly ${childrenCount} ages. ` +
-        `If the guest gives one age for all of them ("all 5", "everyone is 5", "each is 5"), ` +
-        `repeat that age ${childrenCount} times. A number that restates how many children ` +
-        `there are ("all 3 are 5") is a COUNT, not an age — do not return it. `
+      ? `The guest has ${childrenCount} children. Use that number to interpret the message; ` +
+        `it is NOT a required length for your answer. ` +
+        `If the message states one age collectively for all of them ("all 5", "everyone is 5", ` +
+        `"each is 5"), expand it to ${childrenCount} ages. ` +
+        `A number that merely restates how many children there are ("all 3 are 5") is a COUNT, ` +
+        `not an age — do not return it. ` +
+        `Otherwise return ONLY the ages the message actually states: if it names fewer children ` +
+        `than ${childrenCount} and says nothing that covers the rest, return the shorter array. ` +
+        `Never invent, infer, guess, duplicate or pad an age to reach ${childrenCount} — ` +
+        `a missing age is an expected outcome and the caller will ask for it. `
       : "";
   const system =
     `Extract the ages of children from the guest message as a JSON array of integers. ` +
@@ -766,6 +777,7 @@ export async function extractChildrenAgesAI(
     `Resolve relative phrasing: "twins"/"both"/"same age" mean two (or more) children share ` +
     `one stated age; "eldest"/"youngest" refer to one child. ` +
     `Ignore numbers that are not ages (room counts, times, dates, phone numbers). ` +
+    `Never guess an age the message does not support; returning fewer ages is correct. ` +
     `Respond with ONLY a JSON object, no prose, no markdown fences: {"ages": number[]}`;
   const user = `Message: "${reply}"`;
 
