@@ -697,6 +697,43 @@ export async function interpretAllocationModification(
   }
 }
 
+// ── Child-age extraction token budget ────────────────────────────────────────
+// PER-CALL, and deliberately separate from the shared MAX_TOKENS (260) that the
+// conversational replies use — raising that would re-price every AI reply.
+//
+// The old flat 40 was sized for "the twins are 8". Once the node began routing
+// every non-bare-list reply here, a party of ~12+ children needed a longer JSON
+// array than the budget allowed: the response came back truncated, JSON.parse
+// failed, the function returned null, and the caller fell back to the regex —
+// reproducing the exact bug the AI path exists to fix, for precisely the groups
+// that need it most. The budget now scales with the number of ages requested.
+const AGE_TOKENS_BASE      = 24;  // {"ages":[ … ]} envelope plus slack
+const AGE_TOKENS_PER_CHILD = 4;   // one age plus its separator
+const AGE_TOKENS_MAX       = 400; // hard ceiling — cost guard
+const AGE_TOKENS_LEGACY    = 40;  // no count supplied → historical budget, unchanged
+
+/**
+ * Ceiling applied to childrenCount for the BUDGET ARITHMETIC ONLY. This is not a
+ * limit on how many children a booking may have — the node has no such cap, and
+ * adding one is a separate decision. 94 children already saturates
+ * AGE_TOKENS_MAX, so this exists purely to keep a nonsense count (NaN, 1e9) out
+ * of the multiplication.
+ */
+const AGE_BUDGET_COUNT_CEILING = 100;
+
+/**
+ * Token budget for one child-age extraction: `min(400, 24 + childrenCount * 4)`.
+ * Absent/invalid/zero count → the historical 40, so callers that don't pass a
+ * count behave exactly as before. Pure and exported for testing.
+ */
+export function ageExtractionMaxTokens(childrenCount?: number): number {
+  if (typeof childrenCount !== "number" || !Number.isFinite(childrenCount) || childrenCount <= 0) {
+    return AGE_TOKENS_LEGACY;
+  }
+  const n = Math.min(Math.floor(childrenCount), AGE_BUDGET_COUNT_CEILING);
+  return Math.min(AGE_TOKENS_MAX, AGE_TOKENS_BASE + n * AGE_TOKENS_PER_CHILD);
+}
+
 /**
  * Extract children's ages from a free-text reply when plain integer parsing can't
  * (e.g. "the twins are 8", "all 5", "all 3 are 5", "my eldest is 12").
@@ -732,8 +769,9 @@ export async function extractChildrenAgesAI(
     `Respond with ONLY a JSON object, no prose, no markdown fences: {"ages": number[]}`;
   const user = `Message: "${reply}"`;
 
-  const provider = activeProvider();
-  const timeout  = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000));
+  const provider  = activeProvider();
+  const maxTokens = ageExtractionMaxTokens(childrenCount);
+  const timeout   = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000));
 
   let raw: string | null = null;
 
@@ -743,7 +781,7 @@ export async function extractChildrenAgesAI(
       if (!client) return null;
       const call = client.chat.completions.create({
         model:       OPENAI_MODEL,
-        max_tokens:  40,
+        max_tokens:  maxTokens,
         temperature: 0,
         messages:    [{ role: "system", content: system }, { role: "user", content: user }],
       }).then((r) => r.choices[0]?.message?.content?.trim() ?? null);
@@ -753,7 +791,7 @@ export async function extractChildrenAgesAI(
       if (!client) return null;
       const call = client.messages.create({
         model:      ANTHROPIC_MODEL,
-        max_tokens: 40,
+        max_tokens: maxTokens,
         system,
         messages:   [{ role: "user", content: user }],
       }).then((r) => (r.content[0]?.type === "text" ? r.content[0].text.trim() : null));
