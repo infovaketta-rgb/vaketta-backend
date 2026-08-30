@@ -2285,6 +2285,53 @@ describe("collecting_ages handler", () => {
     const { ages } = await runAgeReply("we have 2 rooms, kids are 5 and 8", 2);
     expect(ages).toEqual([2, 5]);          // regex-only: the room count leaks in
   });
+
+  // ── Fewer ages than children must stay short ────────────────────────────────
+  // The count given to the AI parser is context, not a quota (see the prompt in
+  // ai.service). A reply naming two children when three are expected has to come
+  // back as two ages and re-prompt — never be topped up to three.
+
+  it("CA17: bare '5 and 8' for 3 children → partial re-prompt, no third age", async () => {
+    // Bare list, so this never reaches the AI: the regex result stands as-is.
+    const { ages, deps, extractChildrenAges } = await runAgeReply("5 and 8", 3, async () => [5, 8, 8]);
+    expect(extractChildrenAges).not.toHaveBeenCalled();
+    expect(ages).toBeNull();                                   // did not proceed
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("collecting_ages");
+    expect(ara.ageCollection!.collectedAges).toEqual([5, 8]);   // exactly what was said
+    expect(ara.ageCollection!.collectedAges).toHaveLength(2);
+  });
+
+  it("CA18: AI returns 2 ages for 3 children → partial re-prompt, no zero-fill", async () => {
+    const ai = vi.fn(async () => [5, 8]);
+    const { ages, deps } = await runAgeReply("my kids are 5 and 8", 3, ai);
+    expect(ai).toHaveBeenCalledWith("my kids are 5 and 8", 3);
+    expect(ages).toBeNull();
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("collecting_ages");
+    expect(ara.ageCollection!.collectedAges).toEqual([5, 8]);
+    expect(ara.ageCollection!.rounds).toBe(1);                 // budget untouched
+  });
+
+  it("CA19: 'all 5' for 3 children still completes at [5,5,5]", async () => {
+    // The legitimate expansion the prompt must keep — the counterpart to CA17/18.
+    const { ages } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+    expect(ages).toEqual([5, 5, 5]);
+  });
+
+  // ⚠ KNOWN GAP — pins current behaviour, not desired behaviour.
+  // A padded array is indistinguishable from a legitimately expanded one at this
+  // boundary: the dep returns number[] with no provenance, so [5,8,8] from
+  // "my kids are 5 and 8" and [5,5,5] from "all 5" are the same shape. The node
+  // therefore accepts the padding and proceeds. Mitigation is prompt-side only;
+  // closing it needs the dep to carry how each age was derived. If that lands,
+  // this test SHOULD fail — rewrite it then, don't delete it.
+  it("CA20: a padded AI response reaches 'complete' unchallenged (known gap)", async () => {
+    const padded = vi.fn(async () => [5, 8, 8]);   // third age was never stated
+    const { ages, deps } = await runAgeReply("my kids are 5 and 8", 3, padded);
+    expect(ages).toEqual([5, 8, 8]);                            // fabricated 8 accepted
+    expect(readAra(deps).phase).not.toBe("collecting_ages");    // proceeded to allocate
+  });
 });
 
 // ── Piece 2B: generateSmartPlans (pure — no DB, no Redis) ─────────────────────

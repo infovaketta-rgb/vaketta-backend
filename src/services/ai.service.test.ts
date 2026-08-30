@@ -133,6 +133,33 @@ describe("extractChildrenAgesAI token budget", () => {
     expect(logError).toHaveBeenCalledTimes(1);
   });
 
+  it("AB10: the count is framed as context, never as a required length", async () => {
+    anthropicCreate.mockResolvedValueOnce(anthropicOk('{"ages":[5]}'));
+    await extractChildrenAgesAI("my kids are 5 and 8", 3);
+    const { system } = anthropicCreate.mock.calls[0]![0];
+    // The quota wording is what invited padding — it must not come back.
+    expect(system).not.toMatch(/return exactly \d+ ages/i);
+    expect(system).toMatch(/NOT a required length/i);
+    expect(system).toMatch(/never invent, infer, guess, duplicate or pad/i);
+    expect(system).toMatch(/return the shorter array/i);
+  });
+
+  it("AB11: collective expansion and the count-is-not-an-age rule survive", async () => {
+    anthropicCreate.mockResolvedValueOnce(anthropicOk('{"ages":[5,5,5]}'));
+    await extractChildrenAgesAI("all 5", 3);
+    const { system } = anthropicCreate.mock.calls[0]![0];
+    expect(system).toMatch(/expand it to 3 ages/i);
+    expect(system).toMatch(/is a COUNT,\s*not an age/i);
+  });
+
+  it("AB12: no count → no count-specific clauses in the prompt at all", async () => {
+    anthropicCreate.mockResolvedValueOnce(anthropicOk('{"ages":[8,8]}'));
+    await extractChildrenAgesAI("the twins are 8");
+    const { system } = anthropicCreate.mock.calls[0]![0];
+    expect(system).not.toMatch(/required length|shorter array|The guest has/i);
+    expect(system).toMatch(/twins/i);   // relative-phrasing rule still there
+  });
+
   it("AB9: openai branch — finish_reason 'stop' returns the ages", async () => {
     vi.stubEnv("AI_PROVIDER", "openai");
     vi.stubEnv("OPENAI_API_KEY", "test-key");
