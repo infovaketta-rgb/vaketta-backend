@@ -2119,6 +2119,10 @@ describe("collecting_ages handler", () => {
     });
     await handleAdvancedRoomAllocation(deps);
     expect(extractChildrenAges).toHaveBeenCalledTimes(1);  // ambiguous → AI
+    // AI-parsed ages are read back before allocating; confirm to proceed.
+    expect(readAra(deps).phase).toBe("confirming_ages");
+    (deps as { input: string }).input = "1";
+    await handleAdvancedRoomAllocation(deps);
     expect(deps.flowData.flowVars["effectiveChildren"]).toBe("2");
     expect(readAra(deps).phase).not.toBe("collecting_ages");
   });
@@ -2221,6 +2225,28 @@ describe("collecting_ages handler", () => {
   }
 
   /**
+   * One age reply, then a confirming "1" if the node read the ages back.
+   * Uncertain paths (AI-parsed, or sliced by "over") now cost one extra turn;
+   * these tests care about the ages that finally reach allocation. The turn
+   * itself is the subject of CA21+.
+   */
+  async function runAgeReplyConfirmed(
+    input: string,
+    children: number,
+    ai?: (reply: string, childrenCount: number) => Promise<number[] | null>,
+  ) {
+    const r = await runAgeReply(input, children, ai);
+    const state = r.deps.flowData.flowVars["__araState__"];
+    if (state && (JSON.parse(state) as AraState).phase === "confirming_ages") {
+      (r.deps as { input: string }).input = "1";
+      await handleAdvancedRoomAllocation(r.deps);
+      const raw = r.deps.flowData.flowVars["effectiveChildrenAges"];
+      return { ...r, ages: raw ? (JSON.parse(raw) as number[]) : null, echoed: true };
+    }
+    return { ...r, echoed: false };
+  }
+
+  /**
    * Stand-in for the real AI parser: uses the childrenCount context exactly as
    * the prompt instructs — discard a number that merely restates the count, then
    * repeat the remaining age once per child.
@@ -2232,24 +2258,24 @@ describe("collecting_ages handler", () => {
   };
 
   it("CA8: 'all 5' for 3 children → [5,5,5] via the AI, which gets the count", async () => {
-    const { ages, extractChildrenAges } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+    const { ages, extractChildrenAges } = await runAgeReplyConfirmed("all 5", 3, aiExpandsQuantifier);
     expect(extractChildrenAges).toHaveBeenCalledWith("all 5", 3);
     expect(ages).toEqual([5, 5, 5]);
   });
 
   it("CA9: 'everyone is 5' for 3 children → [5,5,5]", async () => {
-    const { ages, extractChildrenAges } = await runAgeReply("everyone is 5", 3, aiExpandsQuantifier);
+    const { ages, extractChildrenAges } = await runAgeReplyConfirmed("everyone is 5", 3, aiExpandsQuantifier);
     expect(extractChildrenAges).toHaveBeenCalledTimes(1);
     expect(ages).toEqual([5, 5, 5]);
   });
 
   it("CA10: 'each is 5' for 3 children → [5,5,5]", async () => {
-    const { ages } = await runAgeReply("each is 5", 3, aiExpandsQuantifier);
+    const { ages } = await runAgeReplyConfirmed("each is 5", 3, aiExpandsQuantifier);
     expect(ages).toEqual([5, 5, 5]);
   });
 
   it("CA11: 'all 3 are 5' → [5,5,5]; the 3 is a count, never an age", async () => {
-    const { ages } = await runAgeReply("all 3 are 5", 3, aiExpandsQuantifier);
+    const { ages } = await runAgeReplyConfirmed("all 3 are 5", 3, aiExpandsQuantifier);
     expect(ages).toEqual([5, 5, 5]);
     expect(ages).not.toEqual([3, 5, 0]);   // what the regex gate produced
   });
@@ -2262,7 +2288,7 @@ describe("collecting_ages handler", () => {
 
   it("CA13: 'we have 2 rooms, kids are 5 and 8' → [5,8], not the regex's [2,5]", async () => {
     const ai = async () => [5, 8];
-    const { ages, extractChildrenAges } = await runAgeReply("we have 2 rooms, kids are 5 and 8", 2, ai);
+    const { ages, extractChildrenAges } = await runAgeReplyConfirmed("we have 2 rooms, kids are 5 and 8", 2, ai);
     expect(extractChildrenAges).toHaveBeenCalledWith("we have 2 rooms, kids are 5 and 8", 2);
     expect(ages).toEqual([5, 8]);
     expect(ages).not.toEqual([2, 5]);      // the embedded room count as an age
@@ -2270,19 +2296,19 @@ describe("collecting_ages handler", () => {
 
   it("CA14: AI returns null → falls back to the regex result, no throw", async () => {
     const ai = vi.fn(async () => null);
-    const { ages, extractChildrenAges } = await runAgeReply("kids are 5 and 8 years old", 2, ai);
+    const { ages, extractChildrenAges } = await runAgeReplyConfirmed("kids are 5 and 8 years old", 2, ai);
     expect(extractChildrenAges).toHaveBeenCalledTimes(1);
     expect(ages).toEqual([5, 8]);
   });
 
   it("CA15: AI throws → falls back to the regex result, no throw", async () => {
     const ai = async () => { throw new Error("provider down"); };
-    const { ages } = await runAgeReply("kids are 5 and 8 years old", 2, ai);
+    const { ages } = await runAgeReplyConfirmed("kids are 5 and 8 years old", 2, ai);
     expect(ages).toEqual([5, 8]);
   });
 
   it("CA16: no AI dep → unchanged regex behaviour (documented fallback)", async () => {
-    const { ages } = await runAgeReply("we have 2 rooms, kids are 5 and 8", 2);
+    const { ages } = await runAgeReplyConfirmed("we have 2 rooms, kids are 5 and 8", 2);
     expect(ages).toEqual([2, 5]);          // regex-only: the room count leaks in
   });
 
@@ -2315,22 +2341,132 @@ describe("collecting_ages handler", () => {
 
   it("CA19: 'all 5' for 3 children still completes at [5,5,5]", async () => {
     // The legitimate expansion the prompt must keep — the counterpart to CA17/18.
-    const { ages } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+    const { ages } = await runAgeReplyConfirmed("all 5", 3, aiExpandsQuantifier);
     expect(ages).toEqual([5, 5, 5]);
   });
 
-  // ⚠ KNOWN GAP — pins current behaviour, not desired behaviour.
-  // A padded array is indistinguishable from a legitimately expanded one at this
-  // boundary: the dep returns number[] with no provenance, so [5,8,8] from
-  // "my kids are 5 and 8" and [5,5,5] from "all 5" are the same shape. The node
-  // therefore accepts the padding and proceeds. Mitigation is prompt-side only;
-  // closing it needs the dep to carry how each age was derived. If that lands,
-  // this test SHOULD fail — rewrite it then, don't delete it.
-  it("CA20: a padded AI response reaches 'complete' unchallenged (known gap)", async () => {
+  // The padding gap is still undetectable at this boundary — number[] carries no
+  // provenance, so [5,8,8] and a legitimate [5,5,5] are the same shape. What
+  // changed is that it no longer reaches allocation unseen: the guest is shown
+  // the ages and can reject them. Prompt-side mitigation plus a human check.
+  it("CA20: a padded AI response is echoed to the guest, not allocated", async () => {
     const padded = vi.fn(async () => [5, 8, 8]);   // third age was never stated
     const { ages, deps } = await runAgeReply("my kids are 5 and 8", 3, padded);
-    expect(ages).toEqual([5, 8, 8]);                            // fabricated 8 accepted
-    expect(readAra(deps).phase).not.toBe("collecting_ages");    // proceeded to allocate
+    expect(ages).toBeNull();                                    // did NOT allocate
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("confirming_ages");
+    expect(ara.ageConfirm!.ages).toEqual([5, 8, 8]);            // shown as-is
+  });
+
+  // ── Read-back sub-phase ─────────────────────────────────────────────────────
+
+  it("CA21: bare list at exactly childrenCount → allocates in one turn, no echo", async () => {
+    const { ages, deps, echoed } = await runAgeReplyConfirmed("5, 8 and 12", 3, aiExpandsQuantifier);
+    expect(echoed).toBe(false);                                 // no extra turn
+    expect(readAra(deps).phase).not.toBe("confirming_ages");
+    expect(ages).toEqual([5, 8, 12]);
+  });
+
+  it("CA22: an AI-parsed result is echoed with the ages before allocating", async () => {
+    const { deps } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("confirming_ages");
+    expect(ara.ageConfirm).toEqual({ ages: [5, 5, 5], corrections: 0 });
+    expect(deps.flowData.flowVars["effectiveChildrenAges"]).toBeUndefined();
+  });
+
+  it("CA23: an 'over' result is echoed even on the bare-list path", async () => {
+    // Bare list, no AI — but accumulateAges sliced the 15 off, so what we would
+    // allocate with is not what the guest typed.
+    const { deps, extractChildrenAges } = await runAgeReply("5, 8, 12, 15", 3, aiExpandsQuantifier);
+    expect(extractChildrenAges).not.toHaveBeenCalled();
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("confirming_ages");
+    expect(ara.ageConfirm!.ages).toEqual([5, 8, 12]);           // slice untouched
+  });
+
+  it("CA24: confirming the read-back allocates with exactly those ages", async () => {
+    const { deps } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+    (deps as { input: string }).input = "1";
+    await handleAdvancedRoomAllocation(deps);
+    expect(JSON.parse(deps.flowData.flowVars["effectiveChildrenAges"]!)).toEqual([5, 5, 5]);
+    expect(readAra(deps).phase).not.toBe("confirming_ages");
+  });
+  it("CA25: rejecting re-prompts once, then a second rejection proceeds", async () => {
+    const { deps } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+
+    // First rejection: clears the ages and asks for a plain list.
+    (deps as { input: string }).input = "2";
+    const reprompt = await handleAdvancedRoomAllocation(deps);
+    expect(reprompt).toMatch(/plain list/i);
+    let ara = readAra(deps);
+    expect(ara.phase).toBe("collecting_ages");
+    expect(ara.ageCollection!.collectedAges).toEqual([]);
+    expect(ara.ageConfirm!.corrections).toBe(1);
+
+    // Vague again: echoed again, but the correction budget is already spent.
+    (deps as { input: string }).input = "all 6";
+    await handleAdvancedRoomAllocation(deps);
+    ara = readAra(deps);
+    expect(ara.phase).toBe("confirming_ages");
+    expect(ara.ageConfirm).toEqual({ ages: [6, 6, 6], corrections: 1 });
+
+    // Second rejection must NOT loop: it proceeds with what we have.
+    (deps as { input: string }).input = "2";
+    await handleAdvancedRoomAllocation(deps);
+    expect(JSON.parse(deps.flowData.flowVars["effectiveChildrenAges"]!)).toEqual([6, 6, 6]);
+    expect(readAra(deps).phase).not.toBe("collecting_ages");
+  });
+
+  it("CA26: an unparsed reply re-shows the question without spending the budget", async () => {
+    const { deps } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+    (deps as { input: string }).input = "what time is check in?";
+    const again = await handleAdvancedRoomAllocation(deps);
+    expect(again).toMatch(/just to confirm/i);
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("confirming_ages");
+    expect(ara.ageConfirm!.corrections).toBe(0);
+  });
+
+  it("CA27: old-shape AraState (no aiUsed, no ageConfirm) does not throw", async () => {
+    // Exactly what a session serialised before this sub-phase existed looks like.
+    const legacy = {
+      guests:          { adults: 2, children: 2 },
+      selectedRooms:   [],
+      remainingGuests: { adults: 0, children: 0 },
+      phase:           "collecting_ages",
+      ageCollection:   { adults: 2, children: 2, childrenCount: 2, collectedAges: [], rounds: 0 },
+    };
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(legacy) },
+      rooms: famRoom(),
+      input: "5, 8",
+      childAgeLimit: 12,
+    });
+    await expect(handleAdvancedRoomAllocation(deps)).resolves.not.toThrow();
+    // Bare list at the exact count: proceeds in one turn, as it always did.
+    expect(JSON.parse(deps.flowData.flowVars["effectiveChildrenAges"]!)).toEqual([5, 8]);
+  });
+
+  it("CA28: confirming_ages with no ageConfirm falls back, does not throw", async () => {
+    // Defensive: a truncated blob carrying the new phase but no pending ages.
+    const broken = {
+      guests:          { adults: 2, children: 2 },
+      selectedRooms:   [],
+      remainingGuests: { adults: 0, children: 0 },
+      phase:           "confirming_ages",
+      ageCollection:   { adults: 2, children: 2, childrenCount: 2, collectedAges: [], rounds: 0 },
+    };
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(broken) },
+      rooms: famRoom(),
+      input: "5, 8",
+      childAgeLimit: 12,
+    });
+    await expect(handleAdvancedRoomAllocation(deps)).resolves.not.toThrow();
+    expect(JSON.parse(deps.flowData.flowVars["effectiveChildrenAges"]!)).toEqual([5, 8]);
   });
 });
 
