@@ -770,9 +770,6 @@ export function parseChildrenAges(raw: string): number[] {
 
 // ── Stateful children-age collection (Task 1) ─────────────────────────────────
 
-/** Words that hint at relative ages a plain integer regex would misread. */
-const AGE_TRIGGER_WORDS = /twins|both|eldest|youngest|same age/i;
-
 /** Max age-collection rounds before we give up and fill remaining slots with 0. */
 export const MAX_AGE_ROUNDS = 3;
 
@@ -786,12 +783,32 @@ export function extractAgesRegex(reply: string): number[] {
 }
 
 /**
- * Whether the AI fallback should be consulted for this reply: only when the
- * regex found NO digits at all, OR the reply uses relative-age words
- * ("twins", "both", "eldest", "youngest", "same age") that the regex misreads.
+ * Separators a guest puts between bare ages: commas, ampersands, hyphens/dashes,
+ * and the word "and". Deliberately short — anything not listed here makes the
+ * reply non-bare, which routes it to the AI rather than to a guess.
  */
-export function needsAiAgeParse(reply: string): boolean {
-  return extractAgesRegex(reply).length === 0 || AGE_TRIGGER_WORDS.test(reply);
+const AGE_LIST_SEPARATORS = /\band\b|[,&]|[-–—]/gi;
+
+/**
+ * True when the reply is an UNAMBIGUOUS bare list of ages: after stripping
+ * whitespace and the separators above, nothing but digit-runs remains
+ * ("5", "5, 8 and 12", "5-8-12").
+ *
+ * This is the ONLY shape the integer regex may be trusted on, and it replaces
+ * the old `needsAiAgeParse` word-list gate. That gate asked the opposite
+ * question — "does this reply look ambiguous?" — so it could only ever
+ * recognise ambiguity it had been told about in advance. A quantifier reply
+ * like "all 5" contains one digit and none of the listed words, so the regex
+ * answer [5] was taken as final and the AI was never consulted: the shape that
+ * most needed semantic parsing was the shape that could not reach the parser.
+ * Inverting the gate into an allowlist of provably-safe shapes means every
+ * other shape — quantifiers, prose, embedded counts, stray numbers — routes to
+ * the AI by default, and new phrasings need no new words here.
+ */
+export function isBareAgeList(reply: string): boolean {
+  const stripped = reply.replace(AGE_LIST_SEPARATORS, " ").trim();
+  if (stripped === "") return false;
+  return /^\d+(?:\s+\d+)*$/.test(stripped);
 }
 
 export type AgeAccumulation = {
@@ -1313,9 +1330,12 @@ export type AdvancedRoomAllocationDeps = {
   // strictly older than this is reclassified as an adult before allocation.
   // Absent → no reclassification (back-compat; everyone stays as collected).
   childAgeLimit?: number;
-  // OPTIONAL — AI fallback for ambiguous age replies ("the twins are 8"). Returns
-  // ages or null on any failure. Absent → regex-only collection.
-  extractChildrenAges?: (reply: string) => Promise<number[] | null>;
+  // OPTIONAL — AI parser for every age reply that is not a bare list of digits
+  // ("all 5", "the twins are 8", "all 3 are 5"). `childrenCount` is how many ages
+  // are expected, passed as context so a quantifier reply can be expanded to one
+  // age per child. Returns ages or null on any failure. Absent → regex-only
+  // collection (the pre-existing behaviour).
+  extractChildrenAges?: (reply: string, childrenCount: number) => Promise<number[] | null>;
   // OPTIONAL — sends the occupancy-summary text before the carousel when children
   // are promoted to adults. Absent → notice is skipped silently.
   sendOccupancyNotice?: (args: { hotelId: string; guestId: string; text: string }) => Promise<void>;
@@ -1779,8 +1799,9 @@ async function generateAndSendPlans(
 
 /**
  * Stateful children-age collection handler (Task 1). One call per guest reply.
- * Parses regex-first, consults the AI fallback only for empty/ambiguous input,
- * accumulates across rounds, guards against non-age messages, and on completion
+ * Trusts the integer regex only for a bare list of ages and routes every other
+ * shape to the AI parser (see isBareAgeList), accumulates across rounds,
+ * guards against non-age messages, and on completion
  * (or after MAX_AGE_ROUNDS, filling the rest with 0) hands off to
  * reclassifyAndProceed. Stays in "collecting_ages" until done.
  */
@@ -1798,14 +1819,16 @@ async function handleAgeCollection(deps: AdvancedRoomAllocationDeps, state: AraS
 
   const round = ac.rounds + 1;
 
-  // Step 1 — regex first.
+  // Step 1 — the integer regex. Its result is only authoritative when the reply
+  // is a bare list of ages; otherwise it is a starting point the AI may overrule.
   let extracted = extractAgesRegex(input);
 
-  // Step 2 — AI fallback ONLY when regex is empty or the reply is ambiguous.
-  let aiTried = false;
-  if (deps.extractChildrenAges && needsAiAgeParse(input)) {
-    aiTried = true;
-    const aiAges = await deps.extractChildrenAges(input);
+  // Step 2 — every other shape (quantifiers, prose, embedded counts, stray
+  // numbers) goes to the AI, with the expected child count as context so "all 5"
+  // for 3 children can come back as [5,5,5]. Dep absent, or the AI failing /
+  // returning nothing → keep the regex result, i.e. the pre-existing behaviour.
+  if (!isBareAgeList(input) && deps.extractChildrenAges) {
+    const aiAges = await deps.extractChildrenAges(input, ac.childrenCount);
     if (aiAges && aiAges.length > 0) extracted = aiAges;
   }
 
@@ -1845,7 +1868,6 @@ async function handleAgeCollection(deps: AdvancedRoomAllocationDeps, state: AraS
   writeState(vars, next);
   flowData.waitingFor = "answer";
   await persist(deps);
-  void aiTried; // (kept for clarity; AI use is internal)
   return (
     `Got ${acc.ages.join(", ")} — what's the age of your other ${remaining} ` +
     `${remaining === 1 ? "child" : "children"}?`

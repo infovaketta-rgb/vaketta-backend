@@ -24,7 +24,7 @@ import {
   buildRoomDescriptionsMessage,
   renderPlanTextFallback,
   extractAgesRegex,
-  needsAiAgeParse,
+  isBareAgeList,
   accumulateAges,
   reclassifyGuests,
   buildOccupancyNotice,
@@ -1966,13 +1966,27 @@ describe("children-age parsing helpers", () => {
     expect(extractAgesRegex("no kids")).toEqual([]);
   });
 
-  it("AP2: needsAiAgeParse — false for plain digits, true for empty or relative words", () => {
-    expect(needsAiAgeParse("8, 12 and 5")).toBe(false);     // regex handles it
-    expect(needsAiAgeParse("no idea")).toBe(true);          // no digits
-    expect(needsAiAgeParse("the twins are 8")).toBe(true);  // relative word
-    expect(needsAiAgeParse("both are 6")).toBe(true);
-    expect(needsAiAgeParse("eldest is 12")).toBe(true);
-    expect(needsAiAgeParse("they are the same age, 7")).toBe(true);
+  it("AP2: isBareAgeList — true only for a bare list of ages", () => {
+    // Bare lists — the regex is authoritative, no AI needed.
+    expect(isBareAgeList("8, 12 and 5")).toBe(true);
+    expect(isBareAgeList("13")).toBe(true);
+    expect(isBareAgeList("5 8 12")).toBe(true);
+    expect(isBareAgeList("5-8-12")).toBe(true);
+    expect(isBareAgeList("6 & 9")).toBe(true);
+    // Everything else routes to the AI, including the phrasings the old
+    // AGE_TRIGGER_WORDS list had to enumerate one by one.
+    expect(isBareAgeList("no idea")).toBe(false);           // no digits
+    expect(isBareAgeList("")).toBe(false);                  // empty
+    expect(isBareAgeList("the twins are 8")).toBe(false);
+    expect(isBareAgeList("both are 6")).toBe(false);
+    expect(isBareAgeList("eldest is 12")).toBe(false);
+    expect(isBareAgeList("they are the same age, 7")).toBe(false);
+    // …and the quantifier shapes it never covered.
+    expect(isBareAgeList("all 5")).toBe(false);
+    expect(isBareAgeList("everyone is 5")).toBe(false);
+    expect(isBareAgeList("each is 5")).toBe(false);
+    expect(isBareAgeList("all 3 are 5")).toBe(false);
+    expect(isBareAgeList("we have 2 rooms, kids are 5 and 8")).toBe(false);
   });
 
   it("AP3: accumulateAges — complete / partial / over", () => {
