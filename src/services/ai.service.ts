@@ -699,18 +699,36 @@ export async function interpretAllocationModification(
 
 /**
  * Extract children's ages from a free-text reply when plain integer parsing can't
- * (e.g. "the twins are 8", "both are the same age, 6", "my eldest is 12").
+ * (e.g. "the twins are 8", "all 5", "all 3 are 5", "my eldest is 12").
  * Returns the ages as an array of ints, or null on any error/timeout/parse
  * failure so the caller can fall back to its regex result. Never throws.
+ *
+ * `childrenCount` is how many ages the caller expects. It is what lets a
+ * quantifier reply resolve at all: "all 5" is one age for THREE children, and
+ * without the count there is no way to know how many times to repeat it. It also
+ * tells the model which number is a count rather than an age in "all 3 are 5".
+ * Optional so existing callers (and tests) keep working unchanged.
  *
  * Same cheap/safe shape as classifyBookingIntent: temperature 0, tiny
  * max_tokens, 3 s timeout.
  */
-export async function extractChildrenAgesAI(reply: string): Promise<number[] | null> {
+export async function extractChildrenAgesAI(
+  reply: string,
+  childrenCount?: number,
+): Promise<number[] | null> {
+  const expected =
+    typeof childrenCount === "number" && childrenCount > 0
+      ? `There are exactly ${childrenCount} children, so return exactly ${childrenCount} ages. ` +
+        `If the guest gives one age for all of them ("all 5", "everyone is 5", "each is 5"), ` +
+        `repeat that age ${childrenCount} times. A number that restates how many children ` +
+        `there are ("all 3 are 5") is a COUNT, not an age — do not return it. `
+      : "";
   const system =
     `Extract the ages of children from the guest message as a JSON array of integers. ` +
+    expected +
     `Resolve relative phrasing: "twins"/"both"/"same age" mean two (or more) children share ` +
     `one stated age; "eldest"/"youngest" refer to one child. ` +
+    `Ignore numbers that are not ages (room counts, times, dates, phone numbers). ` +
     `Respond with ONLY a JSON object, no prose, no markdown fences: {"ages": number[]}`;
   const user = `Message: "${reply}"`;
 
