@@ -2193,6 +2193,98 @@ describe("collecting_ages handler", () => {
     expect(sendOccupancyNotice).not.toHaveBeenCalled();
     expect(deps.flowData.flowVars["promotedToAdult"]).toBe("0");
   });
+
+  // ── Gate inversion (isBareAgeList) ──────────────────────────────────────────
+  // The regex is authoritative only for a bare list of ages; every other shape
+  // must reach deps.extractChildrenAges. The quantifier replies below are the
+  // ones the old AGE_TRIGGER_WORDS gate answered wrongly and silently, because
+  // they contain a digit and none of its listed words.
+
+  /** Run one age reply through the handler; returns the ages that came out. */
+  async function runAgeReply(
+    input: string,
+    children: number,
+    ai?: (reply: string, childrenCount: number) => Promise<number[] | null>,
+  ) {
+    const extractChildrenAges = ai ? vi.fn(ai) : undefined;
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(collectState(2, children)) },
+      rooms: famRoom(),
+      input,
+      childAgeLimit: 12,
+      ...(extractChildrenAges ? { extractChildrenAges } : {}),
+    });
+    await handleAdvancedRoomAllocation(deps);
+    const raw = deps.flowData.flowVars["effectiveChildrenAges"];
+    return { ages: raw ? (JSON.parse(raw) as number[]) : null, extractChildrenAges, deps };
+  }
+
+  /**
+   * Stand-in for the real AI parser: uses the childrenCount context exactly as
+   * the prompt instructs — discard a number that merely restates the count, then
+   * repeat the remaining age once per child.
+   */
+  const aiExpandsQuantifier = async (reply: string, childrenCount: number) => {
+    const nums = (reply.match(/\d+/g) ?? []).map(Number).filter((n) => n !== childrenCount);
+    const age  = nums.pop();
+    return age === undefined ? null : (Array(childrenCount).fill(age) as number[]);
+  };
+
+  it("CA8: 'all 5' for 3 children → [5,5,5] via the AI, which gets the count", async () => {
+    const { ages, extractChildrenAges } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+    expect(extractChildrenAges).toHaveBeenCalledWith("all 5", 3);
+    expect(ages).toEqual([5, 5, 5]);
+  });
+
+  it("CA9: 'everyone is 5' for 3 children → [5,5,5]", async () => {
+    const { ages, extractChildrenAges } = await runAgeReply("everyone is 5", 3, aiExpandsQuantifier);
+    expect(extractChildrenAges).toHaveBeenCalledTimes(1);
+    expect(ages).toEqual([5, 5, 5]);
+  });
+
+  it("CA10: 'each is 5' for 3 children → [5,5,5]", async () => {
+    const { ages } = await runAgeReply("each is 5", 3, aiExpandsQuantifier);
+    expect(ages).toEqual([5, 5, 5]);
+  });
+
+  it("CA11: 'all 3 are 5' → [5,5,5]; the 3 is a count, never an age", async () => {
+    const { ages } = await runAgeReply("all 3 are 5", 3, aiExpandsQuantifier);
+    expect(ages).toEqual([5, 5, 5]);
+    expect(ages).not.toEqual([3, 5, 0]);   // what the regex gate produced
+  });
+
+  it("CA12: '5, 8 and 12' is a bare list → regex only, no AI call", async () => {
+    const { ages, extractChildrenAges } = await runAgeReply("5, 8 and 12", 3, aiExpandsQuantifier);
+    expect(extractChildrenAges).not.toHaveBeenCalled();
+    expect(ages).toEqual([5, 8, 12]);
+  });
+
+  it("CA13: 'we have 2 rooms, kids are 5 and 8' → [5,8], not the regex's [2,5]", async () => {
+    const ai = async () => [5, 8];
+    const { ages, extractChildrenAges } = await runAgeReply("we have 2 rooms, kids are 5 and 8", 2, ai);
+    expect(extractChildrenAges).toHaveBeenCalledWith("we have 2 rooms, kids are 5 and 8", 2);
+    expect(ages).toEqual([5, 8]);
+    expect(ages).not.toEqual([2, 5]);      // the embedded room count as an age
+  });
+
+  it("CA14: AI returns null → falls back to the regex result, no throw", async () => {
+    const ai = vi.fn(async () => null);
+    const { ages, extractChildrenAges } = await runAgeReply("kids are 5 and 8 years old", 2, ai);
+    expect(extractChildrenAges).toHaveBeenCalledTimes(1);
+    expect(ages).toEqual([5, 8]);
+  });
+
+  it("CA15: AI throws → falls back to the regex result, no throw", async () => {
+    const ai = async () => { throw new Error("provider down"); };
+    const { ages } = await runAgeReply("kids are 5 and 8 years old", 2, ai);
+    expect(ages).toEqual([5, 8]);
+  });
+
+  it("CA16: no AI dep → unchanged regex behaviour (documented fallback)", async () => {
+    const { ages } = await runAgeReply("we have 2 rooms, kids are 5 and 8", 2);
+    expect(ages).toEqual([2, 5]);          // regex-only: the room count leaks in
+  });
 });
 
 // ── Piece 2B: generateSmartPlans (pure — no DB, no Redis) ─────────────────────
