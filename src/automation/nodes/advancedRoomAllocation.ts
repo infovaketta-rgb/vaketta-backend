@@ -43,7 +43,7 @@ export type AraState = {
   guests:          { adults: number; children: number; childrenAges?: number[] };
   selectedRooms:   AllocationRoom[];
   remainingGuests: { adults: number; children: number };
-  phase:           "collecting_ages" | "collecting_room_preference" | "confirm" | "manual" | "room_menu" | "move_from_count" | "move_to_room" | "change_type_select" | "plan_selection";
+  phase:           "collecting_ages" | "confirming_ages" | "collecting_room_preference" | "confirm" | "manual" | "room_menu" | "move_from_count" | "move_to_room" | "change_type_select" | "plan_selection";
   // Structured-modify navigation (all optional — older state shapes stay valid):
   selectedRoomIndex?: number; // which room the guest is editing (room_menu / move_*)
   pendingMove?: { fromRoomIndex: number; adults: number; children: number };
@@ -58,6 +58,17 @@ export type AraState = {
     childrenCount: number;   // how many ages we still need (== children)
     collectedAges: number[]; // ages gathered so far across rounds
     rounds:        number;   // accumulation rounds used (each guest reply counts as one)
+    // Sticky across rounds: at least one reply was parsed by the AI rather than
+    // read off a bare digit list, so the final set is not a literal transcription
+    // and gets read back to the guest. Optional — absent on pre-existing sessions.
+    aiUsed?:       boolean;
+  };
+  // Age read-back (present during "confirming_ages"). `ages` is what we are about
+  // to allocate with; `corrections` counts rejections already spent, capped at
+  // MAX_AGE_CORRECTIONS so reject → re-prompt cannot loop.
+  ageConfirm?: {
+    ages:        number[];
+    corrections: number;
   };
   // ── Room-preference collection (Piece 2A). Present during
   // "collecting_room_preference"; carries the inputs needed to generate plans
@@ -772,6 +783,26 @@ export function parseChildrenAges(raw: string): number[] {
 
 /** Max age-collection rounds before we give up and fill remaining slots with 0. */
 export const MAX_AGE_ROUNDS = 3;
+
+/**
+ * How many times the guest may reject the age read-back and re-enter the ages.
+ * One. A second rejection proceeds with what we have, so reject → re-prompt can
+ * never become a loop the guest cannot leave.
+ */
+export const MAX_AGE_CORRECTIONS = 1;
+
+/**
+ * Read-back text for the collected ages. Pure and exported for testing.
+ */
+export function renderAgeConfirmation(ages: number[]): string {
+  const subject = ages.length === 1 ? "your child is" : `your ${ages.length} children are`;
+  return `Just to confirm — ${subject} aged *${formatAges(ages)}*.`;
+}
+
+/** Footer used when no interactive button sender is injected. */
+function ageConfirmFooter(): string {
+  return "Reply *1* if that's right\nReply *2* to correct the ages\nReply *MENU* to cancel";
+}
 
 /**
  * Step 1 of parsing — pull every integer in the child range 0–17 from a reply,
@@ -1827,7 +1858,11 @@ async function handleAgeCollection(deps: AdvancedRoomAllocationDeps, state: AraS
   // numbers) goes to the AI, with the expected child count as context so "all 5"
   // for 3 children can come back as [5,5,5]. Dep absent, or the AI failing /
   // returning nothing → keep the regex result, i.e. the pre-existing behaviour.
-  if (!isBareAgeList(input) && deps.extractChildrenAges) {
+  // A non-bare reply is an uncertain reply whatever happens next: either the AI
+  // interpreted it, or the AI declined and the raw regex result stands on text
+  // it was never trusted to read. Both get read back before allocating.
+  const aiPath = !isBareAgeList(input);
+  if (aiPath && deps.extractChildrenAges) {
     try {
       const aiAges = await deps.extractChildrenAges(input, ac.childrenCount);
       if (aiAges && aiAges.length > 0) extracted = aiAges;
@@ -1842,7 +1877,7 @@ async function handleAgeCollection(deps: AdvancedRoomAllocationDeps, state: AraS
   if (extracted.length === 0) {
     const exhausted = round >= MAX_AGE_ROUNDS;
     if (!exhausted) {
-      const next: AraState = { ...state, ageCollection: { ...ac, rounds: round } };
+      const next: AraState = { ...state, ageCollection: { ...ac, rounds: round, aiUsed: ac.aiUsed || aiPath } };
       writeState(vars, next);
       flowData.waitingFor = "answer";
       await persist(deps);
@@ -1855,7 +1890,17 @@ async function handleAgeCollection(deps: AdvancedRoomAllocationDeps, state: AraS
   const acc = accumulateAges(ac.collectedAges, extracted, ac.childrenCount);
 
   if (acc.status === "complete" || acc.status === "over") {
-    return finishAgeCollection(deps, ac, acc.ages);
+    // Read the ages back only when the result is UNCERTAIN — i.e. it is not a
+    // literal transcription of what the guest typed:
+    //   • the reply went down the AI path (this round or an earlier one), so the
+    //     ages were interpreted, padded, or degraded to the regex on failure; or
+    //   • "over" — accumulateAges sliced the tail off, so some number the guest
+    //     typed is not in the set we are about to allocate with.
+    // A bare list that lands exactly on childrenCount is what the guest wrote,
+    // digit for digit, and proceeds with no extra turn exactly as before.
+    const uncertain = aiPath || ac.aiUsed === true || acc.status === "over";
+    if (!uncertain) return finishAgeCollection(deps, ac, acc.ages);
+    return askAgeConfirmation(deps, state, ac, acc.ages);
   }
 
   // status === "partial"
@@ -1869,7 +1914,10 @@ async function handleAgeCollection(deps: AdvancedRoomAllocationDeps, state: AraS
 
   // Ask for the remaining ages, staying in the collection phase.
   const remaining = ac.childrenCount - acc.ages.length;
-  const next: AraState = { ...state, ageCollection: { ...ac, collectedAges: acc.ages, rounds: round } };
+  const next: AraState = {
+    ...state,
+    ageCollection: { ...ac, collectedAges: acc.ages, rounds: round, aiUsed: ac.aiUsed || aiPath },
+  };
   writeState(vars, next);
   flowData.waitingFor = "answer";
   await persist(deps);
@@ -1877,6 +1925,106 @@ async function handleAgeCollection(deps: AdvancedRoomAllocationDeps, state: AraS
     `Got ${acc.ages.join(", ")} — what's the age of your other ${remaining} ` +
     `${remaining === 1 ? "child" : "children"}?`
   );
+}
+
+/** Guest said the read-back ages are right. Reuses the confirm-step matchers. */
+function isAgeConfirmInput(raw: string): boolean {
+  const l = raw.trim().toLowerCase();
+  return isConfirmInput(raw) || l === "yes" || l === "y";
+}
+
+/** Guest said they are wrong and wants to re-enter them. */
+function isAgeRejectInput(raw: string): boolean {
+  const l = raw.trim().toLowerCase();
+  return isModifyInput(raw) || l === "no" || l === "n";
+}
+
+/**
+ * Read the collected ages back and wait for a yes/no. Enters "confirming_ages"
+ * carrying the exact ages we would otherwise have allocated with, so confirming
+ * costs nothing but a turn and rejecting cannot lose them.
+ *
+ * Reuses the existing sendConfirmButtons dep (the same 3-button sender the
+ * allocation summary uses) — no new messaging path. Absent → plain text.
+ */
+async function askAgeConfirmation(
+  deps:  AdvancedRoomAllocationDeps,
+  state: AraState,
+  ac:    NonNullable<AraState["ageCollection"]>,
+  ages:  number[],
+): Promise<string | null> {
+  const { hotelId, guestId, flowData } = deps;
+  const vars = flowData.flowVars;
+
+  const next: AraState = {
+    ...state,
+    phase:         "confirming_ages",
+    ageCollection: { ...ac, collectedAges: ages },
+    ageConfirm:    { ages, corrections: state.ageConfirm?.corrections ?? 0 },
+  };
+  writeState(vars, next);
+  flowData.waitingFor = "answer";
+  await persist(deps);
+
+  const bodyText = renderAgeConfirmation(ages);
+  if (deps.sendConfirmButtons) {
+    const sent = await deps.sendConfirmButtons({ hotelId, guestId, bodyText });
+    if (sent) return "ALREADY_SENT";
+  }
+  return `${bodyText}\n\n${ageConfirmFooter()}`;
+}
+
+/**
+ * One guest reply to the age read-back. Confirm → allocate with exactly those
+ * ages. Reject → clear them and ask for a plain list, ONCE; a second rejection
+ * proceeds with what we have, so this can never become a loop.
+ */
+async function handleAgeConfirmation(
+  deps:  AdvancedRoomAllocationDeps,
+  state: AraState,
+): Promise<string | null> {
+  const { input, flowData } = deps;
+  const vars = flowData.flowVars;
+  const ac      = state.ageCollection;
+  const pending = state.ageConfirm;
+
+  // Sessions serialised before this sub-phase existed (or a truncated blob) have
+  // no ages to confirm. Don't throw and don't invent an answer — hand the turn
+  // back to the collection handler, which is exactly where such a state was
+  // headed before this phase existed.
+  if (!ac || !pending) {
+    const back: AraState = { ...state, phase: "collecting_ages" };
+    writeState(vars, back);
+    return handleAgeCollection(deps, back);
+  }
+
+  if (isAgeConfirmInput(input)) {
+    return finishAgeCollection(deps, ac, pending.ages);
+  }
+
+  if (isAgeRejectInput(input)) {
+    // Budget spent — proceed with what we have rather than asking again. This is
+    // the pre-echo behaviour, so the worst case is exactly the old worst case.
+    if (pending.corrections >= MAX_AGE_CORRECTIONS) {
+      return finishAgeCollection(deps, ac, pending.ages);
+    }
+    const next: AraState = {
+      ...state,
+      phase:         "collecting_ages",
+      ageCollection: { ...ac, collectedAges: [], aiUsed: false },
+      ageConfirm:    { ages: pending.ages, corrections: pending.corrections + 1 },
+    };
+    writeState(vars, next);
+    flowData.waitingFor = "answer";
+    await persist(deps);
+    return "No problem — please send the ages as a plain list, oldest first, e.g. *12, 8, 5* 👶";
+  }
+
+  // Anything else: re-show the question. Does not spend the correction budget
+  // and does not advance — an unparsed reply is not a rejection.
+  flowData.waitingFor = "answer";
+  await persist(deps);
+  return `${renderAgeConfirmation(pending.ages)}\n\n${ageConfirmFooter()}`;
 }
 
 /**
@@ -2180,6 +2328,14 @@ export async function handleAdvancedRoomAllocation(deps: AdvancedRoomAllocationD
   // (MENU is already handled globally above.)
   if (state.phase === "collecting_ages") {
     return handleAgeCollection(deps, state);
+  }
+
+  // ── Age read-back sub-phase ────────────────────────────────────────────────
+  // Only reached when the collected ages were uncertain (AI-parsed or sliced).
+  // An older serialised state can never carry this phase, so nothing in flight
+  // changes behaviour. (MENU handled globally above.)
+  if (state.phase === "confirming_ages") {
+    return handleAgeConfirmation(deps, state);
   }
 
   // ── Room-preference collection sub-phase (Piece 2A) ────────────────────────
