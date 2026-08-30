@@ -1828,8 +1828,13 @@ async function handleAgeCollection(deps: AdvancedRoomAllocationDeps, state: AraS
   // for 3 children can come back as [5,5,5]. Dep absent, or the AI failing /
   // returning nothing → keep the regex result, i.e. the pre-existing behaviour.
   if (!isBareAgeList(input) && deps.extractChildrenAges) {
-    const aiAges = await deps.extractChildrenAges(input, ac.childrenCount);
-    if (aiAges && aiAges.length > 0) extracted = aiAges;
+    try {
+      const aiAges = await deps.extractChildrenAges(input, ac.childrenCount);
+      if (aiAges && aiAges.length > 0) extracted = aiAges;
+    } catch {
+      // The injected parser is contractually non-throwing, but a dead AI
+      // provider must degrade to the regex result — never take down a booking.
+    }
   }
 
   // Step 4 — non-age message guard: nothing parsed AND no age words → re-prompt,
