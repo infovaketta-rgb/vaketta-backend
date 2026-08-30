@@ -773,7 +773,11 @@ export async function extractChildrenAgesAI(
   const maxTokens = ageExtractionMaxTokens(childrenCount);
   const timeout   = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000));
 
-  let raw: string | null = null;
+  // Both providers' stop reasons are kept alongside the text: a truncated reply
+  // still parses as far as it got, and returning those partial ages is silent
+  // data loss (fewer ages than children, no error anywhere). See below.
+  type AgeCall = { text: string | null; truncated: boolean };
+  let result: AgeCall | null = null;
 
   try {
     if (provider === "openai") {
@@ -784,8 +788,11 @@ export async function extractChildrenAgesAI(
         max_tokens:  maxTokens,
         temperature: 0,
         messages:    [{ role: "system", content: system }, { role: "user", content: user }],
-      }).then((r) => r.choices[0]?.message?.content?.trim() ?? null);
-      raw = await Promise.race([call, timeout]);
+      }).then((r): AgeCall => ({
+        text:      r.choices[0]?.message?.content?.trim() ?? null,
+        truncated: r.choices[0]?.finish_reason === "length",
+      }));
+      result = await Promise.race([call, timeout]);
     } else {
       const client = getAnthropicClient();
       if (!client) return null;
@@ -794,14 +801,32 @@ export async function extractChildrenAgesAI(
         max_tokens: maxTokens,
         system,
         messages:   [{ role: "user", content: user }],
-      }).then((r) => (r.content[0]?.type === "text" ? r.content[0].text.trim() : null));
-      raw = await Promise.race([call, timeout]);
+      }).then((r): AgeCall => ({
+        text:      r.content[0]?.type === "text" ? r.content[0].text.trim() : null,
+        truncated: r.stop_reason === "max_tokens",
+      }));
+      result = await Promise.race([call, timeout]);
     }
   } catch (err) {
     log.warn({ err }, "extractChildrenAgesAI: API call failed");
     return null;
   }
 
+  if (!result) return null;  // timed out
+
+  // Hit the token limit → the ages array is incomplete. Parsing it anyway would
+  // hand the caller fewer ages than the guest has children, and the caller has
+  // no way to tell that from a genuine answer — which is how the old flat budget
+  // stayed invisible. Fail loudly and let the regex fallback take over instead.
+  if (result.truncated) {
+    log.error(
+      { err: new Error("max_tokens reached"), childrenCount, maxTokens },
+      "extractChildrenAgesAI: response truncated at the token limit — discarding partial ages",
+    );
+    return null;
+  }
+
+  const raw = result.text;
   if (!raw) return null;
 
   const match = raw.match(/\{[\s\S]*\}/);
