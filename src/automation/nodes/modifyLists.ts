@@ -23,6 +23,7 @@ import type {
   AraState,
   RoomConfigResolver,
 } from "./advancedRoomAllocation";
+import type { RoomAction } from "./ara/types";
 
 const log = logger.child({ service: "modify-lists" });
 
@@ -52,7 +53,10 @@ export const ADD_ROOM_PREFIX = "ADD_ROOM_";
 
 // ── Pure builders (exported for tests) ───────────────────────────────────────
 
-export type RoomAction = "add_bed" | "remove_bed" | "move_guest" | "change_type" | "remove_room";
+// Canonical definition lives in ara/types.ts; imported for local use and
+// re-exported so existing importers of this module keep working and the two can
+// never drift apart.
+export type { RoomAction };
 
 const ACTION_LABELS: Record<RoomAction, string> = {
   add_bed:     "Add extra bed",
