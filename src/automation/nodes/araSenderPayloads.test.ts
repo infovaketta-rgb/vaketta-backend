@@ -16,6 +16,8 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
   CAROUSEL_DESC_MAX, CAROUSEL_MAX_CARDS,
@@ -23,7 +25,7 @@ import {
   buildRoomTypeCards, buildRoomTypeCarouselPayload,
 } from "./araSenderPayloads";
 import {
-  DEFAULT_RESOLVED, fillKey, resolveAraCopy,
+  DEFAULT_RESOLVED, araOverridesFromBotMessages, fillKey, resolveAraCopy,
   type CopyRejection,
 } from "./ara/copy";
 import type { AllocationRoomInput } from "./ara/types";
@@ -338,5 +340,211 @@ describe("interactive ids are never affected by copy", () => {
     // It is the caller's allocation summary, not a registry key.
     const summary = "🛏 *Suggested Allocation*\n━━━\n*Total: ₹10,000*";
     expect(buildConfirmButtonsPayload(summary).bodyText).toBe(summary);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STAGE 2D — botMessages all the way to the outgoing payload
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// The chain flowRuntime runs once per ARA turn:
+//   hotelCfg.botMessages → araOverridesFromBotMessages → resolveAraCopy → builder
+//
+// Everything here is pure, so the chain is exercised directly. The single line
+// of flowRuntime wiring is verified by source scan at the end of this file —
+// importing flowRuntime would drag in prisma, Redis and ai.service.
+
+/** What flowRuntime does, for one hotel's config row. */
+const copyFor = (botMessages: unknown) =>
+  resolveAraCopy(araOverridesFromBotMessages(botMessages));
+
+describe("2D: botMessages → payload", () => {
+  const carousel = (botMessages: unknown) => buildRoomTypeCarouselPayload({
+    roomInputs: [roomInput()], photoByType: noPhotos, fallbackImage: FALLBACK,
+    copy: copyFor(botMessages),
+  });
+
+  it("no overrides → byte-identical default payloads", () => {
+    for (const botMessages of [undefined, null, {}, { menuGreeting: "Hi there" }, "garbage", []]) {
+      expect(carousel(botMessages), JSON.stringify(botMessages) ?? typeof botMessages).toEqual({
+        kind:     "cards",
+        bodyText: "🏨 *Choose a room type:*",
+        cards: [{
+          imageUrl:    FALLBACK,
+          title:       "Deluxe",
+          price:       7000,
+          description: "Up to 3 adults, 1 children · ₹7,000/night",
+          buttonId:    "room_TYPE:rt_a",
+          buttonLabel: "Choose",
+        }],
+      });
+      expect(buildMixItUpPayload(copyFor(botMessages))).toEqual(buildMixItUpPayload());
+      expect(buildConfirmButtonsPayload("S", copyFor(botMessages)))
+        .toEqual(buildConfirmButtonsPayload("S"));
+    }
+  });
+
+  it("a valid override changes exactly the intended field", () => {
+    const p = carousel({ "ara.flowRuntime.carouselBody": "🏨 *Pick your room:*" });
+    expect(p.bodyText).toBe("🏨 *Pick your room:*");
+    // Nothing else moved.
+    expect(p.cards[0]!.buttonLabel).toBe("Choose");
+    expect(p.cards[0]!.description).toBe("Up to 3 adults, 1 children · ₹7,000/night");
+    expect(p.cards[0]!.buttonId).toBe("room_TYPE:rt_a");
+  });
+
+  it("overrides reach all three senders", () => {
+    const botMessages = {
+      "ara.flowRuntime.carouselButton": "Select",
+      "ara.flowRuntime.mixButton":      "Choose",
+      "ara.confirm.buttonConfirm":      "✅ Yes",
+    };
+    const copy = copyFor(botMessages);
+    expect(copy.rejected).toEqual([]);
+    expect(carousel(botMessages).cards[0]!.buttonLabel).toBe("Select");
+    expect(buildMixItUpPayload(copy).buttonLabel).toBe("Choose");
+    expect(buildConfirmButtonsPayload("S", copy).buttons[0]!.title).toBe("✅ Yes");
+  });
+
+  it("an invalid override falls back to the default in the payload", () => {
+    // Over the 20-char cap on a key sendListMessage passes verbatim.
+    const copy = copyFor({ "ara.flowRuntime.mixButton": "A label far beyond twenty characters" });
+    expect(copy.rejected.map((r) => r.reason)).toEqual(["too-long"]);
+    expect(buildMixItUpPayload(copy).buttonLabel).toBe("Options");
+  });
+
+  it("an unsupported key is ignored and reported", () => {
+    const copy = copyFor({ "ara.flowRuntime.notAThing": "x", "menuFooter": "y" });
+    expect(copy.rejected).toEqual([{ key: "flowRuntime.notAThing", reason: "unknown-key" }]);
+    expect(buildMixItUpPayload(copy)).toEqual(buildMixItUpPayload());
+  });
+
+  it("a protocol-like override can never enter a payload", () => {
+    const copy = copyFor({ "ara.flowRuntime.mixRowTitle": "MIX_IT_UP" });
+    expect(copy.rejected.map((r) => r.reason)).toEqual(["protocol-like"]);
+    const p = buildMixItUpPayload(copy);
+    expect(p.sections[0]!.rows[0]!.title).toBe("Mix it up 🎲");
+    expect(p.sections[0]!.rows[0]!.id).toBe("MIX_IT_UP");
+  });
+
+  it("malformed botMessages never throws and yields defaults", () => {
+    const hostile: unknown[] = [
+      Object.create(null), new Map(), new Date(), 0, NaN, "",
+      { "ara.flowRuntime.mixBody": { nested: true } },
+      { "ara.flowRuntime.mixBody": null },
+      { "ara.flowRuntime.mixBody": ["a"] },
+    ];
+    hostile.forEach((h, i) => {
+      expect(() => copyFor(h), `case ${i}`).not.toThrow();
+      expect(buildMixItUpPayload(copyFor(h)), `case ${i}`).toEqual(buildMixItUpPayload());
+    });
+  });
+
+  it("interactive ids survive every override attempt", () => {
+    const copy = copyFor({
+      "ara.flowRuntime.carouselButton": "Select",
+      "ara.confirm.buttonConfirm":      "✅ Yes",
+      "ara.confirm.buttonModify":       "✏️ Change",
+      "ara.confirm.buttonCancel":       "✖️ Stop",
+    });
+    expect(carousel({ "ara.flowRuntime.carouselButton": "Select" }).cards[0]!.buttonId)
+      .toBe("room_TYPE:rt_a");
+    expect(buildConfirmButtonsPayload("S", copy).buttons.map((b) => b.id))
+      .toEqual(["CONFIRM_BOOKING", "MODIFY_BOOKING", "CANCEL_BOOKING"]);
+  });
+});
+
+describe("2D: multi-tenant payload isolation", () => {
+  it("two hotels in sequence get their own payloads", () => {
+    const a = copyFor({ "ara.flowRuntime.mixButton": "A-label" });
+    const b = copyFor({});
+    const c = copyFor({ "ara.flowRuntime.mixButton": "C-label" });
+
+    expect(buildMixItUpPayload(a).buttonLabel).toBe("A-label");
+    expect(buildMixItUpPayload(b).buttonLabel).toBe("Options");
+    expect(buildMixItUpPayload(c).buttonLabel).toBe("C-label");
+    // A's bundle is untouched by the later resolves.
+    expect(buildMixItUpPayload(a).buttonLabel).toBe("A-label");
+  });
+
+  it("an un-customised hotel is unaffected by a customised one", () => {
+    const customised = copyFor({ "ara.flowRuntime.carouselBody": "CHANGED" });
+    expect(buildRoomTypeCarouselPayload({
+      roomInputs: [roomInput()], photoByType: noPhotos, fallbackImage: FALLBACK, copy: customised,
+    }).bodyText).toBe("CHANGED");
+
+    const plain = copyFor(undefined);
+    expect(plain.copy).toBe(DEFAULT_RESOLVED.copy);
+    expect(buildRoomTypeCarouselPayload({
+      roomInputs: [roomInput()], photoByType: noPhotos, fallbackImage: FALLBACK, copy: plain,
+    }).bodyText).toBe("🏨 *Choose a room type:*");
+  });
+});
+
+describe("2D: the flowRuntime wiring (tenant overrides deferred to 2G)", () => {
+  // flowRuntime imports prisma, queue/redis (which constructs a client at
+  // import) and ai.service, so it is read as TEXT — the technique already used
+  // by ara/purity.test.ts and ara/copy.test.ts.
+  const src = readFileSync(join(__dirname, "..", "flowRuntime.ts"), "utf8");
+
+  // The absence assertions below must be about CODE, not prose: the deferral is
+  // documented at the call site in a comment that necessarily names the symbols
+  // 2G will introduce. Conservative line-based strip — whole-line comments
+  // only, which is exactly where that documentation lives, and a trailing
+  // comment on a code line still leaves its code behind.
+  const code = src.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
+
+  it("does NOT read HotelConfig.botMessages yet", () => {
+    // Stage 2G owns activation. Until then the runtime resolves to the
+    // built-in bundle, so guest output is byte-identical for every hotel and
+    // an `ara.*` key written directly to botMessages has no effect.
+    expect(code).not.toContain("araOverridesFromBotMessages");
+    expect(code.match(/resolveAraCopy\(/g) ?? []).toEqual([]);
+    expect(code).toContain("const araCopy = DEFAULT_RESOLVED;");
+    // And no config fetch was added in anticipation of 2G.
+    expect(code.match(/getHotelConfigCached\(/g) ?? []).toHaveLength(2); // pre-existing: :227 and :562
+  });
+
+  it("binds the default bundle into every copy-bearing sender", () => {
+    // The threading itself is 2C/2D/2E work and stays — only the SOURCE of the
+    // bundle is deferred, so 2G is a one-line change at a single call site.
+    // Three extracted payload builders (2C/2D) + planList and the four
+    // modifyLists senders (2E) = eight.
+    expect(src.match(/copy: araCopy/g) ?? []).toHaveLength(8);
+    for (const sender of [
+      "trySendRoomTypeCarousel", "trySendMixItUpList", "trySendConfirmButtons",
+      "trySendPlanList", "trySendRoomMenuList", "trySendMoveToRoomList",
+      "trySendManualModeList", "trySendChangeRoomTypeList",
+    ]) {
+      const line = src.split("\n").find((l) => l.includes(`${sender}({ ...a,`));
+      expect(line, `${sender} is not bound with copy`).toContain("copy: araCopy");
+    }
+  });
+
+  it("carries no rejection-logging path, because nothing can be refused", () => {
+    // A default is never rejected (the grandfathering rule), so a warn here
+    // would be unreachable code. It lands with the 2G read.
+    expect(code).not.toContain("ARA copy: ignoring invalid botMessages override(s)");
+    expect(code).not.toContain("araCopy.rejected");
+  });
+
+  it("does not thread copy into the Stage 2F modules", () => {
+    // Scope guard, moved forward by 2E: planList and modifyLists are now
+    // threaded, but the pure ARA core is not. These senders take the channel
+    // only, so this stage cannot have silently become 2F.
+    for (const sender of ["trySendOccupancyNotice"]) {
+      const line = src.split("\n").find((l) => l.includes(`${sender}({ ...a,`));
+      expect(line, `${sender} binding`).toBeDefined();
+      expect(line, `${sender} should not take copy yet`).not.toContain("copy:");
+    }
+
+    // render.ts / ages.ts / appliers.ts / plans.ts / phases/* / handler.ts own
+    // 79 of the 134 keys and still use their own literals — the registry scan
+    // in ara/copy.test.ts is what proves that, and it would fail here if one
+    // of them were silently converted.
+    const araSrc = ["render", "ages", "appliers", "plans", "handler", "dates", "constants"]
+      .map((m) => readFileSync(join(__dirname, "ara", `${m}.ts`), "utf8"))
+      .join("\n");
+    expect(araSrc).not.toContain("fillKey(");
   });
 });

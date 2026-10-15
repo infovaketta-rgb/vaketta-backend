@@ -37,6 +37,7 @@ import {
   ARA_COPY, DEFAULT_COPY, copyDefault, fill,
   DEFAULT_RESOLVED, HARD_CAP_KEYS, PROTOCOL_LIKE,
   fillKey, resolveAraCopy, staticKeys, validateResolvedCopy,
+  ARA_BOTMESSAGE_PREFIX, araOverridesFromBotMessages,
   type AraCopyOverrides, type CopyRejection,
   type AraCopyKey, type AraCopyOrigin, type AraCopySpec,
 } from "./copy";
@@ -1005,16 +1006,28 @@ function appearsInSource(segment: string, source: string): boolean {
   return normalised.includes(segment) || normalised.includes(escaped);
 }
 
+/**
+ * Origins whose keys are DE-DUPLICATED: the call site reads the registry via
+ * `fillKey`, so the literal exists in NO source file any more and there is
+ * nothing left for a text scan to find. Each is verified by CALL equivalence
+ * instead (strictly stronger than the scan it replaces) plus a structural
+ * assertion below that the key name is looked up in its own module.
+ *
+ *   araSenderPayloads — Stage 2C (13 keys)
+ *   planList, modifyLists — Stage 2E (7 + 20 keys)
+ */
+const DE_DUPLICATED_ORIGINS: readonly AraCopyOrigin[] = [
+  "araSenderPayloads",
+  "planList",
+  "modifyLists",
+];
+
 describe("source equivalence — scan (literals that cannot be invoked)", () => {
   it("every default's literal segments appear in its origin module", () => {
     const problems: string[] = [];
     for (const key of KEYS) {
       if (SCAN_EXEMPT[key]) continue;
-      // Stage 2C: the extracted payload builders read these from the registry
-      // via fillKey, so the literal exists in NO source file any more — the
-      // registry is now the only copy. Verified by call equivalence instead,
-      // in araSenderPayloads.test.ts, and structurally by the case below.
-      if (specOf(key).origin === "araSenderPayloads") continue;
+      if (DE_DUPLICATED_ORIGINS.includes(specOf(key).origin)) continue;
       const s = specOf(key);
       const src = sourceOf(s.origin);
       const segments = literalSegments(s.default);
@@ -1051,6 +1064,59 @@ describe("source equivalence — scan (literals that cannot be invoked)", () => 
     // And the duplication really is gone — the message text is not in there.
     expect(src).not.toContain("Not sure? Let us pick");
     expect(src).not.toContain("Choose a room type");
+  });
+
+  it("planList and modifyLists read every key of theirs FROM the registry (2E)", () => {
+    // Same contract as the builders above: the literal is gone from both files,
+    // so the proof of wiring is that the KEY NAME is looked up there, and the
+    // proof of de-duplication is that the message text is not.
+    for (const origin of ["planList", "modifyLists"] as const) {
+      const src  = sourceOf(origin);
+      const keys = KEYS.filter((k) => specOf(k).origin === origin);
+
+      for (const key of keys) {
+        expect(src, `${key} is never looked up in ${ORIGIN_FILES[origin].join(", ")}`)
+          .toContain(`"${key}"`);
+      }
+
+      // De-duplication, asserted per key rather than by spot-check. Limited to
+      // STATIC defaults of 10+ chars: a shorter or templated default has no run
+      // distinctive enough to search for without colliding with ordinary code —
+      // `lists.changeTypeDesc`'s "available" is a substring of `availableCount`,
+      // and "Plan"/"Confirm" appear in identifiers and comments. The remaining
+      // keys are covered by the key-name presence above plus call equivalence
+      // in planList.test.ts / modifyLists.test.ts.
+      const distinctive = keys.filter((k) => {
+        const d = specOf(k).default;
+        return !d.includes("{{") && d.length >= 10;
+      });
+      for (const key of distinctive) {
+        expect(src.includes(specOf(key).default), `${key} is still hardcoded in ${origin}`)
+          .toBe(false);
+      }
+      expect(distinctive.length, `${origin} has too few checkable statics`)
+        .toBeGreaterThanOrEqual(origin === "planList" ? 6 : 12);
+    }
+
+    expect(KEYS.filter((k) => specOf(k).origin === "planList")).toHaveLength(7);
+    expect(KEYS.filter((k) => specOf(k).origin === "modifyLists")).toHaveLength(20);
+  });
+
+  it("the Stage 2E files hold no ARA copy literal of their own", () => {
+    // Spot-check the strings a reviewer would look for by eye, including the
+    // four footers that were repeated at four call sites each.
+    const planList    = sourceOf("planList");
+    const modifyLists = sourceOf("modifyLists");
+
+    expect(planList).not.toContain("Your Room Options");
+    expect(planList).not.toContain("View Plans");          // both the button and the footer prose
+    expect(planList).not.toContain("Choose a Plan");
+    expect(planList).not.toContain("extra beds included");
+
+    expect(modifyLists).not.toContain("Type 'Hi' to cancel");
+    expect(modifyLists).not.toContain("Go back");
+    expect(modifyLists).not.toContain("Available Room Types");
+    expect(modifyLists).not.toContain("Confirm booking");
   });
 
   it("the carousel card description is still truncated to 60 (F2)", () => {
@@ -1200,5 +1266,151 @@ describe("source equivalence — scan (literals that cannot be invoked)", () => 
     // Guards against a vacuous pass from a broken reader or matcher.
     expect(appearsInSource("a string that is definitely not in the source", sourceOf("render"))).toBe(false);
     expect(sourceOf("render").length).toBeGreaterThan(1000);
+  });
+});
+
+// ── Tenant override extraction from HotelConfig.botMessages (Stage 2D) ───────
+
+describe("araOverridesFromBotMessages", () => {
+  it("keeps only the ara.* namespace and strips the prefix", () => {
+    expect(araOverridesFromBotMessages({
+      "menuGreeting": "Welcome!",
+      "menuFooter": "Bye",
+      "ara.lists.buttonOptions": "Pick",
+      "ara.confirm.footer": "Reply 1",
+    })).toEqual({
+      "lists.buttonOptions": "Pick",
+      "confirm.footer": "Reply 1",
+    });
+  });
+
+  it("cannot be shadowed by an unrelated message template", () => {
+    // The whole point of the prefix: menuGreeting must never become ARA copy,
+    // and an un-prefixed ARA-looking key must not be picked up either.
+    expect(araOverridesFromBotMessages({
+      "menuGreeting": "Welcome!",
+      "lists.buttonOptions": "Unprefixed — must be ignored",
+    })).toEqual({});
+  });
+
+  it("returns {} for every missing or malformed shape", () => {
+    // botMessages is `Json @default("{}")` and the config ROW may be null, so
+    // all of these are reachable in production.
+    for (const input of [undefined, null, {}, "a string", 42, true, [], ["a"], () => 1]) {
+      expect(araOverridesFromBotMessages(input), JSON.stringify(input) ?? typeof input).toEqual({});
+    }
+  });
+
+  it("passes values through untouched for the resolver to judge", () => {
+    // Validation belongs to resolveAraCopy, which reports WHY each refusal
+    // happened; filtering here would discard that diagnostic.
+    expect(araOverridesFromBotMessages({
+      "ara.lists.buttonOptions": 42,
+      "ara.confirm.footer": "",
+      "ara.nope": "x",
+    })).toEqual({
+      "lists.buttonOptions": 42,
+      "confirm.footer": "",
+      "nope": "x",
+    });
+  });
+
+  it("reads own enumerable properties only — no prototype leakage", () => {
+    const hostile = Object.create({ "ara.lists.buttonOptions": "injected" }) as Record<string, unknown>;
+    expect(araOverridesFromBotMessages(hostile)).toEqual({});
+    expect(araOverridesFromBotMessages(Object.create(null))).toEqual({});
+  });
+
+  it("a bare 'ara.' key strips to the empty key and is then rejected", () => {
+    expect(araOverridesFromBotMessages({ "ara.": "x" })).toEqual({ "": "x" });
+    expect(resolveAraCopy(araOverridesFromBotMessages({ "ara.": "x" })).rejected)
+      .toEqual([{ key: "", reason: "unknown-key" }]);
+  });
+
+  it("the prefix is the documented one", () => {
+    expect(ARA_BOTMESSAGE_PREFIX).toBe("ara.");
+  });
+});
+
+describe("botMessages → resolveAraCopy, end to end", () => {
+  const resolveFor = (botMessages: unknown) =>
+    resolveAraCopy(araOverridesFromBotMessages(botMessages));
+
+  it("an un-customised hotel gets DEFAULT_COPY by identity", () => {
+    // The cheap path, and the byte-identity guarantee: no allocation of a new
+    // bundle, so nothing can differ from today's output.
+    for (const botMessages of [undefined, null, {}, { menuGreeting: "Hi" }]) {
+      const r = resolveFor(botMessages);
+      expect(r.copy).toBe(DEFAULT_COPY);
+      expect(r.overridden).toEqual([]);
+      expect(r.rejected).toEqual([]);
+    }
+  });
+
+  it("a valid override applies and the rest stay default", () => {
+    const r = resolveFor({ "ara.lists.buttonOptions": "Pick one" });
+    expect(r.copy["lists.buttonOptions"]).toBe("Pick one");
+    expect(r.overridden).toEqual(["lists.buttonOptions"]);
+    for (const k of KEYS) {
+      if (k !== "lists.buttonOptions") expect(r.copy[k], k).toBe(specOf(k).default);
+    }
+  });
+
+  it("an unsupported or invalid override falls back, with a reason", () => {
+    const r = resolveFor({
+      "ara.lists.buttonOptions": "A label far beyond twenty characters",
+      "ara.not.a.real.key": "x",
+      "ara.confirm.footer": "",
+    });
+    expect(r.copy["lists.buttonOptions"]).toBe(specOf("lists.buttonOptions").default);
+    expect(r.copy["confirm.footer"]).toBe(specOf("confirm.footer").default);
+    expect(r.rejected.map((x) => x.reason).sort()).toEqual(["blank", "too-long", "unknown-key"]);
+  });
+
+  it("malformed botMessages never throws", () => {
+    const hostile: unknown[] = [
+      "", 0, NaN, Symbol("s"), new Map(), new Date(),
+      { "ara.summary.total": { nested: true } },
+      { "ara.summary.total": ["array"] },
+      Object.create(null),
+    ];
+    // Index, not String(h): a null-prototype object cannot convert to a
+    // primitive, which would throw in the LABEL before the code is reached.
+    hostile.forEach((h, i) => expect(() => resolveFor(h), `case ${i}`).not.toThrow());
+  });
+});
+
+describe("multi-tenant isolation", () => {
+  const resolveFor = (botMessages: unknown) =>
+    resolveAraCopy(araOverridesFromBotMessages(botMessages));
+
+  it("one hotel's override never reaches another", () => {
+    const a = resolveFor({ "ara.lists.buttonOptions": "Hotel A label" });
+    const b = resolveFor({});
+    const c = resolveFor({ "ara.lists.buttonOptions": "Hotel C label" });
+
+    expect(a.copy["lists.buttonOptions"]).toBe("Hotel A label");
+    expect(b.copy["lists.buttonOptions"]).toBe("Options");
+    expect(c.copy["lists.buttonOptions"]).toBe("Hotel C label");
+    // A is unchanged after B and C resolved — no shared mutable bundle.
+    expect(a.copy["lists.buttonOptions"]).toBe("Hotel A label");
+  });
+
+  it("the shared DEFAULT_COPY is never mutated by a resolve", () => {
+    // The real leakage risk: if resolveAraCopy wrote into DEFAULT_COPY instead
+    // of spreading, every later tenant would inherit the previous one's copy.
+    const before = DEFAULT_COPY["lists.buttonOptions"];
+    resolveFor({ "ara.lists.buttonOptions": "Mutating?" });
+    expect(DEFAULT_COPY["lists.buttonOptions"]).toBe(before);
+    expect(Object.isFrozen(DEFAULT_COPY)).toBe(true);
+    expect(resolveFor({}).copy).toBe(DEFAULT_COPY);
+  });
+
+  it("resolving is order-independent and repeatable", () => {
+    const once = resolveFor({ "ara.plans.sectionTitle": "Plans" });
+    resolveFor({ "ara.plans.sectionTitle": "Something else entirely" });
+    const again = resolveFor({ "ara.plans.sectionTitle": "Plans" });
+    expect(again.copy).toEqual(once.copy);
+    expect(once.copy["plans.sectionTitle"]).toBe("Plans");
   });
 });

@@ -16,6 +16,7 @@ import { sendOutbound } from "../../services/outbound/outbound.service";
 import { MessageChannel } from "@prisma/client";
 import { logger } from "../../utils/logger";
 import type { AllocationPlan, AllocationRoomInput } from "./advancedRoomAllocation";
+import { DEFAULT_RESOLVED, fillKey, type ResolvedAraCopy } from "./ara/copy";
 
 const log = logger.child({ service: "plan-list" });
 
@@ -26,13 +27,18 @@ const MAX_BODY = 1_024; // Meta interactive-list body limit
  * block intact. Returns an array of strings; the last element is always the
  * chunk that should carry the interactive list button.
  */
-export function chunkPlanDetailText(plans: AllocationPlan[]): string[] {
-  const header = "🏨 *Your Room Options*";
-  const footer = "_Tap *View Plans* to choose_ 👇";
+export function chunkPlanDetailText(
+  plans: AllocationPlan[],
+  copy: ResolvedAraCopy = DEFAULT_RESOLVED,
+): string[] {
+  const header = fillKey(copy, "plans.detailHeader");
+  const footer = fillKey(copy, "plans.detailFooter");
 
   const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
   const planBlocks = plans.map((p, i) => {
-    const beds = p.rooms.some((r) => r.extraBed) ? "extra beds included" : "no extra beds";
+    const beds = p.rooms.some((r) => r.extraBed)
+      ? fillKey(copy, "plans.detailBedsIncluded")
+      : fillKey(copy, "plans.detailBedsNone");
     let block = `*Plan ${i + 1} — ${inr(p.totalPrice)}* _(${p.label})_\n`;
     block += `${p.roomCount} room${p.roomCount === 1 ? "" : "s"} · ${beds}`;
     p.rooms.forEach((r, j) => {
@@ -108,11 +114,16 @@ export function buildPlanDescription(plan: AllocationPlan): string {
  * Detailed plan-comparison text — the LIST message body. Pure — no side effects,
  * no external imports. All ₹ amounts use the Indian locale.
  */
-export function buildPlanDetailText(plans: AllocationPlan[]): string {
+export function buildPlanDetailText(
+  plans: AllocationPlan[],
+  copy: ResolvedAraCopy = DEFAULT_RESOLVED,
+): string {
   const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
 
   const blocks = plans.map((p, i) => {
-    const beds = p.rooms.some((r) => r.extraBed) ? "extra beds included" : "no extra beds";
+    const beds = p.rooms.some((r) => r.extraBed)
+      ? fillKey(copy, "plans.detailBedsIncluded")
+      : fillKey(copy, "plans.detailBedsNone");
     let block = `*Plan ${i + 1} — ${inr(p.totalPrice)}* _(${p.label})_\n`;
     block += `${p.roomCount} room${p.roomCount === 1 ? "" : "s"} · ${beds}`;
     p.rooms.forEach((r, j) => {
@@ -126,7 +137,7 @@ export function buildPlanDetailText(plans: AllocationPlan[]): string {
     return block;
   });
 
-  return `🏨 *Your Room Options*\n\n${blocks.join("\n\n")}\n\n_Tap *View Plans* to choose_ 👇`;
+  return `${fillKey(copy, "plans.detailHeader")}\n\n${blocks.join("\n\n")}\n\n${fillKey(copy, "plans.detailFooter")}`;
 }
 
 /**
@@ -143,8 +154,12 @@ export async function trySendPlanList(args: {
   // Kept for API compatibility (callers still pass it); the plan list no longer
   // renders a per-room-type section now that preference is collected up front.
   eligibleRoomInputs?:  AllocationRoomInput[];
+  // Stage 2E: the resolved copy bundle. Absent (tests, legacy callers) → the
+  // built-in defaults, so output is unchanged.
+  copy?:                ResolvedAraCopy | undefined;
 }): Promise<boolean> {
   const { hotelId, guestId, channel, plans } = args;
+  const copy = args.copy ?? DEFAULT_RESOLVED;
   if (plans.length === 0) return false;
 
   try {
@@ -153,7 +168,11 @@ export async function trySendPlanList(args: {
     // carries no label/rationale (legacy generatePlans output).
     const planRows = plans.map((plan, i) => {
       const inr   = `₹${plan.totalPrice.toLocaleString("en-IN")}`;
-      const title = (plan.label ? `${plan.label} — ${inr}` : `Plan ${i + 1} — ${inr}`).slice(0, 24);
+      // The labelled arm composes a plan's OWN label (from ara/plans.ts) and is
+      // not registry copy; only the legacy fallback has a key.
+      const title = (plan.label
+        ? `${plan.label} — ${inr}`
+        : fillKey(copy, "plans.rowTitleLegacy", { number: i + 1, total: inr })).slice(0, 24);
       return {
         id:          `plan_${i}`,
         title,
@@ -161,11 +180,11 @@ export async function trySendPlanList(args: {
       };
     });
 
-    const sections = [{ title: "Choose a Plan", rows: planRows }];
+    const sections = [{ title: fillKey(copy, "plans.sectionTitle"), rows: planRows }];
 
     // Chunk plan detail text so no single message exceeds MAX_BODY.
     // All chunks except the last are plain text; the last carries the choice UI.
-    const chunks = chunkPlanDetailText(plans);
+    const chunks = chunkPlanDetailText(plans, copy);
     const lastChunk = chunks[chunks.length - 1]!;
 
     // Send any leading plain-text chunks — a chunk failure aborts the whole
@@ -180,7 +199,7 @@ export async function trySendPlanList(args: {
     const res = await sendOutbound({ hotelId, guestId, channel }, {
       kind:        "choice",
       bodyText:    lastChunk,
-      buttonLabel: "View Plans",
+      buttonLabel: fillKey(copy, "plans.buttonLabel"),
       sections,
     });
     return res.sent;

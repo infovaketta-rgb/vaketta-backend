@@ -24,6 +24,7 @@ import type {
   RoomConfigResolver,
 } from "./advancedRoomAllocation";
 import type { RoomAction } from "./ara/types";
+import { DEFAULT_RESOLVED, fillKey, type ResolvedAraCopy } from "./ara/copy";
 
 const log = logger.child({ service: "modify-lists" });
 
@@ -81,6 +82,7 @@ const ACTION_IDS: Record<RoomAction, string> = {
 export function buildRoomMenuSections(
   room:      AllocationRoom,
   options:   RoomAction[],
+  copy:      ResolvedAraCopy = DEFAULT_RESOLVED,
 ): { title: string; rows: Array<{ id: string; title: string; description?: string }> }[] {
   const modRows = options.map((a) => ({
     id:          ACTION_IDS[a],
@@ -88,8 +90,8 @@ export function buildRoomMenuSections(
   }));
 
   return [
-    { title: "Modify Room", rows: modRows },
-    { title: "Navigation",  rows: [{ id: MOD_GO_BACK, title: "↩️ Go back" }] },
+    { title: fillKey(copy, "lists.modifyRoomSection"), rows: modRows },
+    { title: fillKey(copy, "lists.navigationSection"), rows: [{ id: MOD_GO_BACK, title: fillKey(copy, "lists.goBackRow") }] },
   ];
 }
 
@@ -103,6 +105,7 @@ export function buildMoveToRoomSections(
   fromIndex:  number,
   pending:    { adults: number; children: number },
   resolveCfg: RoomConfigResolver,
+  copy:       ResolvedAraCopy = DEFAULT_RESOLVED,
 ): {
   sections: { title: string; rows: Array<{ id: string; title: string; description?: string }> }[];
   destIndices: number[];  // slot n (1-based) → state.selectedRooms[destIndices[n-1]]
@@ -115,7 +118,12 @@ export function buildMoveToRoomSections(
     const slot = destIndices.length + 1;
     const cfg  = resolveCfg(r);
     destIndices.push(i);
-    const desc = `Currently ${r.adults} adults, ${r.children} children (max ${cfg.maxAdults} adults, ${cfg.maxChildren} children)`.slice(0, ROW_DESC_MAX);
+    const desc = fillKey(copy, "lists.moveToRoomDesc", {
+      adults:      r.adults,
+      children:    r.children,
+      maxAdults:   cfg.maxAdults,
+      maxChildren: cfg.maxChildren,
+    }).slice(0, ROW_DESC_MAX);
     rows.push({
       id:          `${MOVE_TO_ROOM_PREFIX}${slot}`,
       title:       r.roomTypeName.slice(0, 24),
@@ -123,12 +131,12 @@ export function buildMoveToRoomSections(
     });
   });
 
-  const navRow = { id: MOVE_GO_BACK, title: "↩️ Go back" };
+  const navRow = { id: MOVE_GO_BACK, title: fillKey(copy, "lists.goBackRow") };
 
   return {
     sections: [
-      { title: "Available Rooms", rows },
-      { title: "Navigation",      rows: [navRow] },
+      { title: fillKey(copy, "lists.availableRoomsSection"), rows },
+      { title: fillKey(copy, "lists.navigationSection"),     rows: [navRow] },
     ],
     destIndices,
   };
@@ -147,31 +155,43 @@ function occupancyLabel(r: AllocationRoom): string {
 export function buildManualModeSections(
   state:   AraState,
   addable: AllocationRoomInput[],
+  copy:    ResolvedAraCopy = DEFAULT_RESOLVED,
 ): { title: string; rows: Array<{ id: string; title: string; description?: string }> }[] {
   const n = state.selectedRooms.length;
 
   const editRows = state.selectedRooms.map((r, i) => ({
     id:          `${EDIT_ROOM_PREFIX}${i + 1}`,
-    title:       `Edit Room ${i + 1}: ${r.roomTypeName}`.slice(0, 24),
-    description: `${occupancyLabel(r)} — ${inr(r.totalPrice)}`.slice(0, ROW_DESC_MAX),
+    title:       fillKey(copy, "lists.editRoomTitle", {
+      roomNumber:   i + 1,
+      roomTypeName: r.roomTypeName,
+    }).slice(0, 24),
+    description: fillKey(copy, "lists.editRoomDesc", {
+      occupancy: occupancyLabel(r),
+      total:     inr(r.totalPrice),
+    }).slice(0, ROW_DESC_MAX),
   }));
 
   const addRows = addable.map((r, i) => ({
     id:          `${ADD_ROOM_PREFIX}${r.roomTypeId}`,
     title:       r.name.slice(0, 24),
-    description: `Fits ${r.maxAdults ?? "?"} adults, ${r.maxChildren ?? "?"} children · ${inr(r.basePrice)}/night · ${r.availableCount} avail`.slice(0, ROW_DESC_MAX),
+    description: fillKey(copy, "lists.addRoomDesc", {
+      maxAdults:   r.maxAdults   ?? "?",
+      maxChildren: r.maxChildren ?? "?",
+      price:       inr(r.basePrice),
+      available:   r.availableCount,
+    }).slice(0, ROW_DESC_MAX),
   }));
 
   const confirmRows = [
-    { id: MODIFY_DONE,    title: "✅ Confirm booking" },
-    { id: MODIFY_GO_BACK, title: "↩️ Go back" },
+    { id: MODIFY_DONE,    title: fillKey(copy, "lists.confirmBookingRow") },
+    { id: MODIFY_GO_BACK, title: fillKey(copy, "lists.goBackRow") },
   ];
 
   const sections: { title: string; rows: Array<{ id: string; title: string; description?: string }> }[] = [];
 
-  if (editRows.length > 0)  sections.push({ title: "Edit Existing Rooms", rows: editRows });
-  if (addRows.length  > 0)  sections.push({ title: "Add a Room",          rows: addRows  });
-  sections.push({ title: "Confirm", rows: confirmRows });
+  if (editRows.length > 0)  sections.push({ title: fillKey(copy, "lists.editExistingSection"), rows: editRows });
+  if (addRows.length  > 0)  sections.push({ title: fillKey(copy, "lists.addRoomSection"),      rows: addRows  });
+  sections.push({ title: fillKey(copy, "lists.confirmSection"), rows: confirmRows });
 
   return sections;
 }
@@ -197,16 +217,18 @@ export async function trySendRoomMenuList(args: {
   room:       AllocationRoom;
   options:    RoomAction[];
   roomIndex:  number;
+  copy?:      ResolvedAraCopy | undefined;
 }): Promise<boolean> {
   const { hotelId, guestId, channel, room, options, roomIndex } = args;
+  const copy = args.copy ?? DEFAULT_RESOLVED;
   try {
     const bodyText = `*Room ${roomIndex + 1}: ${room.roomTypeName}*\n👥 ${occupancyLabel(room)}\n💰 ${inr(room.pricePerNight)}/night\n\nWhat would you like to do?`;
     const res = await sendOutbound({ hotelId, guestId, channel }, {
       kind:        "choice",
       bodyText,
-      buttonLabel: "Options",
-      footerText:  "Type 'Hi' to cancel",
-      sections:    buildRoomMenuSections(room, options),
+      buttonLabel: fillKey(copy, "lists.buttonOptions"),
+      footerText:  fillKey(copy, "lists.cancelFooter"),
+      sections:    buildRoomMenuSections(room, options, copy),
     });
     return res.sent;
   } catch (err) {
@@ -234,10 +256,12 @@ export async function trySendMoveToRoomList(args: {
   fromIndex:  number;
   pending:    { adults: number; children: number };
   resolveCfg: RoomConfigResolver;
+  copy?:      ResolvedAraCopy | undefined;
 }): Promise<{ sent: boolean; destIndices: number[] }> {
   const { hotelId, guestId, channel, state, fromIndex, pending, resolveCfg } = args;
+  const copy = args.copy ?? DEFAULT_RESOLVED;
   try {
-    const { sections, destIndices } = buildMoveToRoomSections(state, fromIndex, pending, resolveCfg);
+    const { sections, destIndices } = buildMoveToRoomSections(state, fromIndex, pending, resolveCfg, copy);
     if (destIndices.length === 0) return { sent: false, destIndices: [] };
 
     const moving: string[] = [];
@@ -247,8 +271,8 @@ export async function trySendMoveToRoomList(args: {
     const res = await sendOutbound({ hotelId, guestId, channel }, {
       kind:        "choice",
       bodyText:    `Move ${moving.join(", ")} to which room?`,
-      buttonLabel: "Choose Room",
-      footerText:  "Type 'Hi' to cancel",
+      buttonLabel: fillKey(copy, "lists.buttonChooseRoom"),
+      footerText:  fillKey(copy, "lists.cancelFooter"),
       sections,
     });
     return { sent: res.sent, destIndices: res.sent ? destIndices : [] };
@@ -279,16 +303,20 @@ export function parseChangeTypeReply(raw: string): string | null {
  */
 export function buildChangeTypeSections(
   candidates: AllocationRoomInput[],
+  copy:       ResolvedAraCopy = DEFAULT_RESOLVED,
 ): { title: string; rows: Array<{ id: string; title: string; description?: string }> }[] {
   const typeRows = candidates.map((r) => ({
     id:          `${CHANGE_TYPE_PREFIX}${r.roomTypeId}`,
     title:       r.name.slice(0, 24),
-    description: `${inr(r.basePrice)}/night · ${r.availableCount} available`.slice(0, ROW_DESC_MAX),
+    description: fillKey(copy, "lists.changeTypeDesc", {
+      price:     inr(r.basePrice),
+      available: r.availableCount,
+    }).slice(0, ROW_DESC_MAX),
   }));
 
   return [
-    { title: "Available Room Types", rows: typeRows },
-    { title: "Navigation",           rows: [{ id: CHANGE_TYPE_GO_BACK, title: "↩️ Go back" }] },
+    { title: fillKey(copy, "lists.availableTypesSection"), rows: typeRows },
+    { title: fillKey(copy, "lists.navigationSection"),     rows: [{ id: CHANGE_TYPE_GO_BACK, title: fillKey(copy, "lists.goBackRow") }] },
   ];
 }
 
@@ -307,15 +335,17 @@ export async function trySendChangeRoomTypeList(args: {
   room:       AllocationRoom;
   roomIndex:  number;
   candidates: AllocationRoomInput[];
+  copy?:      ResolvedAraCopy | undefined;
 }): Promise<boolean> {
   const { hotelId, guestId, channel, roomIndex, candidates } = args;
+  const copy = args.copy ?? DEFAULT_RESOLVED;
   try {
     const res = await sendOutbound({ hotelId, guestId, channel }, {
       kind:        "choice",
-      bodyText:    `Change Room ${roomIndex + 1} to which type?`,
-      buttonLabel: "Choose Type",
-      footerText:  "Type 'Hi' to cancel",
-      sections:    buildChangeTypeSections(candidates),
+      bodyText:    fillKey(copy, "changeType.listBody", { roomNumber: roomIndex + 1 }),
+      buttonLabel: fillKey(copy, "lists.buttonChooseType"),
+      footerText:  fillKey(copy, "lists.cancelFooter"),
+      sections:    buildChangeTypeSections(candidates, copy),
     });
     return res.sent;
   } catch (err) {
@@ -339,8 +369,10 @@ export async function trySendManualModeList(args: {
   channel: MessageChannel;
   state:   AraState;
   addable: AllocationRoomInput[];
+  copy?:   ResolvedAraCopy | undefined;
 }): Promise<boolean> {
   const { hotelId, guestId, channel, state, addable } = args;
+  const copy = args.copy ?? DEFAULT_RESOLVED;
   try {
     const total  = state.selectedRooms.reduce((s, r) => s + r.totalPrice, 0);
     const rooms  = state.selectedRooms;
@@ -353,9 +385,9 @@ export async function trySendManualModeList(args: {
     const res = await sendOutbound({ hotelId, guestId, channel }, {
       kind:        "choice",
       bodyText:    summary,
-      buttonLabel: "Edit Booking",
-      footerText:  "Type 'Hi' to cancel",
-      sections:    buildManualModeSections(state, addable),
+      buttonLabel: fillKey(copy, "lists.buttonEditBooking"),
+      footerText:  fillKey(copy, "lists.cancelFooter"),
+      sections:    buildManualModeSections(state, addable, copy),
     });
     return res.sent;
   } catch (err) {

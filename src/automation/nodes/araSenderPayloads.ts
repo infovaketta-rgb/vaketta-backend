@@ -74,7 +74,7 @@ export function buildRoomTypeCards(args: {
   roomInputs:   AllocationRoomInput[];
   photoByType:  Map<string, string>;
   fallbackImage: string;
-  copy?:        ResolvedAraCopy;
+  copy?:        ResolvedAraCopy | undefined;
   onReject?:    CopyRejectionSink;
 }): OutboundCard[] {
   const { roomInputs, photoByType, fallbackImage } = args;
@@ -111,7 +111,7 @@ export function buildRoomTypeCarouselPayload(args: {
   roomInputs:    AllocationRoomInput[];
   photoByType:   Map<string, string>;
   fallbackImage: string;
-  copy?:         ResolvedAraCopy;
+  copy?:         ResolvedAraCopy | undefined;
   onReject?:     CopyRejectionSink;
 }): Extract<OutboundPayload, { kind: "cards" }> {
   const copy = args.copy ?? DEFAULT_RESOLVED;

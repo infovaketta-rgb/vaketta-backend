@@ -64,6 +64,9 @@ import { trySendPlanList } from "./nodes/planList";
 import {
   buildConfirmButtonsPayload, buildMixItUpPayload, buildRoomTypeCarouselPayload,
 } from "./nodes/araSenderPayloads";
+import {
+  DEFAULT_RESOLVED, type ResolvedAraCopy,
+} from "./nodes/ara/copy";
 import { trySendRoomMenuList, trySendMoveToRoomList, trySendManualModeList, trySendChangeRoomTypeList } from "./nodes/modifyLists";
 import { aggregateRoomQuantities } from "./bookingAllocation";
 import { nightsBetween, exceedsMaxStay, STAY_TOO_LONG_MESSAGE } from "./stayDuration";
@@ -358,7 +361,10 @@ async function trySendOptionsList(args: {
 // plan_selection handler can distinguish it from the show_rooms "room_{id}" buttons.
 
 async function trySendRoomTypeCarousel(
-  args: Parameters<SendRoomCarouselFn>[0] & { channel: MessageChannel },
+  args: Parameters<SendRoomCarouselFn>[0] & {
+    channel: MessageChannel;
+    copy?:   ResolvedAraCopy | undefined;
+  },
 ): Promise<boolean> {
   const { hotelId, guestId, channel, roomInputs, adults } = args;
   try {
@@ -389,6 +395,7 @@ async function trySendRoomTypeCarousel(
       roomInputs:    eligible,
       photoByType,
       fallbackImage: CAROUSEL_FALLBACK_IMAGE,
+      copy:          args.copy,
     });
 
     log.info({ cardsCount: payload.cards.length }, "carousel: cards built");
@@ -417,10 +424,13 @@ async function trySendOccupancyNotice(
 // MIX_IT_UP (the webhook collapses list_reply.id to a text body the ARA handler
 // matches). Returns true if sent. Never throws.
 async function trySendMixItUpList(
-  args: { hotelId: string; guestId: string; channel: MessageChannel },
+  args: {
+    hotelId: string; guestId: string; channel: MessageChannel;
+    copy?:   ResolvedAraCopy | undefined;
+  },
 ): Promise<boolean> {
   const { hotelId, guestId, channel } = args;
-  const res = await sendOutbound({ hotelId, guestId, channel }, buildMixItUpPayload());
+  const res = await sendOutbound({ hotelId, guestId, channel }, buildMixItUpPayload(args.copy));
   return res.sent;
 }
 
@@ -430,10 +440,13 @@ async function trySendMixItUpList(
 // legacy "1"/"2"/"MENU" text replies (the webhook collapses button_reply.id to a
 // text body). Returns true if sent (→ "ALREADY_SENT"). Never throws.
 async function trySendConfirmButtons(
-  args: { hotelId: string; guestId: string; bodyText: string; channel: MessageChannel },
+  args: {
+    hotelId: string; guestId: string; bodyText: string; channel: MessageChannel;
+    copy?:   ResolvedAraCopy | undefined;
+  },
 ): Promise<boolean> {
   const { hotelId, guestId, bodyText, channel } = args;
-  const res = await sendOutbound({ hotelId, guestId, channel }, buildConfirmButtonsPayload(bodyText));
+  const res = await sendOutbound({ hotelId, guestId, channel }, buildConfirmButtonsPayload(bodyText, args.copy));
   return res.sent;
 }
 
@@ -1344,6 +1357,23 @@ export async function executeFlowStep(
         // The ARA node is channel-agnostic — every injected sender gets the
         // active channel bound here via closure, so the node's dep signatures
         // (and its tests) never mention channels.
+
+        // Guest-facing copy. The registry is threaded into the three extracted
+        // senders below, but TENANT OVERRIDES ARE DEFERRED TO STAGE 2G — this
+        // is the built-in bundle, so output is byte-identical to pre-registry
+        // behaviour for every hotel.
+        //
+        // 2G replaces this one line with
+        //   resolveAraCopy(araOverridesFromBotMessages(hotelCfg?.botMessages))
+        // plus a warn for `araCopy.rejected`. `hotelCfg` is already fetched at
+        // the top of executeFlowStep, so that needs no extra query. Two things
+        // must land first: a `maxLen` for `flowRuntime.carouselBody` and
+        // `flowRuntime.mixBody` (nothing caps them — sendCarouselMessage and
+        // sendListMessage pass `body.text` verbatim), and `onReject` passed at
+        // the three sender bindings so a late overflow is logged rather than
+        // silently falling back.
+        const araCopy = DEFAULT_RESOLVED;
+
         return handleAdvancedRoomAllocation({
           node,
           currentNodeId,
@@ -1363,18 +1393,18 @@ export async function executeFlowStep(
           getCalendarData,
           retryStep,
           interpretModification: interpretAllocationModification,
-          sendPlanList:     (a) => trySendPlanList({ ...a, channel }),
-          sendRoomCarousel: (a) => trySendRoomTypeCarousel({ ...a, channel }),
+          sendPlanList:     (a) => trySendPlanList({ ...a, channel, copy: araCopy }),
+          sendRoomCarousel: (a) => trySendRoomTypeCarousel({ ...a, channel, copy: araCopy }),
           childAgeLimit:        hotelCfg?.childAgeLimit ?? 12,
           extractChildrenAges:  extractChildrenAgesAI,
           sendOccupancyNotice:  (a) => trySendOccupancyNotice({ ...a, channel }),
           sendRoomDescriptions: (a) => trySendOccupancyNotice({ ...a, channel }), // generic text sender (same shape)
-          sendMixItUpList:      (a) => trySendMixItUpList({ ...a, channel }),
-          sendConfirmButtons:   (a) => trySendConfirmButtons({ ...a, channel }),
-          sendRoomMenuList:        (a) => trySendRoomMenuList({ ...a, channel }),
-          sendMoveToRoomList:      (a) => trySendMoveToRoomList({ ...a, channel }),
-          sendManualModeList:      (a) => trySendManualModeList({ ...a, channel }),
-          sendChangeRoomTypeList:  (a) => trySendChangeRoomTypeList({ ...a, channel }),
+          sendMixItUpList:      (a) => trySendMixItUpList({ ...a, channel, copy: araCopy }),
+          sendConfirmButtons:   (a) => trySendConfirmButtons({ ...a, channel, copy: araCopy }),
+          sendRoomMenuList:        (a) => trySendRoomMenuList({ ...a, channel, copy: araCopy }),
+          sendMoveToRoomList:      (a) => trySendMoveToRoomList({ ...a, channel, copy: araCopy }),
+          sendManualModeList:      (a) => trySendManualModeList({ ...a, channel, copy: araCopy }),
+          sendChangeRoomTypeList:  (a) => trySendChangeRoomTypeList({ ...a, channel, copy: araCopy }),
         });
       }
 

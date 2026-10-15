@@ -908,12 +908,50 @@ export function fill(template: string, locals?: Record<string, string | number>)
 export function copyDefault(key: AraCopyKey, locals?: Record<string, string | number>): string {
   return fill(ARA_COPY[key].default, locals);
 }
-// ── Override resolution (pure; nothing calls it at runtime yet) ──────────────
+// ── Tenant override source: HotelConfig.botMessages ──────────────────────────
+
+/**
+ * Namespace every ARA key carries inside `HotelConfig.botMessages`.
+ *
+ * That column is one flat, untyped JSON blob shared with the menu and booking
+ * copy (`menuGreeting`, `menuFooter`, …), and `patchBotMessages` writes it with
+ * no whitelist. The prefix is what keeps the two sets apart, and it is why an
+ * ARA key can never be shadowed by an unrelated message template.
+ */
+export const ARA_BOTMESSAGE_PREFIX = "ara.";
+
+/**
+ * Pull the candidate ARA overrides out of a `botMessages` blob.
+ *
+ * Returns the `ara.*` entries with the prefix stripped and the VALUES
+ * UNTOUCHED — type and content validation belong to `resolveAraCopy`, which
+ * reports why each refusal happened. Filtering here would throw that diagnostic
+ * away, so this function decides only which entries are in the ARA namespace.
+ *
+ * Takes `unknown` because the column is `Json` and the config row itself may be
+ * null: a missing config, an explicit JSON null, a blob someone set to a string
+ * or an array, and `{}` all yield `{}`, and therefore the built-in defaults.
+ * Only own enumerable properties are read, so prototype keys cannot leak in.
+ */
+export function araOverridesFromBotMessages(botMessages: unknown): Record<string, unknown> {
+  if (botMessages === null || typeof botMessages !== "object" || Array.isArray(botMessages)) {
+    return {};
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(botMessages as Record<string, unknown>)) {
+    if (key.startsWith(ARA_BOTMESSAGE_PREFIX)) {
+      out[key.slice(ARA_BOTMESSAGE_PREFIX.length)] = value;
+    }
+  }
+  return out;
+}
+
+// ── Override resolution (pure) ───────────────────────────────────────────────
 //
-// Stage 2B ships the API only. `resolveAraCopy()` is not yet invoked from
-// flowRuntime and NO override source is read — `HotelConfig.botMessages` stays
-// untouched until the stage that has sender coverage. Called with no arguments
-// it returns the built-in defaults, so wiring it later is provably inert.
+// Called once per ARA turn from flowRuntime with the hotel's `ara.*` entries
+// (Stage 2D). With no such entries it returns DEFAULT_COPY by identity, so a
+// hotel that has never customised anything gets byte-identical output for the
+// cost of one empty-object allocation.
 
 /** A hotel's proposed replacements. Values are untrusted text. */
 export type AraCopyOverrides = Partial<Record<AraCopyKey, string>>;

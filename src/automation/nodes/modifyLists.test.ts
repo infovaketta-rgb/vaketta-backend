@@ -7,9 +7,12 @@
  * module — exactly as planList.test.ts already does — makes both reachable and
  * lets every outgoing field be asserted without prisma, Redis or a network call.
  *
- * Stage 2C does NOT thread the copy registry into modifyLists (that is 2E), so
- * these assertions pin the CURRENT strings and prove they equal the registry
- * defaults. When threading lands, this file is what shows nothing moved.
+ * Written in Stage 2C, when modifyLists still held its own literals, to pin the
+ * CURRENT strings and prove they equalled the registry defaults. Stage 2E then
+ * threaded the registry in — and this file passed UNCHANGED, which is the
+ * byte-identity evidence it was written to provide. Keep it that way: the copy
+ * plumbing is tested separately in araListCopy.test.ts, so this stays a pure
+ * default-output regression net.
  *
  * Also guards against the failure mode the brief names: payload construction
  * must not bypass validation or truncate unexpectedly. Row titles and
