@@ -61,6 +61,9 @@ import { getWatchedFlowVarNames, pickWatchedFlowVars } from "../services/templat
 import { extractDateWithAI, classifyBookingIntent, interpretAllocationModification, extractChildrenAgesAI } from "../services/ai.service";
 import { handleAdvancedRoomAllocation, type AllocationRoomInput, type SendRoomCarouselFn } from "./nodes/advancedRoomAllocation";
 import { trySendPlanList } from "./nodes/planList";
+import {
+  buildConfirmButtonsPayload, buildMixItUpPayload, buildRoomTypeCarouselPayload,
+} from "./nodes/araSenderPayloads";
 import { trySendRoomMenuList, trySendMoveToRoomList, trySendManualModeList, trySendChangeRoomTypeList } from "./nodes/modifyLists";
 import { aggregateRoomQuantities } from "./bookingAllocation";
 import { nightsBetween, exceedsMaxStay, STAY_TOO_LONG_MESSAGE } from "./stayDuration";
@@ -380,30 +383,17 @@ async function trySendRoomTypeCarousel(
       if (!photoByType.has(p.roomTypeId)) photoByType.set(p.roomTypeId, p.url);
     }
 
-    const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
-    const cards: OutboundCard[] = eligible.slice(0, 10).map((r) => {
-      const baseA = r.baseAdults  ?? 2;
-      const maxA  = r.maxAdults   ?? baseA;
-      const maxC  = r.maxChildren ?? 0;
-      const cap   = maxC > 0 ? `Up to ${maxA} adults, ${maxC} children` : `Up to ${maxA} adults`;
-      const desc  = `${cap} · ${inr(r.basePrice)}/night`;
-      return {
-        imageUrl:    photoByType.get(r.roomTypeId) ?? CAROUSEL_FALLBACK_IMAGE,
-        title:       r.name,
-        price:       r.basePrice,
-        description: desc.slice(0, 60),
-        buttonId:    `room_TYPE:${r.roomTypeId}`,
-        buttonLabel: "Choose",
-      };
+    // Payload construction is pure and lives in ./nodes/araSenderPayloads so it
+    // can be tested against the copy registry without prisma or a network call.
+    const payload = buildRoomTypeCarouselPayload({
+      roomInputs:    eligible,
+      photoByType,
+      fallbackImage: CAROUSEL_FALLBACK_IMAGE,
     });
 
-    log.info({ cardsCount: cards.length }, "carousel: cards built");
+    log.info({ cardsCount: payload.cards.length }, "carousel: cards built");
 
-    const res = await sendOutbound({ hotelId, guestId, channel }, {
-      kind:     "cards",
-      bodyText: "🏨 *Choose a room type:*",
-      cards,
-    });
+    const res = await sendOutbound({ hotelId, guestId, channel }, payload);
     return res.sent;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "ARA room carousel send failed — skipping");
@@ -430,12 +420,7 @@ async function trySendMixItUpList(
   args: { hotelId: string; guestId: string; channel: MessageChannel },
 ): Promise<boolean> {
   const { hotelId, guestId, channel } = args;
-  const res = await sendOutbound({ hotelId, guestId, channel }, {
-    kind:        "choice",
-    bodyText:    "_Not sure? Let us pick the best combination for you_ 👇",
-    buttonLabel: "Options",
-    sections:    [{ title: "Let us choose", rows: [{ id: "MIX_IT_UP", title: "Mix it up 🎲", description: "We'll pick the best room combination" }] }],
-  });
+  const res = await sendOutbound({ hotelId, guestId, channel }, buildMixItUpPayload());
   return res.sent;
 }
 
@@ -448,15 +433,7 @@ async function trySendConfirmButtons(
   args: { hotelId: string; guestId: string; bodyText: string; channel: MessageChannel },
 ): Promise<boolean> {
   const { hotelId, guestId, bodyText, channel } = args;
-  const res = await sendOutbound({ hotelId, guestId, channel }, {
-    kind:     "buttons",
-    bodyText,
-    buttons: [
-      { id: "CONFIRM_BOOKING", title: "✅ Confirm" },
-      { id: "MODIFY_BOOKING",  title: "✏️ Modify" },
-      { id: "CANCEL_BOOKING",  title: "✖️ Cancel" },
-    ],
-  });
+  const res = await sendOutbound({ hotelId, guestId, channel }, buildConfirmButtonsPayload(bodyText));
   return res.sent;
 }
 

@@ -35,7 +35,9 @@ import { join } from "node:path";
 
 import {
   ARA_COPY, DEFAULT_COPY, copyDefault, fill,
-  HARD_CAP_KINDS, staticKeys, validateResolvedCopy,
+  DEFAULT_RESOLVED, HARD_CAP_KEYS, PROTOCOL_LIKE,
+  fillKey, resolveAraCopy, staticKeys, validateResolvedCopy,
+  type AraCopyOverrides, type CopyRejection,
   type AraCopyKey, type AraCopyOrigin, type AraCopySpec,
 } from "./copy";
 import { inr } from "./money";
@@ -206,12 +208,363 @@ describe("fill", () => {
 
 // ── Resolved-length validation (audit F5) ────────────────────────────────────
 
-describe("validateResolvedCopy — caps on the FINAL string", () => {
+// ── Override resolution (Stage 2B) ───────────────────────────────────────────
+
+describe("resolveAraCopy — defaults", () => {
+  it("with no argument returns the built-in defaults, nothing overridden", () => {
+    const r = resolveAraCopy();
+    expect(r.copy).toBe(DEFAULT_COPY);        // same frozen object, not a copy
+    expect(r.rejected).toEqual([]);
+    expect(r.overridden).toEqual([]);
+  });
+
+  it("treats null, undefined and an empty map as no overrides", () => {
+    for (const input of [undefined, null, {}]) {
+      const r = resolveAraCopy(input);
+      expect(r.copy).toBe(DEFAULT_COPY);
+      expect(r.overridden).toEqual([]);
+    }
+    expect(resolveAraCopy({}).rejected).toEqual([]);
+  });
+
+  it("DEFAULT_RESOLVED is the no-override bundle", () => {
+    expect(DEFAULT_RESOLVED.copy).toBe(DEFAULT_COPY);
+    expect(DEFAULT_RESOLVED.overridden).toEqual([]);
+    expect(DEFAULT_RESOLVED.rejected).toEqual([]);
+  });
+
+  it("every key still resolves to its exact default", () => {
+    const r = resolveAraCopy({ "lists.buttonOptions": "Pick" });
+    for (const k of KEYS) {
+      if (k === "lists.buttonOptions") continue;
+      expect(r.copy[k]).toBe(specOf(k).default);
+    }
+  });
+
+  it("the result and its arrays are frozen", () => {
+    const r = resolveAraCopy({ "lists.buttonOptions": "Pick" });
+    expect(Object.isFrozen(r)).toBe(true);
+    expect(Object.isFrozen(r.copy)).toBe(true);
+    expect(Object.isFrozen(r.rejected)).toBe(true);
+    expect(Object.isFrozen(r.overridden)).toBe(true);
+  });
+});
+
+describe("resolveAraCopy — valid overrides", () => {
+  it("applies a static override and records it", () => {
+    const r = resolveAraCopy({ "lists.buttonOptions": "Pick one" });
+    expect(r.copy["lists.buttonOptions"]).toBe("Pick one");
+    expect(r.overridden).toEqual(["lists.buttonOptions"]);
+    expect(r.rejected).toEqual([]);
+  });
+
+  it("applies a templated override using only declared tokens", () => {
+    const r = resolveAraCopy({ "summary.total": "Grand total {{total}}" });
+    expect(r.rejected).toEqual([]);
+    expect(fillKey(r, "summary.total", { total: "₹99" })).toBe("Grand total ₹99");
+  });
+
+  it("an override identical to the default is NOT counted as an override", () => {
+    // So it keeps the grandfathered cap exemption in fillKey.
+    const r = resolveAraCopy({ "lists.editRoomTitle": specOf("lists.editRoomTitle").default });
+    expect(r.rejected).toEqual([]);
+    expect(r.overridden).toEqual([]);
+    expect(r.copy).toBe(DEFAULT_COPY);
+  });
+
+  it("AraCopyOverrides types a well-formed override map", () => {
+    // The exported shape a caller will store. Typed here so it cannot drift
+    // from what resolveAraCopy actually accepts.
+    const overrides: AraCopyOverrides = {
+      "lists.buttonOptions": "Pick",
+      "summary.total": "Grand total {{total}}",
+    };
+    const r = resolveAraCopy(overrides);
+    expect(r.rejected).toEqual([]);
+    expect([...r.overridden].sort()).toEqual(["lists.buttonOptions", "summary.total"]);
+  });
+
+  it("accepts several overrides and leaves the rest alone", () => {
+    const r = resolveAraCopy({
+      "lists.buttonOptions": "Pick",
+      "plans.sectionTitle": "Your plans",
+    });
+    expect([...r.overridden].sort()).toEqual(["lists.buttonOptions", "plans.sectionTitle"]);
+    expect(r.copy["lists.buttonChooseRoom"]).toBe(specOf("lists.buttonChooseRoom").default);
+  });
+});
+
+describe("resolveAraCopy — every rejection reason", () => {
+  const only = (input: unknown) => {
+    const r = resolveAraCopy(input);
+    expect(r.rejected).toHaveLength(1);
+    return r;
+  };
+
+  it("unknown-key", () => {
+    const r = only({ "lists.notARealKey": "x" });
+    expect(r.rejected[0]).toEqual({ key: "lists.notARealKey", reason: "unknown-key" });
+    expect(r.copy).toBe(DEFAULT_COPY);
+  });
+
+  it("not-a-string — number, null, object, boolean", () => {
+    for (const bad of [42, null, {}, true]) {
+      const r = only({ "lists.buttonOptions": bad });
+      expect(r.rejected[0]!.reason).toBe("not-a-string");
+      expect(r.copy["lists.buttonOptions"]).toBe(specOf("lists.buttonOptions").default);
+    }
+    expect(only({ "lists.buttonOptions": null }).rejected[0]!.detail).toBe("null");
+  });
+
+  it("blank — empty and whitespace-only", () => {
+    for (const bad of ["", "   ", "\n\t "]) {
+      const r = only({ "lists.buttonOptions": bad });
+      expect(r.rejected[0]!.reason).toBe("blank");
+    }
+  });
+
+  it("undeclared-token — a hotel cannot invent variables", () => {
+    const r = only({ "summary.total": "Total {{total}} for {{guestName}}" });
+    expect(r.rejected[0]!.reason).toBe("undeclared-token");
+    expect(r.rejected[0]!.detail).toBe("guestName");
+    expect(r.copy["summary.total"]).toBe(specOf("summary.total").default);
+  });
+
+  it("undeclared-token — any token on a key that declares none", () => {
+    const r = only({ "rejections.nothingToMove": "Nothing {{x}}" });
+    expect(r.rejected[0]!.reason).toBe("undeclared-token");
+  });
+
+  it("malformed-template — stray braces that would render raw", () => {
+    for (const bad of ["Total {{total", "Total total}}", "{{ total }}", "{{}}"]) {
+      const r = only({ "summary.total": bad });
+      expect(r.rejected[0]!.reason, bad).toBe("malformed-template");
+    }
+  });
+
+  it("protocol-like — an interactive reply id would break every tap", () => {
+    for (const bad of ["MOD_ADD_EXTRA_BED", "tap CONFIRM_BOOKING now", "MIX_IT_UP", "plan_3"]) {
+      const r = only({ "lists.buttonOptions": bad });
+      expect(r.rejected[0]!.reason, bad).toBe("protocol-like");
+    }
+  });
+
+  it("too-long — skeleton already overflows the declared cap", () => {
+    const r = only({ "lists.buttonOptions": "A label well past twenty chars" });
+    expect(r.rejected[0]!.reason).toBe("too-long");
+    expect(r.rejected[0]!.detail).toMatch(/skeleton 30 > 20/);
+    expect(r.copy["lists.buttonOptions"]).toBe(specOf("lists.buttonOptions").default);
+  });
+
+  it("a mis-shaped container is reported, not ignored", () => {
+    for (const bad of ["a string", 7, true, ["a"]]) {
+      const r = resolveAraCopy(bad);
+      expect(r.copy).toBe(DEFAULT_COPY);
+      expect(r.rejected).toHaveLength(1);
+      expect(r.rejected[0]!.key).toBe("(root)");
+    }
+    expect(resolveAraCopy(["a"]).rejected[0]!.detail).toContain("array");
+  });
+
+  it("every rejection reason is exercised by this suite", () => {
+    const seen = new Set<string>();
+    const probes: unknown[] = [
+      { "nope.nope": "x" },
+      { "lists.buttonOptions": 1 },
+      { "lists.buttonOptions": " " },
+      { "summary.total": "{{nope}}" },
+      { "summary.total": "{{total" },
+      { "lists.buttonOptions": "MOD_GO_BACK" },
+      { "lists.buttonOptions": "x".repeat(40) },
+    ];
+    for (const p of probes) for (const r of resolveAraCopy(p).rejected) seen.add(r.reason);
+    expect([...seen].sort()).toEqual([
+      "blank", "malformed-template", "not-a-string", "protocol-like",
+      "too-long", "undeclared-token", "unknown-key",
+    ]);
+  });
+
+  it("one bad override never blocks a good one", () => {
+    const r = resolveAraCopy({
+      "lists.buttonOptions": "Pick",
+      "lists.buttonChooseRoom": "",
+    });
+    expect(r.copy["lists.buttonOptions"]).toBe("Pick");
+    expect(r.copy["lists.buttonChooseRoom"]).toBe(specOf("lists.buttonChooseRoom").default);
+    expect(r.rejected.map((x) => x.reason)).toEqual(["blank"]);
+  });
+
+  it("never throws on hostile input", () => {
+    const hostile: unknown[] = [
+      Object.create(null),
+      { "lists.buttonOptions": { toString: () => "x" } },
+      { __proto__: { "lists.buttonOptions": "injected" } },
+      new Map(),
+      () => "fn",
+      Symbol("s"),
+    ];
+    for (const h of hostile) expect(() => resolveAraCopy(h)).not.toThrow();
+    // A prototype-only value must not leak through as an override.
+    expect(resolveAraCopy({ __proto__: { "lists.buttonOptions": "injected" } })
+      .copy["lists.buttonOptions"]).toBe(specOf("lists.buttonOptions").default);
+  });
+});
+
+// ── fillKey: final-text validation + grandfathering ──────────────────────────
+
+describe("fillKey — grandfathering of defaults", () => {
+  it("renders a default in full even when it overflows its own cap", () => {
+    // THE invariant that keeps current guest output byte-identical.
+    const long = fillKey(DEFAULT_RESOLVED, "lists.editRoomTitle", {
+      roomNumber: 1, roomTypeName: "Presidential Ocean-Facing Suite",
+    });
+    expect(long).toBe("Edit Room 1: Presidential Ocean-Facing Suite");
+    expect(long.length).toBeGreaterThan(specOf("lists.editRoomTitle").maxLen!);
+  });
+
+  it("the four template-overflow defaults all still render unchanged", () => {
+    // Pinned in Stage 1.1 as raw-text overflows; they must keep working.
+    const cases: Array<[AraCopyKey, Record<string, string | number>]> = [
+      ["lists.addRoomDesc", { maxAdults: 3, maxChildren: 1, price: "₹7,000", available: 4 }],
+      ["lists.editRoomTitle", { roomNumber: 1, roomTypeName: "Deluxe" }],
+      ["lists.moveToRoomDesc", { adults: 2, children: 1, maxAdults: 3, maxChildren: 1 }],
+      ["plans.rowTitleLegacy", { number: 1, total: "₹10,000" }],
+    ];
+    for (const [key, locals] of cases) {
+      // Raw template overflows its cap …
+      expect(specOf(key).default.length, key).toBeGreaterThan(specOf(key).maxLen!);
+      // … yet fillKey returns the real rendering, identical to copyDefault.
+      expect(fillKey(DEFAULT_RESOLVED, key, locals)).toBe(copyDefault(key, locals));
+    }
+  });
+
+  it("matches copyDefault for every key under the no-override bundle", () => {
+    // Default-output compatibility, across the whole registry.
+    for (const k of KEYS) {
+      expect(fillKey(DEFAULT_RESOLVED, k), k).toBe(copyDefault(k));
+    }
+  });
+
+  it("never reports a default as a violation, even an overflowing one", () => {
+    // The observable effect of the grandfathering branch. Output is identical
+    // either way (the fallback IS the default), but without the early return
+    // every over-long default would be reported as a rejection on every turn.
+    const seen: CopyRejection[] = [];
+    for (const k of KEYS) fillKey(DEFAULT_RESOLVED, k, { roomTypeName: "X".repeat(300) }, (x) => seen.push(x));
+    expect(seen).toEqual([]);
+  });
+
+  it("stays total under an adversarial override of EVERY key", () => {
+    // The contract that matters on the hot path: whatever a hotel stores, every
+    // key still renders to a non-empty string. Each key is attacked with a
+    // different malformed value, all at once.
+    const attacks = ["", "   ", "{{broken", "MOD_GO_BACK", "{{nope}}", "x".repeat(500)];
+    const hostile: Record<string, unknown> = {};
+    KEYS.forEach((k, i) => { hostile[k] = i % 7 === 6 ? 123 : attacks[i % attacks.length]; });
+
+    const r = resolveAraCopy(hostile);
+    expect(r.rejected.length).toBeGreaterThan(100);
+
+    for (const k of KEYS) {
+      const out = fillKey(r, k);
+      expect(typeof out, k).toBe("string");
+      expect(out.length, k).toBeGreaterThan(0);
+      // Nothing hostile survived into the rendered text.
+      expect(out, k).not.toContain("MOD_GO_BACK");
+      expect(out, k).not.toContain("{{broken");
+      expect(out, k).not.toContain("{{nope}}");
+    }
+  });
+
+  it("leaves a missing local visible as {{token}}", () => {
+    expect(fillKey(DEFAULT_RESOLVED, "summary.total")).toBe("*Total: {{total}}*");
+  });
+});
+
+describe("fillKey — final-text validation of overrides", () => {
+  it("accepts an override whose rendered text fits", () => {
+    const r = resolveAraCopy({ "plans.rowTitleLegacy": "P{{number}} {{total}}" });
+    expect(r.rejected).toEqual([]);
+    expect(fillKey(r, "plans.rowTitleLegacy", { number: 1, total: "₹10,000" })).toBe("P1 ₹10,000");
+  });
+
+  it("falls back to the DEFAULT rendering when the final text overflows", () => {
+    // Skeleton fits (21 chars <= 24) but the interpolated result does not —
+    // the case only a post-interpolation check can catch.
+    const r = resolveAraCopy({ "plans.rowTitleLegacy": "Plan number {{number}} — {{total}}" });
+    expect(r.rejected).toEqual([]);
+    expect(r.overridden).toEqual(["plans.rowTitleLegacy"]);
+
+    const seen: CopyRejection[] = [];
+    const out = fillKey(r, "plans.rowTitleLegacy", { number: 1, total: "₹1,23,456" }, (x) => seen.push(x));
+
+    expect(out).toBe(copyDefault("plans.rowTitleLegacy", { number: 1, total: "₹1,23,456" }));
+    expect(out).toBe("Plan 1 — ₹1,23,456");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.reason).toBe("too-long");
+    expect(seen[0]!.detail).toBe("rendered 25 > 24");
+  });
+
+  it("never returns a clipped version of the hotel's text", () => {
+    const r = resolveAraCopy({ "plans.rowTitleLegacy": "Plan number {{number}} — {{total}}" });
+    const out = fillKey(r, "plans.rowTitleLegacy", { number: 1, total: "₹1,23,456" });
+    expect(out).not.toContain("Plan number");
+    expect(out.endsWith("…")).toBe(false);
+  });
+
+  it("onReject is optional — overflow still falls back silently", () => {
+    const r = resolveAraCopy({ "plans.rowTitleLegacy": "Plan number {{number}} — {{total}}" });
+    expect(() => fillKey(r, "plans.rowTitleLegacy", { number: 1, total: "₹1,23,456" })).not.toThrow();
+  });
+
+  it("an uncapped key's override is never length-checked", () => {
+    const long = "A very long re-prompt ".repeat(20);
+    const r = resolveAraCopy({ "confirm.reprompt": long });
+    expect(r.rejected).toEqual([]);
+    expect(fillKey(r, "confirm.reprompt")).toBe(long);
+  });
+});
+
+describe("fillKey — exact length boundaries", () => {
+  it("accepts exactly maxLen and rejects maxLen + 1, at resolve time", () => {
+    const cap = specOf("lists.buttonOptions").maxLen!;
+    expect(cap).toBe(20);
+
+    const atCap = "x".repeat(cap);
+    const okResolved = resolveAraCopy({ "lists.buttonOptions": atCap });
+    expect(okResolved.rejected).toEqual([]);
+    expect(fillKey(okResolved, "lists.buttonOptions")).toBe(atCap);
+
+    const overCap = "x".repeat(cap + 1);
+    const badResolved = resolveAraCopy({ "lists.buttonOptions": overCap });
+    expect(badResolved.rejected.map((x) => x.reason)).toEqual(["too-long"]);
+    expect(fillKey(badResolved, "lists.buttonOptions")).toBe(specOf("lists.buttonOptions").default);
+  });
+
+  it("accepts exactly maxLen and rejects maxLen + 1, after interpolation", () => {
+    const cap = specOf("plans.rowTitleLegacy").maxLen!;   // 24
+    // "AB" + 22 chars of total = exactly 24.
+    const tmpl = "AB{{total}}";
+    const r = resolveAraCopy({ "plans.rowTitleLegacy": tmpl });
+    expect(r.rejected).toEqual([]);
+
+    const at = fillKey(r, "plans.rowTitleLegacy", { total: "y".repeat(cap - 2) });
+    expect(at).toHaveLength(cap);
+    expect(at.startsWith("AB")).toBe(true);
+
+    const over = fillKey(r, "plans.rowTitleLegacy", { total: "y".repeat(cap - 1) });
+    expect(over).toBe(copyDefault("plans.rowTitleLegacy", { total: "y".repeat(cap - 1) }));
+  });
+});
+
+// ── Static length validation ─────────────────────────────────────────────────
+
+describe("validateResolvedCopy — caps on an already-resolved map", () => {
   it("every STATIC default satisfies every cap it declares", () => {
     // Only static keys: DEFAULT_COPY holds TEMPLATES, and a template is longer
     // than what it renders ("Plan {{number}} — {{total}}" is 27 characters but
     // renders to about 16). Measuring a template against a cap is precisely the
-    // mistake the skeleton check above exists to avoid.
+    // mistake fillKey exists to avoid.
     const staticDefaults = Object.fromEntries(
       staticKeys().map((k) => [k, DEFAULT_COPY[k]]),
     ) as Partial<Record<AraCopyKey, string>>;
@@ -220,8 +573,7 @@ describe("validateResolvedCopy — caps on the FINAL string", () => {
 
   it("a templated default is NOT validatable from the registry alone", () => {
     // Documents the boundary rather than hiding it: these four templates exceed
-    // their cap as raw text and only fit once interpolated, so the wiring stage
-    // must call validateResolvedCopy AFTER fill(), never on the template.
+    // their cap as raw text and only fit once interpolated.
     const templatedOverflow = validateResolvedCopy(DEFAULT_COPY).map((v) => v.key).sort();
     expect(templatedOverflow).toEqual([
       "lists.addRoomDesc",
@@ -232,25 +584,7 @@ describe("validateResolvedCopy — caps on the FINAL string", () => {
     for (const k of templatedOverflow) expect(specOf(k).vars?.length).toBeGreaterThan(0);
   });
 
-  it("every hard-capped key is STATIC, so the default check is complete", () => {
-    // This is the property that makes a resolved-length check meaningful without
-    // per-key locals: buttons and section titles interpolate nothing, so their
-    // resolved text IS their default. Adding a templated button would fail here
-    // rather than quietly creating a cap nobody can validate.
-    const statics = new Set(staticKeys());
-    expect(KEYS.filter((k) => HARD_CAP_KINDS.includes(specOf(k).kind) && !statics.has(k))).toEqual([]);
-  });
-
-  it("covers every button and section title", () => {
-    const hard = KEYS.filter((k) => HARD_CAP_KINDS.includes(specOf(k).kind));
-    expect(hard.length).toBeGreaterThanOrEqual(19);
-    for (const k of hard) expect(specOf(k).maxLen, `${k} has no maxLen`).toBeDefined();
-    expect(validateResolvedCopy(DEFAULT_COPY, { onlyKinds: HARD_CAP_KINDS })).toEqual([]);
-  });
-
-  it("reports an over-long override instead of truncating it", () => {
-    // Deliberately NOT silently shortened: a clipped button reading
-    // "Confirm boo" is worse than a rejected override.
+  it("reports an over-long value instead of truncating it", () => {
     const bad = validateResolvedCopy({ "lists.buttonOptions": "A button label far beyond twenty characters" });
     expect(bad).toHaveLength(1);
     expect(bad[0]!.key).toBe("lists.buttonOptions");
@@ -260,21 +594,81 @@ describe("validateResolvedCopy — caps on the FINAL string", () => {
     expect(bad[0]!.value).toContain("far beyond");
   });
 
-  it("honours onlyKinds and skips absent or uncapped keys", () => {
+  it("honours onlyKeys and skips absent or uncapped keys", () => {
     const over = {
       "lists.buttonOptions": "x".repeat(40),
       "rejections.nothingToMove": "y".repeat(400),
     };
     expect(validateResolvedCopy(over).map((v) => v.key)).toEqual(["lists.buttonOptions"]);
-    expect(validateResolvedCopy(over, { onlyKinds: ["section.title"] })).toEqual([]);
+    expect(validateResolvedCopy(over, { onlyKeys: ["plans.sectionTitle"] })).toEqual([]);
     expect(validateResolvedCopy({})).toEqual([]);
   });
+});
 
-  it("excludes row kinds, which the call sites already slice", () => {
-    // Row titles/descriptions are truncated by `.slice()` in modifyLists and
-    // planList, so overflow there is clipping, not a Meta 400. Buttons and
-    // section titles are sliced NOWHERE today, which is why only they are hard.
-    expect([...HARD_CAP_KINDS]).toEqual(["button", "section.title"]);
+// ── HARD_CAP_KEYS vs the real sender paths (Stage 2A audit) ──────────────────
+
+describe("HARD_CAP_KEYS — keys Meta receives untruncated", () => {
+  it("is exactly the six list CTA labels plus the nine section titles", () => {
+    expect([...HARD_CAP_KEYS].sort()).toEqual([
+      "flowRuntime.mixButton",
+      "flowRuntime.mixSection",
+      "lists.addRoomSection",
+      "lists.availableRoomsSection",
+      "lists.availableTypesSection",
+      "lists.buttonChooseRoom",
+      "lists.buttonChooseType",
+      "lists.buttonEditBooking",
+      "lists.buttonOptions",
+      "lists.confirmSection",
+      "lists.editExistingSection",
+      "lists.modifyRoomSection",
+      "lists.navigationSection",
+      "plans.buttonLabel",
+      "plans.sectionTitle",
+    ]);
+    expect(HARD_CAP_KEYS).toHaveLength(15);
+  });
+
+  it("every hard-capped key declares a cap and is static", () => {
+    const statics = new Set(staticKeys());
+    for (const k of HARD_CAP_KEYS) {
+      expect(specOf(k).maxLen, `${k} has no maxLen`).toBeDefined();
+      expect(statics.has(k), `${k} is templated — its final length is unknowable here`).toBe(true);
+    }
+    expect(validateResolvedCopy(DEFAULT_COPY, { onlyKeys: HARD_CAP_KEYS })).toEqual([]);
+  });
+
+  it("every hard-capped key is a list CTA or a section title", () => {
+    // Correction to Stage 1.1: `kind` alone cannot express this. Four of the ten
+    // `button` keys ARE truncated by their sender (the reply-buttons and
+    // carousel paths), so they are deliberately absent here.
+    for (const k of HARD_CAP_KEYS) {
+      expect(["button", "section.title"]).toContain(specOf(k).kind);
+    }
+    const senderTruncated: AraCopyKey[] = [
+      "confirm.buttonConfirm", "confirm.buttonModify", "confirm.buttonCancel",
+      "flowRuntime.carouselButton",
+    ];
+    for (const k of senderTruncated) {
+      expect(specOf(k).kind).toBe("button");
+      expect(HARD_CAP_KEYS).not.toContain(k);
+    }
+  });
+});
+
+// ── Template hygiene of the registry itself ──────────────────────────────────
+
+describe("registry templates are well-formed", () => {
+  it("no default contains a stray brace", () => {
+    const bad = KEYS.filter((k) => {
+      const stripped = specOf(k).default.replace(/\{\{[\w.]+\}\}/g, "");
+      return stripped.includes("{{") || stripped.includes("}}");
+    });
+    expect(bad).toEqual([]);
+  });
+
+  it("no default is protocol-like", () => {
+    expect(KEYS.filter((k) => PROTOCOL_LIKE.test(specOf(k).default))).toEqual([]);
   });
 });
 
@@ -558,6 +952,7 @@ const ORIGIN_FILES: Record<AraCopyOrigin, string[]> = {
   planList: ["planList.ts"],
   modifyLists: ["modifyLists.ts"],
   flowRuntime: ["../flowRuntime.ts"],
+  araSenderPayloads: ["araSenderPayloads.ts"],
 };
 
 const sourceCache = new Map<string, string>();
@@ -615,6 +1010,11 @@ describe("source equivalence — scan (literals that cannot be invoked)", () => 
     const problems: string[] = [];
     for (const key of KEYS) {
       if (SCAN_EXEMPT[key]) continue;
+      // Stage 2C: the extracted payload builders read these from the registry
+      // via fillKey, so the literal exists in NO source file any more — the
+      // registry is now the only copy. Verified by call equivalence instead,
+      // in araSenderPayloads.test.ts, and structurally by the case below.
+      if (specOf(key).origin === "araSenderPayloads") continue;
       const s = specOf(key);
       const src = sourceOf(s.origin);
       const segments = literalSegments(s.default);
@@ -631,22 +1031,33 @@ describe("source equivalence — scan (literals that cannot be invoked)", () => 
     expect(problems).toEqual([]);
   });
 
-  it("the flowRuntime senders' strings are all still there", () => {
-    const src = sourceOf("flowRuntime");
-    for (const key of KEYS.filter((k) => specOf(k).origin === "flowRuntime")) {
-      for (const seg of literalSegments(specOf(key).default)) {
-        expect(src, `${key} segment "${seg}" missing from flowRuntime.ts`).toContain(seg);
-      }
+  it("the extracted builders read every sender key FROM the registry", () => {
+    // Stage 2C de-duplicated these thirteen: the literal is gone from
+    // flowRuntime.ts and was not copied into the builders — they call
+    // fillKey(copy, "<key>"). Asserting the key name appears as a string
+    // literal proves the builder is wired to that exact registry entry, which
+    // a text search for the MESSAGE no longer can.
+    const src = sourceOf("araSenderPayloads");
+    const senderKeys = KEYS.filter((k) => specOf(k).origin === "araSenderPayloads");
+
+    for (const key of senderKeys) {
+      expect(src, `${key} is never looked up in araSenderPayloads.ts`).toContain(`"${key}"`);
     }
+
     // 3 confirm buttons + 7 mix/carousel + 3 card-description keys (F2).
-    expect(KEYS.filter((k) => specOf(k).origin === "flowRuntime").length).toBe(13);
+    expect(senderKeys).toHaveLength(13);
+    // flowRuntime no longer holds any ARA copy literal of its own.
+    expect(KEYS.filter((k) => specOf(k).origin === "flowRuntime")).toEqual([]);
+    // And the duplication really is gone — the message text is not in there.
+    expect(src).not.toContain("Not sure? Let us pick");
+    expect(src).not.toContain("Choose a room type");
   });
 
   it("the carousel card description is still truncated to 60 (F2)", () => {
     // The slice lives in flowRuntime's private builder, which this patch must
     // not modify, so its presence is asserted rather than exercised.
-    const src = sourceOf("flowRuntime");
-    expect(src).toContain("description: desc.slice(0, 60)");
+    const src = sourceOf("araSenderPayloads");
+    expect(src).toContain("desc.slice(0, CAROUSEL_DESC_MAX)");
     expect(specOf("flowRuntime.cardDescription").maxLen).toBe(60);
 
     // The slice is DEFENSIVE, not load-bearing: both capacity arms are bounded
