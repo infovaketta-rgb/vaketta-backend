@@ -446,8 +446,9 @@ export const ARA_COPY = {
   "changeType.listBody": {
     default: "Change Room {{roomNumber}} to which type?",
     vars: ["roomNumber"],
+    maxLen: 1024,
     kind: "body", group: "changeType", origin: "modifyLists",
-    note: "Interactive path. Deliberately shorter than changeType.header and carries no occupancy — not a bug.",
+    note: "Interactive path. Deliberately shorter than changeType.header and carries no occupancy — not a bug. Stage 2F: 1024 (self-imposed interactive-body bound; Meta's list page says 4096, its Messages reference says 1024, unresolved). Passed verbatim by sendListMessage:310. Templated, so it cannot join the static-only HARD_CAP_KEYS; fillKey's per-key check is its guard.",
   },
   "changeType.noOthers": {
     default: "Sorry, there are no other room types to switch to.",
@@ -476,23 +477,33 @@ export const ARA_COPY = {
     kind: "fragment", group: "plans", origin: "render",
     note: "Capitalised form. plans.detailBedsNone is the lower-case long form.",
   },
+  // The four below are composed INTO the plan-list body, not sent as their own
+  // Meta field, so each carries the self-imposed 1024 interactive-body bound.
+  // planList's own MAX_BODY = 1024 chunk threshold is a self-imposed, tighter
+  // bound — see the comment on that constant.
   "plans.detailHeader": {
     default: "🏨 *Your Room Options*",
+    maxLen: 1024,
     kind: "header", group: "plans", origin: "planList",
+    note: "Stage 2F: capped at 1024, which is planList's own MAX_BODY chunk budget and the TIGHTEST bound its container enforces (a fragment is capped by its container, not by the wire limit of a field it is not). Over-long values are flushed into a preceding kind:\"text\" send by chunkPlanDetailText, never into the interactive body.",
   },
   "plans.detailFooter": {
     default: "_Tap *View Plans* to choose_ 👇",
+    maxLen: 1024,
     kind: "footer", group: "plans", origin: "planList",
+    note: "NOT a Meta footer — appended to the list BODY, so the 1024 body bound applies, not 60. Stage 2F: this is the one plans.detail* key that can BECOME the whole body.text, via the overflow branch at planList.ts:78-82.",
   },
   "plans.detailBedsIncluded": {
     default: "extra beds included",
+    maxLen: 1024,
     kind: "fragment", group: "plans", origin: "planList",
-    note: "Lower-case long form inside the plan detail body. Diverges from plans.bedsIncluded by design.",
+    note: "Lower-case long form inside the plan detail body. Diverges from plans.bedsIncluded by design. Stage 2F: inherits the 1024 interactive-body bound.",
   },
   "plans.detailBedsNone": {
     default: "no extra beds",
+    maxLen: 1024,
     kind: "fragment", group: "plans", origin: "planList",
-    note: "Lower-case long form. Diverges from plans.bedsNone by design.",
+    note: "Lower-case long form. Diverges from plans.bedsNone by design. Stage 2F: inherits the 1024 interactive-body bound.",
   },
   "plans.sectionTitle": {
     default: "Choose a Plan",
@@ -675,8 +686,9 @@ export const ARA_COPY = {
   },
   "lists.cancelFooter": {
     default: "Type 'Hi' to cancel",
+    maxLen: 60,
     kind: "footer", group: "lists", origin: "modifyLists",
-    note: "KNOWN WRONG, PRESERVED: the node matches MENU/CANCEL_BOOKING and never 'Hi'. Emitted by all four modifyLists senders. Pinned by goldens so fixing it is a visible diff. Do not correct in Stage 1.",
+    note: "KNOWN WRONG, PRESERVED: the node matches MENU/CANCEL_BOOKING and never 'Hi'. Emitted by all four modifyLists senders. Pinned by goldens so fixing it is a visible diff. Do not correct in Stage 1. Stage 2F: 60 = list footer.text, now sourced from Meta's interactive-list reference; passed verbatim by sendListMessage:326, hence also in HARD_CAP_KEYS.",
   },
   "lists.buttonOptions": {
     default: "Options",
@@ -761,7 +773,9 @@ export const ARA_COPY = {
 
   "flowRuntime.carouselBody": {
     default: "🏨 *Choose a room type:*",
+    maxLen: 1024,
     kind: "body", group: "preference", origin: "araSenderPayloads",
+    note: "Stage 2F: 1024. This is interactive.body.text on type:\"carousel\", for which Meta publishes NO reference at all — the only sourced figure is the general interactive body limit of 1024, which the media-card-carousel TEMPLATE also counts its body against. A CONSERVATIVE INFERENCE, not a Meta-verified limit.",
   },
   "flowRuntime.carouselButton": {
     default: "Choose",
@@ -771,8 +785,9 @@ export const ARA_COPY = {
   },
   "flowRuntime.mixBody": {
     default: "_Not sure? Let us pick the best combination for you_ 👇",
+    maxLen: 1024,
     kind: "body", group: "preference", origin: "araSenderPayloads",
-    note: "Interactive variant. The no-dep text fallback is preference.mixTextFallback, which says MIX instead.",
+    note: "Interactive variant. The no-dep text fallback is preference.mixTextFallback, which says MIX instead. Stage 2F: 1024 (self-imposed interactive-body bound; Meta's list page says 4096, its Messages reference says 1024, unresolved). Passed verbatim by sendListMessage:310.",
   },
   "flowRuntime.mixButton": {
     default: "Options",
@@ -982,6 +997,18 @@ export interface CopyRejection {
   readonly detail?: string;
 }
 
+/**
+ * Where a call site reports LATE overflow — an override that passed the
+ * resolve-time skeleton check but overran its cap once interpolated. Taken as a
+ * parameter rather than imported, because a logger would break this module's
+ * purity (ara/purity.test.ts).
+ *
+ * A sink MUST NOT THROW. Several senders have no try/catch of their own and the
+ * switch in executeFlowStep has none either, so an exception here would fail
+ * the whole turn and the guest would get no reply at all.
+ */
+export type CopyRejectionSink = (rejection: CopyRejection) => void;
+
 export interface ResolvedAraCopy {
   /** Total and frozen. Every key present, so a lookup is never undefined. */
   readonly copy: AraCopy;
@@ -1020,14 +1047,41 @@ export const PROTOCOL_LIKE =
  *     footer.text           whatsapp.send.service.ts:326
  *     body.text             whatsapp.send.service.ts:310
  *
- * So this list is the six list CTA labels plus the nine section titles. The list
- * FOOTER surface is uncapped too, but `lists.cancelFooter` carries no `maxLen`
- * because no Meta footer limit for the LIST path is sourced anywhere in this
- * repo (the 60 at :399 belongs to the BUTTONS path) — see the Stage 2B report.
+ * STAGE 2F — the limits are now sourced from Meta's interactive-list reference:
+ * footer.text 60, header.text 60, action.button 20,
+ * sections[].title 24, rows[].title 24, rows[].description 72, rows[].id 200.
+ * Reply buttons differ: body.text 1024, footer.text 60, reply.title 20.
+ * That retires the Stage 2B note here, which said no LIST footer limit was
+ * sourced in this repo: it is 60, the same as the buttons path, and
+ * `lists.cancelFooter` now carries it and appears below.
+ *
+ * INTERACTIVE BODY = 1024, SELF-IMPOSED. Meta's own pages disagree: both
+ * interactive-list pages say `body.text` is 4096, while its Messages reference
+ * is read as 1024 for the interactive object (and a direct fetch of that page
+ * states no limit at all, so the 1024 claim could not be confirmed at source).
+ * Rather than pick the looser number, every key that reaches an interactive
+ * body carries 1024 until the discrepancy is settled — it is four times
+ * tighter than the best-sourced figure, costs nothing (no default exceeds 54
+ * characters and no tenant copy exists yet), and coincides with both
+ * planList's MAX_BODY chunk budget and the enforced reply-buttons limit at
+ * whatsapp.send.service.ts:383. Revisit if Meta's docs converge on 4096.
+ *
+ * Membership rule: a key belongs here when it is a WHOLE Meta field that the
+ * sender passes verbatim, AND it is static (a templated key's final length is
+ * unknowable without locals, which is what `fillKey` checks instead). So:
+ *   - the six list CTA labels and nine section titles, as before;
+ *   - `lists.cancelFooter` (footer.text, 60);
+ *   - `flowRuntime.mixBody` (list body.text, 1024) and
+ *     `flowRuntime.carouselBody` (carousel body.text, 1024).
+ * Deliberately absent: `changeType.listBody` is a whole body.text field but is
+ * TEMPLATED, so only `fillKey` can police it; and the four `plans.detail*` keys
+ * are fragments composed into a body rather than fields of their own.
  *
  * NOTE: Instagram drops `action.button` and every section title entirely
  * (instagram.renderer.ts maps `choice` to quick replies, which have neither),
- * so these fifteen keys affect WhatsApp only.
+ * so the CTA and section-title keys affect WhatsApp only. IG quick-reply titles
+ * are capped at 20 by instagram.renderer.ts; 20 is documented for the Messenger
+ * Platform and inferred, not confirmed, for the Instagram Messaging API.
  */
 export const HARD_CAP_KEYS: readonly AraCopyKey[] = [
   "lists.buttonOptions",
@@ -1045,6 +1099,10 @@ export const HARD_CAP_KEYS: readonly AraCopyKey[] = [
   "lists.availableTypesSection",
   "plans.sectionTitle",
   "flowRuntime.mixSection",
+  // Stage 2F additions — whole verbatim Meta fields, static, now sourced.
+  "lists.cancelFooter",
+  "flowRuntime.mixBody",
+  "flowRuntime.carouselBody",
 ];
 
 const TOKEN = /\{\{([\w.]+)\}\}/g;

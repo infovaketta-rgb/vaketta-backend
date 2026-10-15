@@ -16,11 +16,24 @@ import { sendOutbound } from "../../services/outbound/outbound.service";
 import { MessageChannel } from "@prisma/client";
 import { logger } from "../../utils/logger";
 import type { AllocationPlan, AllocationRoomInput } from "./advancedRoomAllocation";
-import { DEFAULT_RESOLVED, fillKey, type ResolvedAraCopy } from "./ara/copy";
+import {
+  DEFAULT_RESOLVED, fillKey,
+  type CopyRejectionSink, type ResolvedAraCopy,
+} from "./ara/copy";
 
 const log = logger.child({ service: "plan-list" });
 
-const MAX_BODY = 1_024; // Meta interactive-list body limit
+/**
+ * Chunk threshold for the plan detail text.
+ *
+ * NOT the Meta limit, despite what this comment said before Stage 2F: the
+ * documented maximum for an interactive list `body.text` is **4096**, and 1024
+ * is the REPLY-BUTTONS body limit. 1024 is kept deliberately as a self-imposed,
+ * four-times-tighter bound — it is what produces today's chunking, so raising
+ * it would merge messages a guest currently receives separately and change
+ * default output. Change it only as an explicit product decision.
+ */
+const MAX_BODY = 1_024;
 
 /**
  * Split the plan detail text into ≤MAX_BODY-char chunks, keeping each plan's
@@ -30,15 +43,16 @@ const MAX_BODY = 1_024; // Meta interactive-list body limit
 export function chunkPlanDetailText(
   plans: AllocationPlan[],
   copy: ResolvedAraCopy = DEFAULT_RESOLVED,
+  onReject?: CopyRejectionSink,
 ): string[] {
-  const header = fillKey(copy, "plans.detailHeader");
-  const footer = fillKey(copy, "plans.detailFooter");
+  const header = fillKey(copy, "plans.detailHeader", undefined, onReject);
+  const footer = fillKey(copy, "plans.detailFooter", undefined, onReject);
 
   const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
   const planBlocks = plans.map((p, i) => {
     const beds = p.rooms.some((r) => r.extraBed)
-      ? fillKey(copy, "plans.detailBedsIncluded")
-      : fillKey(copy, "plans.detailBedsNone");
+      ? fillKey(copy, "plans.detailBedsIncluded", undefined, onReject)
+      : fillKey(copy, "plans.detailBedsNone", undefined, onReject);
     let block = `*Plan ${i + 1} — ${inr(p.totalPrice)}* _(${p.label})_\n`;
     block += `${p.roomCount} room${p.roomCount === 1 ? "" : "s"} · ${beds}`;
     p.rooms.forEach((r, j) => {
@@ -117,13 +131,14 @@ export function buildPlanDescription(plan: AllocationPlan): string {
 export function buildPlanDetailText(
   plans: AllocationPlan[],
   copy: ResolvedAraCopy = DEFAULT_RESOLVED,
+  onReject?: CopyRejectionSink,
 ): string {
   const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
 
   const blocks = plans.map((p, i) => {
     const beds = p.rooms.some((r) => r.extraBed)
-      ? fillKey(copy, "plans.detailBedsIncluded")
-      : fillKey(copy, "plans.detailBedsNone");
+      ? fillKey(copy, "plans.detailBedsIncluded", undefined, onReject)
+      : fillKey(copy, "plans.detailBedsNone", undefined, onReject);
     let block = `*Plan ${i + 1} — ${inr(p.totalPrice)}* _(${p.label})_\n`;
     block += `${p.roomCount} room${p.roomCount === 1 ? "" : "s"} · ${beds}`;
     p.rooms.forEach((r, j) => {
@@ -137,7 +152,7 @@ export function buildPlanDetailText(
     return block;
   });
 
-  return `${fillKey(copy, "plans.detailHeader")}\n\n${blocks.join("\n\n")}\n\n${fillKey(copy, "plans.detailFooter")}`;
+  return `${fillKey(copy, "plans.detailHeader", undefined, onReject)}\n\n${blocks.join("\n\n")}\n\n${fillKey(copy, "plans.detailFooter", undefined, onReject)}`;
 }
 
 /**
@@ -157,9 +172,13 @@ export async function trySendPlanList(args: {
   // Stage 2E: the resolved copy bundle. Absent (tests, legacy callers) → the
   // built-in defaults, so output is unchanged.
   copy?:                ResolvedAraCopy | undefined;
+  // Stage 2F: where LATE overflow is reported (an override that passed the
+  // resolve-time check but overran its cap once interpolated).
+  onReject?:            CopyRejectionSink | undefined;
 }): Promise<boolean> {
   const { hotelId, guestId, channel, plans } = args;
   const copy = args.copy ?? DEFAULT_RESOLVED;
+  const onReject = args.onReject;
   if (plans.length === 0) return false;
 
   try {
@@ -172,7 +191,7 @@ export async function trySendPlanList(args: {
       // not registry copy; only the legacy fallback has a key.
       const title = (plan.label
         ? `${plan.label} — ${inr}`
-        : fillKey(copy, "plans.rowTitleLegacy", { number: i + 1, total: inr })).slice(0, 24);
+        : fillKey(copy, "plans.rowTitleLegacy", { number: i + 1, total: inr }, onReject)).slice(0, 24);
       return {
         id:          `plan_${i}`,
         title,
@@ -180,11 +199,11 @@ export async function trySendPlanList(args: {
       };
     });
 
-    const sections = [{ title: fillKey(copy, "plans.sectionTitle"), rows: planRows }];
+    const sections = [{ title: fillKey(copy, "plans.sectionTitle", undefined, onReject), rows: planRows }];
 
     // Chunk plan detail text so no single message exceeds MAX_BODY.
     // All chunks except the last are plain text; the last carries the choice UI.
-    const chunks = chunkPlanDetailText(plans, copy);
+    const chunks = chunkPlanDetailText(plans, copy, onReject);
     const lastChunk = chunks[chunks.length - 1]!;
 
     // Send any leading plain-text chunks — a chunk failure aborts the whole
@@ -199,7 +218,7 @@ export async function trySendPlanList(args: {
     const res = await sendOutbound({ hotelId, guestId, channel }, {
       kind:        "choice",
       bodyText:    lastChunk,
-      buttonLabel: fillKey(copy, "plans.buttonLabel"),
+      buttonLabel: fillKey(copy, "plans.buttonLabel", undefined, onReject),
       sections,
     });
     return res.sent;

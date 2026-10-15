@@ -609,8 +609,12 @@ describe("validateResolvedCopy — caps on an already-resolved map", () => {
 // ── HARD_CAP_KEYS vs the real sender paths (Stage 2A audit) ──────────────────
 
 describe("HARD_CAP_KEYS — keys Meta receives untruncated", () => {
-  it("is exactly the six list CTA labels plus the nine section titles", () => {
+  it("is the six list CTAs, nine section titles, the footer and two bodies", () => {
+    // Stage 2F added the last three: whole Meta fields passed verbatim, static,
+    // and with a limit now sourced from Meta's interactive-list reference.
     expect([...HARD_CAP_KEYS].sort()).toEqual([
+      "flowRuntime.carouselBody",
+      "flowRuntime.mixBody",
       "flowRuntime.mixButton",
       "flowRuntime.mixSection",
       "lists.addRoomSection",
@@ -620,6 +624,7 @@ describe("HARD_CAP_KEYS — keys Meta receives untruncated", () => {
       "lists.buttonChooseType",
       "lists.buttonEditBooking",
       "lists.buttonOptions",
+      "lists.cancelFooter",
       "lists.confirmSection",
       "lists.editExistingSection",
       "lists.modifyRoomSection",
@@ -627,7 +632,68 @@ describe("HARD_CAP_KEYS — keys Meta receives untruncated", () => {
       "plans.buttonLabel",
       "plans.sectionTitle",
     ]);
-    expect(HARD_CAP_KEYS).toHaveLength(15);
+    expect(HARD_CAP_KEYS).toHaveLength(18);
+  });
+
+  it("carries the sourced Meta limit for each surface (2F)", () => {
+    // The numbers, pinned so a future edit cannot quietly invent one.
+    expect(specOf("lists.cancelFooter").maxLen).toBe(60);      // list footer.text
+    expect(specOf("lists.buttonOptions").maxLen).toBe(20);     // action.button
+    expect(specOf("lists.modifyRoomSection").maxLen).toBe(24); // sections[].title
+    expect(specOf("lists.editRoomTitle").maxLen).toBe(24);     // rows[].title
+    expect(specOf("lists.addRoomDesc").maxLen).toBe(72);       // rows[].description
+    expect(specOf("confirm.buttonConfirm").maxLen).toBe(20);   // reply.title
+  });
+
+  it("every interactive BODY key carries the self-imposed 1024, not 4096", () => {
+    // Meta's own pages disagree — both list pages say body.text is 4096, while
+    // its Messages reference is read as 1024 (and a direct fetch of that page
+    // states no limit at all). Rather than take the looser number, every key
+    // that reaches an interactive body is capped at 1024 until the docs settle.
+    // Four times tighter than the best-sourced figure, and free: no default
+    // exceeds 54 characters.
+    const bodyKeys: AraCopyKey[] = [
+      "flowRuntime.mixBody",       // list body.text, sent alone
+      "changeType.listBody",       // list body.text, sent alone
+      "flowRuntime.carouselBody",  // carousel body.text — see below
+      "plans.detailFooter",        // can BECOME the body via the overflow branch
+      "plans.detailHeader",        // composed into the body
+      "plans.detailBedsIncluded",
+      "plans.detailBedsNone",
+    ];
+    for (const k of bodyKeys) expect(specOf(k).maxLen, k).toBe(1024);
+
+    // And no key anywhere is left on the 4096 figure.
+    expect(KEYS.filter((k) => specOf(k).maxLen === 4096)).toEqual([]);
+
+    // The carousel reaches 1024 by a DIFFERENT route: Meta publishes no
+    // reference at all for interactive type:"carousel", so its cap is a
+    // conservative inference, not a verified limit. Recorded in its note so
+    // the distinction survives a future docs pass.
+    expect(specOf("flowRuntime.carouselBody").note).toContain("CONSERVATIVE INFERENCE");
+    expect(specOf("flowRuntime.carouselBody").note).toContain("not a Meta-verified limit");
+
+    // Pre-existing, unchanged by 2F.
+    expect(specOf("lists.buttonOptions").maxLen).toBe(20);     // action.button
+    expect(specOf("lists.modifyRoomSection").maxLen).toBe(24); // sections[].title
+    expect(specOf("lists.editRoomTitle").maxLen).toBe(24);     // rows[].title
+    expect(specOf("lists.addRoomDesc").maxLen).toBe(72);       // rows[].description
+    expect(specOf("confirm.buttonConfirm").maxLen).toBe(20);   // reply.title
+  });
+
+  it("no ARA copy key is left uncapped on a verbatim Meta surface (2F)", () => {
+    // The closing assertion for Stage 2F: every key that reaches a field the
+    // sender does NOT truncate must declare a maxLen. Threaded keys only —
+    // ara/* core keys are Stage 2G's problem and are still text-only.
+    const verbatimSurfaces: AraCopyKey[] = [
+      "lists.cancelFooter", "changeType.listBody",
+      "flowRuntime.mixBody", "flowRuntime.carouselBody",
+      "plans.detailHeader", "plans.detailFooter",
+      "plans.detailBedsIncluded", "plans.detailBedsNone",
+    ];
+    for (const k of verbatimSurfaces) {
+      expect(specOf(k).maxLen, `${k} is still uncapped`).toBeDefined();
+    }
   });
 
   it("every hard-capped key declares a cap and is static", () => {
@@ -639,12 +705,13 @@ describe("HARD_CAP_KEYS — keys Meta receives untruncated", () => {
     expect(validateResolvedCopy(DEFAULT_COPY, { onlyKeys: HARD_CAP_KEYS })).toEqual([]);
   });
 
-  it("every hard-capped key is a list CTA or a section title", () => {
+  it("every hard-capped key is a CTA, section title, footer or body", () => {
     // Correction to Stage 1.1: `kind` alone cannot express this. Four of the ten
     // `button` keys ARE truncated by their sender (the reply-buttons and
-    // carousel paths), so they are deliberately absent here.
+    // carousel paths), so they are deliberately absent here. Stage 2F widened
+    // the set to the footer and body surfaces sendListMessage passes verbatim.
     for (const k of HARD_CAP_KEYS) {
-      expect(["button", "section.title"]).toContain(specOf(k).kind);
+      expect(["button", "section.title", "footer", "body"]).toContain(specOf(k).kind);
     }
     const senderTruncated: AraCopyKey[] = [
       "confirm.buttonConfirm", "confirm.buttonModify", "confirm.buttonCancel",

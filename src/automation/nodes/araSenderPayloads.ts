@@ -35,13 +35,16 @@
 
 import {
   DEFAULT_RESOLVED, fillKey,
-  type CopyRejection, type ResolvedAraCopy,
+  type CopyRejection, type CopyRejectionSink, type ResolvedAraCopy,
 } from "./ara/copy";
 import type { AllocationRoomInput } from "./ara/types";
 import type { OutboundCard, OutboundPayload } from "../../services/outbound/payload";
 
 /** Optional observer for a late copy rejection. Never required. */
-export type CopyRejectionSink = (rejection: CopyRejection) => void;
+// Canonical definition lives in ara/copy.ts (Stage 2F), so planList.ts and
+// modifyLists.ts can thread the same sink type without importing this module.
+// Re-exported here because existing importers refer to it by this path.
+export type { CopyRejectionSink };
 
 /** Meta's carousel card limit, as applied in flowRuntime today. */
 export const CAROUSEL_MAX_CARDS = 10;
@@ -75,7 +78,7 @@ export function buildRoomTypeCards(args: {
   photoByType:  Map<string, string>;
   fallbackImage: string;
   copy?:        ResolvedAraCopy | undefined;
-  onReject?:    CopyRejectionSink;
+  onReject?:    CopyRejectionSink | undefined;
 }): OutboundCard[] {
   const { roomInputs, photoByType, fallbackImage } = args;
   const copy = args.copy ?? DEFAULT_RESOLVED;
@@ -112,7 +115,7 @@ export function buildRoomTypeCarouselPayload(args: {
   photoByType:   Map<string, string>;
   fallbackImage: string;
   copy?:         ResolvedAraCopy | undefined;
-  onReject?:     CopyRejectionSink;
+  onReject?:     CopyRejectionSink | undefined;
 }): Extract<OutboundPayload, { kind: "cards" }> {
   const copy = args.copy ?? DEFAULT_RESOLVED;
   return {

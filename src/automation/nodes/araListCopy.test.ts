@@ -21,6 +21,9 @@
  * constructed directly through resolveAraCopy.
  */
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const sendOutbound = vi.fn();
@@ -37,7 +40,7 @@ import {
 } from "./modifyLists";
 import {
   DEFAULT_COPY, DEFAULT_RESOLVED, fillKey, resolveAraCopy,
-  type AraCopyKey, type ResolvedAraCopy,
+  type AraCopyKey, type CopyRejection, type ResolvedAraCopy,
 } from "./ara/copy";
 import type {
   AllocationConfig, AllocationPlan, AllocationRoom, AllocationRoomInput,
@@ -449,19 +452,83 @@ describe("2E: an invalid override cannot reach a list payload", () => {
     expect(p.buttonLabel).not.toBe("A button label beyo");   // never clipped
   });
 
-  it("KNOWN GAP: lists.cancelFooter has no maxLen, so a long override ships", async () => {
-    // Pinned, not fixed — the 2E analogue of flowRuntime.carouselBody/mixBody.
-    // sendListMessage passes footer.text verbatim and the registry declares no
-    // cap for it, because the list footer limit is still unverified against
-    // Meta's docs (Stage 2F). Until that lands, a hotel could overflow it.
+  it("CLOSED IN 2F: a 400-char cancelFooter is refused and falls back", async () => {
+    // Stage 2E recorded this as a known gap: footer.text is passed verbatim by
+    // sendListMessage:326 and the key declared no maxLen, so 400 characters
+    // reached Meta. Stage 2F sourced the limit (list footer.text = 60) and the
+    // same override is now refused, with the default rendering sent instead —
+    // never a clipped version of the hotel's own text.
     const footer = "F".repeat(400);
+    const r = resolveAraCopy({ "lists.cancelFooter": footer });
+    expect(r.rejected).toEqual([
+      { key: "lists.cancelFooter", reason: "too-long", detail: "skeleton 400 > 60" },
+    ]);
+    expect(r.overridden).toEqual([]);
+
+    await trySendRoomMenuList({ ...ctx, room: room(), options: ["add_bed"], roomIndex: 0, copy: r });
+    expect(lastChoice().footerText).toBe(fillKey(DEFAULT_RESOLVED, "lists.cancelFooter"));
+    expect(lastChoice().footerText).not.toBe("F".repeat(60));   // never clipped
+  });
+
+  it("a cancelFooter at exactly 60 is accepted and reaches all four senders", async () => {
+    const footer = "F".repeat(60);
     const r = resolveAraCopy({ "lists.cancelFooter": footer });
     expect(r.rejected).toEqual([]);
     expect(r.overridden).toEqual(["lists.cancelFooter"]);
 
     await trySendRoomMenuList({ ...ctx, room: room(), options: ["add_bed"], roomIndex: 0, copy: r });
     expect(lastChoice().footerText).toBe(footer);
-    expect(lastChoice().footerText).toHaveLength(400);
+  });
+
+  it("the plan-list body keys carry 1024 — the chunk budget, not Meta's 4096", () => {
+    // plans.detailFooter is the one plans.detail* key that can become the whole
+    // body, via the overflow branch at planList.ts:78-82, so it is the case
+    // that matters. Accepted at the cap, refused one over, default returns.
+    const atCap = "F".repeat(1024);
+    const ok = resolveAraCopy({ "plans.detailFooter": atCap });
+    expect(ok.rejected).toEqual([]);
+    expect(chunkPlanDetailText([plan()], ok).at(-1)).toBe(atCap);   // became the body
+
+    const over = resolveAraCopy({ "plans.detailFooter": "F".repeat(1025) });
+    expect(over.rejected.map((x) => x.reason)).toEqual(["too-long"]);
+    expect(chunkPlanDetailText([plan()], over).at(-1))
+      .toContain(fillKey(DEFAULT_RESOLVED, "plans.detailFooter"));
+  });
+
+  it("a header at the cap cannot overflow the 4096 text.body limit", () => {
+    // Why detailHeader is capped by its CONTAINER (planList's MAX_BODY) rather
+    // than by a Meta field limit. chunkPlanDetailText appends the first block
+    // to the header unconditionally (planList.ts:61 guards on
+    // current.length > 1), so chunk 1 is header + block with no size check,
+    // and it is sent as a plain-text message whose documented limit is 4096.
+    // At 1024 the sum stays far inside that; at 4096 it would not have.
+    const header = "H".repeat(1024);
+    const r = resolveAraCopy({ "plans.detailHeader": header });
+    expect(r.rejected).toEqual([]);
+
+    const chunks = chunkPlanDetailText([plan()], r);
+    const textChunks = chunks.slice(0, -1);        // these go out as kind:"text"
+    for (const c of textChunks) expect(c.length).toBeLessThan(4096);
+    expect(chunks.join("").includes(header)).toBe(true);
+
+    expect(resolveAraCopy({ "plans.detailHeader": "H".repeat(1025) })
+      .rejected.map((x) => x.reason)).toEqual(["too-long"]);
+  });
+
+  it("changeType.listBody is capped at 1024 even though it is templated", async () => {
+    // Templated, so it cannot sit in the static-only HARD_CAP_KEYS; fillKey's
+    // per-key check is the whole guard. Both ends are asserted here.
+    const ok = resolveAraCopy({ "changeType.listBody": "R{{roomNumber}} " + "x".repeat(1000) });
+    expect(ok.rejected).toEqual([]);
+
+    const over = resolveAraCopy({ "changeType.listBody": "R{{roomNumber}} " + "x".repeat(1024) });
+    expect(over.rejected.map((x) => x.reason)).toEqual(["too-long"]);
+
+    await trySendChangeRoomTypeList({
+      ...ctx, room: room(), roomIndex: 0, candidates: [roomInput()], copy: over,
+    });
+    expect(lastChoice().bodyText)
+      .toBe(fillKey(DEFAULT_RESOLVED, "changeType.listBody", { roomNumber: 1 }));
   });
 });
 
@@ -484,5 +551,159 @@ describe("2E: list copy is per-resolve, never shared", () => {
     withCopy({ "lists.cancelFooter": "mutating?" });
     expect(DEFAULT_COPY["lists.cancelFooter"]).toBe(before);
     expect(Object.isFrozen(DEFAULT_COPY)).toBe(true);
+  });
+});
+
+// ── Stage 2F: late-overflow reporting ────────────────────────────────────────
+
+describe("2F: onReject propagation, dedup and logging-failure safety", () => {
+  // A LATE overflow is the one class resolveAraCopy cannot see: the skeleton
+  // fits, so the override is accepted, and only interpolation pushes it over.
+  // lists.editRoomTitle (cap 24) overflows once a long room name lands in it.
+  const LATE = { "lists.editRoomTitle": "Room {{roomNumber}} — {{roomTypeName}}" } as const;
+  const LONG = "Presidential Garden View Suite";
+
+  it("the override is ACCEPTED at resolve time — the skeleton fits", () => {
+    const r = resolveAraCopy(LATE);
+    expect(r.rejected).toEqual([]);
+    expect(r.overridden).toEqual(["lists.editRoomTitle"]);
+    expect(fillKey(r, "lists.editRoomTitle", { roomNumber: 1, roomTypeName: "Deluxe" }))
+      .toBe("Room 1 — Deluxe");
+  });
+
+  it("fires once per overflowing row, with key and reason only", () => {
+    const seen: CopyRejection[] = [];
+    const rows = buildManualModeSections(
+      st([room({ roomTypeName: LONG }), room({ roomTypeName: LONG })]),
+      [], resolveAraCopy(LATE), (r) => seen.push(r),
+    )[0]!.rows;
+
+    // Two rooms → two reports. fillKey does NOT dedup; that is the sink's job.
+    expect(seen).toHaveLength(2);
+    expect(seen[0]!.key).toBe("lists.editRoomTitle");
+    expect(seen[0]!.reason).toBe("too-long");
+    // The report carries lengths, never the hotel's text.
+    expect(seen[0]!.detail).toMatch(/^rendered \d+ > 24$/);
+    expect(JSON.stringify(seen)).not.toContain(LONG);
+
+    // And the row still ships the DEFAULT rendering, sliced as always.
+    expect(rows[0]!.title).toBe(
+      fillKey(DEFAULT_RESOLVED, "lists.editRoomTitle", { roomNumber: 1, roomTypeName: LONG })
+        .slice(0, 24),
+    );
+  });
+
+  it("never fires for a default, however long it renders", () => {
+    // The grandfathering rule: a default is never reported, because its
+    // rendering IS the contract. Same room name, no override.
+    const seen: CopyRejection[] = [];
+    buildManualModeSections(
+      st([room({ roomTypeName: LONG })]), [], DEFAULT_RESOLVED, (r) => seen.push(r),
+    );
+    expect(seen).toEqual([]);
+  });
+
+  it("reaches the sink through every threaded sender", async () => {
+    const state = st([room({ roomTypeName: LONG }), room({ roomTypeName: LONG })]);
+    const copy  = resolveAraCopy({
+      ...LATE,
+      "plans.rowTitleLegacy": "Plan {{number}} of ours today — {{total}}",  // cap 24
+    });
+
+    const hits: string[] = [];
+    const sink = (r: CopyRejection) => { hits.push(r.key); };
+
+    await trySendManualModeList({ ...ctx, state, addable: [], copy, onReject: sink });
+    expect(hits).toContain("lists.editRoomTitle");
+
+    hits.length = 0;
+    sendOutbound.mockReset();
+    sendOutbound.mockResolvedValue({ sent: true });
+    await trySendPlanList({
+      ...ctx, plans: [plan({ label: "" })], copy, onReject: sink,
+    });
+    expect(hits).toContain("plans.rowTitleLegacy");
+  });
+
+  it("a deduplicating sink collapses a burst to one report per key", () => {
+    // The contract flowRuntime's per-turn sink implements: the manual list
+    // renders one row per allocated room, so without dedup a single bad
+    // override would log once per room.
+    const logged: string[] = [];
+    const reported = new Set<string>();
+    const dedup = (r: CopyRejection) => {
+      if (reported.has(r.key)) return;
+      reported.add(r.key);
+      logged.push(r.key);
+    };
+
+    buildManualModeSections(
+      st(Array.from({ length: 12 }, () => room({ roomTypeName: LONG }))),
+      [], resolveAraCopy(LATE), dedup,
+    );
+    expect(logged).toEqual(["lists.editRoomTitle"]);
+  });
+
+  it("a THROWING sink degrades the sender to its text fallback, never a crash", async () => {
+    // Every modifyLists/planList sender builds inside its own try/catch, so a
+    // throwing sink is contained and the sender returns false — the caller then
+    // renders the plain-text alternative. Degraded, but no exception escapes.
+    const boom = () => { throw new Error("logger exploded"); };
+    const copy = resolveAraCopy(LATE);
+
+    await expect(trySendManualModeList({
+      ...ctx, state: st([room({ roomTypeName: LONG })]), addable: [],
+      copy, onReject: boom,
+    })).resolves.toBe(false);
+  });
+
+  it("a throwing sink DOES escape a pure builder — hence the sink's own guard", () => {
+    // The pure builders have no try/catch by design (they never throw on their
+    // own). So nothing but the sink itself can protect a caller that is not
+    // wrapped — which is exactly why flowRuntime's sink carries try/catch.
+    const boom = () => { throw new Error("logger exploded"); };
+    expect(() => buildManualModeSections(
+      st([room({ roomTypeName: LONG })]), [], resolveAraCopy(LATE), boom,
+    )).toThrow("logger exploded");
+  });
+});
+
+describe("2F: the flowRuntime sink", () => {
+  // flowRuntime imports prisma, queue/redis and ai.service, so it is read as
+  // TEXT — the technique ara/purity.test.ts and ara/copy.test.ts already use.
+  const src = readFileSync(join(__dirname, "..", "flowRuntime.ts"), "utf8");
+  const sink = src.slice(src.indexOf("const onAraCopyReject"), src.indexOf("return handleAdvancedRoomAllocation"));
+
+  it("exists, is bound into all eight senders, and is typed as the sink", () => {
+    expect(src).toContain("const onAraCopyReject: CopyRejectionSink");
+    expect(src.match(/onReject: onAraCopyReject/g) ?? []).toHaveLength(8);
+  });
+
+  it("deduplicates by key", () => {
+    expect(src).toContain("const araCopyReported = new Set<string>()");
+    expect(sink).toContain("araCopyReported.has(r.key)");
+    expect(sink).toContain("araCopyReported.add(r.key)");
+  });
+
+  it("wraps its logging in its own try/catch", () => {
+    expect(sink).toContain("try {");
+    expect(sink).toContain("} catch {");
+  });
+
+  it("logs the key and reason, and never the copy value", () => {
+    // The logged object is exactly these three fields — nothing else.
+    expect(sink).toContain("{ hotelId, key: r.key, reason: r.reason }");
+    // Not even `detail`, though it holds only lengths — the 2D precedent.
+    expect(sink).not.toContain("r.detail");
+    // And nothing reaches in for the resolved text itself.
+    expect(sink).not.toContain("araCopy.copy");
+    expect(sink).not.toContain("resolved.copy");
+  });
+
+  it("is declared per turn, inside the ARA case, not at module scope", () => {
+    // Module-level state is forbidden: Vaketta runs multiple processes and the
+    // Set must not outlive the turn, or a key would be reported once ever.
+    const caseStart = src.indexOf('case "advanced_room_allocation"');
+    expect(src.indexOf("const araCopyReported")).toBeGreaterThan(caseStart);
   });
 });

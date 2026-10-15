@@ -24,7 +24,10 @@ import type {
   RoomConfigResolver,
 } from "./advancedRoomAllocation";
 import type { RoomAction } from "./ara/types";
-import { DEFAULT_RESOLVED, fillKey, type ResolvedAraCopy } from "./ara/copy";
+import {
+  DEFAULT_RESOLVED, fillKey,
+  type CopyRejectionSink, type ResolvedAraCopy,
+} from "./ara/copy";
 
 const log = logger.child({ service: "modify-lists" });
 
@@ -83,6 +86,7 @@ export function buildRoomMenuSections(
   room:      AllocationRoom,
   options:   RoomAction[],
   copy:      ResolvedAraCopy = DEFAULT_RESOLVED,
+  onReject?: CopyRejectionSink,
 ): { title: string; rows: Array<{ id: string; title: string; description?: string }> }[] {
   const modRows = options.map((a) => ({
     id:          ACTION_IDS[a],
@@ -90,8 +94,8 @@ export function buildRoomMenuSections(
   }));
 
   return [
-    { title: fillKey(copy, "lists.modifyRoomSection"), rows: modRows },
-    { title: fillKey(copy, "lists.navigationSection"), rows: [{ id: MOD_GO_BACK, title: fillKey(copy, "lists.goBackRow") }] },
+    { title: fillKey(copy, "lists.modifyRoomSection", undefined, onReject), rows: modRows },
+    { title: fillKey(copy, "lists.navigationSection", undefined, onReject), rows: [{ id: MOD_GO_BACK, title: fillKey(copy, "lists.goBackRow", undefined, onReject) }] },
   ];
 }
 
@@ -106,6 +110,7 @@ export function buildMoveToRoomSections(
   pending:    { adults: number; children: number },
   resolveCfg: RoomConfigResolver,
   copy:       ResolvedAraCopy = DEFAULT_RESOLVED,
+  onReject?:  CopyRejectionSink,
 ): {
   sections: { title: string; rows: Array<{ id: string; title: string; description?: string }> }[];
   destIndices: number[];  // slot n (1-based) → state.selectedRooms[destIndices[n-1]]
@@ -123,7 +128,7 @@ export function buildMoveToRoomSections(
       children:    r.children,
       maxAdults:   cfg.maxAdults,
       maxChildren: cfg.maxChildren,
-    }).slice(0, ROW_DESC_MAX);
+    }, onReject).slice(0, ROW_DESC_MAX);
     rows.push({
       id:          `${MOVE_TO_ROOM_PREFIX}${slot}`,
       title:       r.roomTypeName.slice(0, 24),
@@ -131,12 +136,12 @@ export function buildMoveToRoomSections(
     });
   });
 
-  const navRow = { id: MOVE_GO_BACK, title: fillKey(copy, "lists.goBackRow") };
+  const navRow = { id: MOVE_GO_BACK, title: fillKey(copy, "lists.goBackRow", undefined, onReject) };
 
   return {
     sections: [
-      { title: fillKey(copy, "lists.availableRoomsSection"), rows },
-      { title: fillKey(copy, "lists.navigationSection"),     rows: [navRow] },
+      { title: fillKey(copy, "lists.availableRoomsSection", undefined, onReject), rows },
+      { title: fillKey(copy, "lists.navigationSection", undefined, onReject),     rows: [navRow] },
     ],
     destIndices,
   };
@@ -156,6 +161,7 @@ export function buildManualModeSections(
   state:   AraState,
   addable: AllocationRoomInput[],
   copy:    ResolvedAraCopy = DEFAULT_RESOLVED,
+  onReject?: CopyRejectionSink,
 ): { title: string; rows: Array<{ id: string; title: string; description?: string }> }[] {
   const n = state.selectedRooms.length;
 
@@ -164,11 +170,11 @@ export function buildManualModeSections(
     title:       fillKey(copy, "lists.editRoomTitle", {
       roomNumber:   i + 1,
       roomTypeName: r.roomTypeName,
-    }).slice(0, 24),
+    }, onReject).slice(0, 24),
     description: fillKey(copy, "lists.editRoomDesc", {
       occupancy: occupancyLabel(r),
       total:     inr(r.totalPrice),
-    }).slice(0, ROW_DESC_MAX),
+    }, onReject).slice(0, ROW_DESC_MAX),
   }));
 
   const addRows = addable.map((r, i) => ({
@@ -179,19 +185,19 @@ export function buildManualModeSections(
       maxChildren: r.maxChildren ?? "?",
       price:       inr(r.basePrice),
       available:   r.availableCount,
-    }).slice(0, ROW_DESC_MAX),
+    }, onReject).slice(0, ROW_DESC_MAX),
   }));
 
   const confirmRows = [
-    { id: MODIFY_DONE,    title: fillKey(copy, "lists.confirmBookingRow") },
-    { id: MODIFY_GO_BACK, title: fillKey(copy, "lists.goBackRow") },
+    { id: MODIFY_DONE,    title: fillKey(copy, "lists.confirmBookingRow", undefined, onReject) },
+    { id: MODIFY_GO_BACK, title: fillKey(copy, "lists.goBackRow", undefined, onReject) },
   ];
 
   const sections: { title: string; rows: Array<{ id: string; title: string; description?: string }> }[] = [];
 
-  if (editRows.length > 0)  sections.push({ title: fillKey(copy, "lists.editExistingSection"), rows: editRows });
-  if (addRows.length  > 0)  sections.push({ title: fillKey(copy, "lists.addRoomSection"),      rows: addRows  });
-  sections.push({ title: fillKey(copy, "lists.confirmSection"), rows: confirmRows });
+  if (editRows.length > 0)  sections.push({ title: fillKey(copy, "lists.editExistingSection", undefined, onReject), rows: editRows });
+  if (addRows.length  > 0)  sections.push({ title: fillKey(copy, "lists.addRoomSection", undefined, onReject),      rows: addRows  });
+  sections.push({ title: fillKey(copy, "lists.confirmSection", undefined, onReject), rows: confirmRows });
 
   return sections;
 }
@@ -218,17 +224,19 @@ export async function trySendRoomMenuList(args: {
   options:    RoomAction[];
   roomIndex:  number;
   copy?:      ResolvedAraCopy | undefined;
+  onReject?:  CopyRejectionSink | undefined;
 }): Promise<boolean> {
   const { hotelId, guestId, channel, room, options, roomIndex } = args;
   const copy = args.copy ?? DEFAULT_RESOLVED;
+  const onReject = args.onReject;
   try {
     const bodyText = `*Room ${roomIndex + 1}: ${room.roomTypeName}*\n👥 ${occupancyLabel(room)}\n💰 ${inr(room.pricePerNight)}/night\n\nWhat would you like to do?`;
     const res = await sendOutbound({ hotelId, guestId, channel }, {
       kind:        "choice",
       bodyText,
-      buttonLabel: fillKey(copy, "lists.buttonOptions"),
-      footerText:  fillKey(copy, "lists.cancelFooter"),
-      sections:    buildRoomMenuSections(room, options, copy),
+      buttonLabel: fillKey(copy, "lists.buttonOptions", undefined, onReject),
+      footerText:  fillKey(copy, "lists.cancelFooter", undefined, onReject),
+      sections:    buildRoomMenuSections(room, options, copy, onReject),
     });
     return res.sent;
   } catch (err) {
@@ -257,11 +265,13 @@ export async function trySendMoveToRoomList(args: {
   pending:    { adults: number; children: number };
   resolveCfg: RoomConfigResolver;
   copy?:      ResolvedAraCopy | undefined;
+  onReject?:  CopyRejectionSink | undefined;
 }): Promise<{ sent: boolean; destIndices: number[] }> {
   const { hotelId, guestId, channel, state, fromIndex, pending, resolveCfg } = args;
   const copy = args.copy ?? DEFAULT_RESOLVED;
+  const onReject = args.onReject;
   try {
-    const { sections, destIndices } = buildMoveToRoomSections(state, fromIndex, pending, resolveCfg, copy);
+    const { sections, destIndices } = buildMoveToRoomSections(state, fromIndex, pending, resolveCfg, copy, onReject);
     if (destIndices.length === 0) return { sent: false, destIndices: [] };
 
     const moving: string[] = [];
@@ -271,8 +281,8 @@ export async function trySendMoveToRoomList(args: {
     const res = await sendOutbound({ hotelId, guestId, channel }, {
       kind:        "choice",
       bodyText:    `Move ${moving.join(", ")} to which room?`,
-      buttonLabel: fillKey(copy, "lists.buttonChooseRoom"),
-      footerText:  fillKey(copy, "lists.cancelFooter"),
+      buttonLabel: fillKey(copy, "lists.buttonChooseRoom", undefined, onReject),
+      footerText:  fillKey(copy, "lists.cancelFooter", undefined, onReject),
       sections,
     });
     return { sent: res.sent, destIndices: res.sent ? destIndices : [] };
@@ -304,6 +314,7 @@ export function parseChangeTypeReply(raw: string): string | null {
 export function buildChangeTypeSections(
   candidates: AllocationRoomInput[],
   copy:       ResolvedAraCopy = DEFAULT_RESOLVED,
+  onReject?:  CopyRejectionSink,
 ): { title: string; rows: Array<{ id: string; title: string; description?: string }> }[] {
   const typeRows = candidates.map((r) => ({
     id:          `${CHANGE_TYPE_PREFIX}${r.roomTypeId}`,
@@ -311,12 +322,12 @@ export function buildChangeTypeSections(
     description: fillKey(copy, "lists.changeTypeDesc", {
       price:     inr(r.basePrice),
       available: r.availableCount,
-    }).slice(0, ROW_DESC_MAX),
+    }, onReject).slice(0, ROW_DESC_MAX),
   }));
 
   return [
-    { title: fillKey(copy, "lists.availableTypesSection"), rows: typeRows },
-    { title: fillKey(copy, "lists.navigationSection"),     rows: [{ id: CHANGE_TYPE_GO_BACK, title: fillKey(copy, "lists.goBackRow") }] },
+    { title: fillKey(copy, "lists.availableTypesSection", undefined, onReject), rows: typeRows },
+    { title: fillKey(copy, "lists.navigationSection", undefined, onReject),     rows: [{ id: CHANGE_TYPE_GO_BACK, title: fillKey(copy, "lists.goBackRow", undefined, onReject) }] },
   ];
 }
 
@@ -336,16 +347,18 @@ export async function trySendChangeRoomTypeList(args: {
   roomIndex:  number;
   candidates: AllocationRoomInput[];
   copy?:      ResolvedAraCopy | undefined;
+  onReject?:  CopyRejectionSink | undefined;
 }): Promise<boolean> {
   const { hotelId, guestId, channel, roomIndex, candidates } = args;
   const copy = args.copy ?? DEFAULT_RESOLVED;
+  const onReject = args.onReject;
   try {
     const res = await sendOutbound({ hotelId, guestId, channel }, {
       kind:        "choice",
-      bodyText:    fillKey(copy, "changeType.listBody", { roomNumber: roomIndex + 1 }),
-      buttonLabel: fillKey(copy, "lists.buttonChooseType"),
-      footerText:  fillKey(copy, "lists.cancelFooter"),
-      sections:    buildChangeTypeSections(candidates, copy),
+      bodyText:    fillKey(copy, "changeType.listBody", { roomNumber: roomIndex + 1 }, onReject),
+      buttonLabel: fillKey(copy, "lists.buttonChooseType", undefined, onReject),
+      footerText:  fillKey(copy, "lists.cancelFooter", undefined, onReject),
+      sections:    buildChangeTypeSections(candidates, copy, onReject),
     });
     return res.sent;
   } catch (err) {
@@ -370,9 +383,11 @@ export async function trySendManualModeList(args: {
   state:   AraState;
   addable: AllocationRoomInput[];
   copy?:   ResolvedAraCopy | undefined;
+  onReject?: CopyRejectionSink | undefined;
 }): Promise<boolean> {
   const { hotelId, guestId, channel, state, addable } = args;
   const copy = args.copy ?? DEFAULT_RESOLVED;
+  const onReject = args.onReject;
   try {
     const total  = state.selectedRooms.reduce((s, r) => s + r.totalPrice, 0);
     const rooms  = state.selectedRooms;
@@ -385,9 +400,9 @@ export async function trySendManualModeList(args: {
     const res = await sendOutbound({ hotelId, guestId, channel }, {
       kind:        "choice",
       bodyText:    summary,
-      buttonLabel: fillKey(copy, "lists.buttonEditBooking"),
-      footerText:  fillKey(copy, "lists.cancelFooter"),
-      sections:    buildManualModeSections(state, addable, copy),
+      buttonLabel: fillKey(copy, "lists.buttonEditBooking", undefined, onReject),
+      footerText:  fillKey(copy, "lists.cancelFooter", undefined, onReject),
+      sections:    buildManualModeSections(state, addable, copy, onReject),
     });
     return res.sent;
   } catch (err) {
