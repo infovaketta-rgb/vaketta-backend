@@ -12,7 +12,7 @@
  */
 import { redis } from "../queue/redis";
 import { logger } from "../utils/logger";
-import { expireOverdueSubscriptions, renewDueSubscriptions } from "../services/billing.service";
+import { convertDueTrials, expireOverdueSubscriptions, renewDueSubscriptions } from "../services/billing.service";
 import { advanceDelinquent, notifyRecentlySuspended, sendRenewalReminders } from "../services/dunning.service";
 import { syncPendingTemplates } from "../services/templates.service";
 
@@ -61,14 +61,23 @@ async function withLock(key: string, ttlSecs: number, fn: () => Promise<void>): 
 }
 
 /**
- * The billing tick. Order matters:
- *   1. RENEW first — a subscription whose period just ended should roll into the
- *      next one and be invoiced, not be treated as lapsed. Running expiry first
- *      would suspend every paying hotel the moment its period ended.
- *   2. Then advance delinquency (overdue invoice → PAST_DUE → suspended).
- *   3. Then expire whatever genuinely ran out of time (ended trials, cancelled
- *      plans reaching their date).
- *   4. Then notify.
+ * The billing tick — MATERIALISATION ONLY.
+ *
+ * This tick does not decide who has access. `billing/effectiveStatus.ts` already
+ * answered that from the clock on every request, so a late, slow or failed tick
+ * cannot suspend a paying customer or extend a lapsed one. What runs here is the
+ * durable bookkeeping: persisting rolled periods, creating subscriptions for
+ * converted trials, issuing invoices, and sending mail.
+ *
+ * Order still matters, because each step's writes feed the next:
+ *   1. CONVERT trials whose scheduled plan has come into force — they are
+ *      already ACTIVE to the customer; this writes the paid subscription down.
+ *   2. RENEW — roll due periods and invoice each one closed.
+ *   3. Then advance delinquency (overdue invoice → PAST_DUE → suspended).
+ *   4. Then expire whatever genuinely ran out of time. This step re-asks the
+ *      resolver per hotel, so a conversion or renewal that failed above is NOT
+ *      mistaken for a lapse.
+ *   5. Then notify.
  *
  * Every pass is individually idempotent (see billing.service / dunning.service),
  * so a partial failure mid-tick is corrected on the next one. Each is also
@@ -85,6 +94,9 @@ async function runBillingTick(): Promise<void> {
         return null;
       }
     };
+
+    const converted = (await step("convertTrials", convertDueTrials)) as number | null;
+    if (converted) log.info({ count: converted }, "materialised trial → paid conversions");
 
     const renewed = (await step("renew", renewDueSubscriptions)) as number | null;
     if (renewed) log.info({ count: renewed }, "renewed subscriptions");

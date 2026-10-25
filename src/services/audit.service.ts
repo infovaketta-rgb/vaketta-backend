@@ -31,16 +31,40 @@ export type AuditActorType = "ADMIN" | "SYSTEM";
 /** Billing event types. Kept as a union so typos surface at compile time. */
 export type BillingEventType =
   | "plan.assigned"
+  /** A paid plan queued to begin at a trial's exclusive end. */
+  | "plan.scheduled"
   | "plan.created"
   | "plan.updated"
   | "trial.started"
+  /** A scheduled plan materialised into a live paid subscription. */
+  | "trial.converted"
   | "subscription.renewed"
   | "subscription.canceled"
   | "subscription.past_due"
   | "subscription.expired"
+  /** Service restored after a settled invoice cleared the outstanding balance. */
+  | "subscription.reactivated"
   | "invoice.issued"
   | "invoice.paid"
+  /** A money-destroying admin action that previously left no trail at all. */
+  | "invoice.voided"
   | "payment.recorded"
+  /** A hotel submitted an offline payment CLAIM. No money has moved. */
+  | "payment.manual_submitted"
+  /** An admin verified a claim; settlement follows via transitionPayment. */
+  | "payment.manual_approved"
+  /** An admin rejected a claim; the invoice stays OPEN. */
+  | "payment.manual_rejected"
+  /** A Razorpay Order was opened against an invoice (no money moved yet). */
+  | "payment.gateway_order_created"
+  /** A signed gateway payment passed every guard and was credited. */
+  | "payment.gateway_verified"
+  /** A signed gateway payment was REFUSED (amount/currency/void mismatch). */
+  | "payment.gateway_rejected"
+  /** PENDING → SUCCEEDED, i.e. money confirmed after the row was created. */
+  | "payment.succeeded"
+  /** PENDING → FAILED, with the gateway/admin reason in `data`. */
+  | "payment.failed"
   | "notice.renewal_upcoming"
   | "notice.past_due"
   | "notice.expired";

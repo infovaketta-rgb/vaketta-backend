@@ -24,7 +24,7 @@ import {
   buildRoomDescriptionsMessage,
   renderPlanTextFallback,
   extractAgesRegex,
-  needsAiAgeParse,
+  isBareAgeList,
   accumulateAges,
   reclassifyGuests,
   buildOccupancyNotice,
@@ -1966,13 +1966,27 @@ describe("children-age parsing helpers", () => {
     expect(extractAgesRegex("no kids")).toEqual([]);
   });
 
-  it("AP2: needsAiAgeParse — false for plain digits, true for empty or relative words", () => {
-    expect(needsAiAgeParse("8, 12 and 5")).toBe(false);     // regex handles it
-    expect(needsAiAgeParse("no idea")).toBe(true);          // no digits
-    expect(needsAiAgeParse("the twins are 8")).toBe(true);  // relative word
-    expect(needsAiAgeParse("both are 6")).toBe(true);
-    expect(needsAiAgeParse("eldest is 12")).toBe(true);
-    expect(needsAiAgeParse("they are the same age, 7")).toBe(true);
+  it("AP2: isBareAgeList — true only for a bare list of ages", () => {
+    // Bare lists — the regex is authoritative, no AI needed.
+    expect(isBareAgeList("8, 12 and 5")).toBe(true);
+    expect(isBareAgeList("13")).toBe(true);
+    expect(isBareAgeList("5 8 12")).toBe(true);
+    expect(isBareAgeList("5-8-12")).toBe(true);
+    expect(isBareAgeList("6 & 9")).toBe(true);
+    // Everything else routes to the AI, including the phrasings the old
+    // AGE_TRIGGER_WORDS list had to enumerate one by one.
+    expect(isBareAgeList("no idea")).toBe(false);           // no digits
+    expect(isBareAgeList("")).toBe(false);                  // empty
+    expect(isBareAgeList("the twins are 8")).toBe(false);
+    expect(isBareAgeList("both are 6")).toBe(false);
+    expect(isBareAgeList("eldest is 12")).toBe(false);
+    expect(isBareAgeList("they are the same age, 7")).toBe(false);
+    // …and the quantifier shapes it never covered.
+    expect(isBareAgeList("all 5")).toBe(false);
+    expect(isBareAgeList("everyone is 5")).toBe(false);
+    expect(isBareAgeList("each is 5")).toBe(false);
+    expect(isBareAgeList("all 3 are 5")).toBe(false);
+    expect(isBareAgeList("we have 2 rooms, kids are 5 and 8")).toBe(false);
   });
 
   it("AP3: accumulateAges — complete / partial / over", () => {
@@ -2105,6 +2119,10 @@ describe("collecting_ages handler", () => {
     });
     await handleAdvancedRoomAllocation(deps);
     expect(extractChildrenAges).toHaveBeenCalledTimes(1);  // ambiguous → AI
+    // AI-parsed ages are read back before allocating; confirm to proceed.
+    expect(readAra(deps).phase).toBe("confirming_ages");
+    (deps as { input: string }).input = "1";
+    await handleAdvancedRoomAllocation(deps);
     expect(deps.flowData.flowVars["effectiveChildren"]).toBe("2");
     expect(readAra(deps).phase).not.toBe("collecting_ages");
   });
@@ -2178,6 +2196,277 @@ describe("collecting_ages handler", () => {
     await handleAdvancedRoomAllocation(deps);
     expect(sendOccupancyNotice).not.toHaveBeenCalled();
     expect(deps.flowData.flowVars["promotedToAdult"]).toBe("0");
+  });
+
+  // ── Gate inversion (isBareAgeList) ──────────────────────────────────────────
+  // The regex is authoritative only for a bare list of ages; every other shape
+  // must reach deps.extractChildrenAges. The quantifier replies below are the
+  // ones the old AGE_TRIGGER_WORDS gate answered wrongly and silently, because
+  // they contain a digit and none of its listed words.
+
+  /** Run one age reply through the handler; returns the ages that came out. */
+  async function runAgeReply(
+    input: string,
+    children: number,
+    ai?: (reply: string, childrenCount: number) => Promise<number[] | null>,
+  ) {
+    const extractChildrenAges = ai ? vi.fn(ai) : undefined;
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(collectState(2, children)) },
+      rooms: famRoom(),
+      input,
+      childAgeLimit: 12,
+      ...(extractChildrenAges ? { extractChildrenAges } : {}),
+    });
+    await handleAdvancedRoomAllocation(deps);
+    const raw = deps.flowData.flowVars["effectiveChildrenAges"];
+    return { ages: raw ? (JSON.parse(raw) as number[]) : null, extractChildrenAges, deps };
+  }
+
+  /**
+   * One age reply, then a confirming "1" if the node read the ages back.
+   * Uncertain paths (AI-parsed, or sliced by "over") now cost one extra turn;
+   * these tests care about the ages that finally reach allocation. The turn
+   * itself is the subject of CA21+.
+   */
+  async function runAgeReplyConfirmed(
+    input: string,
+    children: number,
+    ai?: (reply: string, childrenCount: number) => Promise<number[] | null>,
+  ) {
+    const r = await runAgeReply(input, children, ai);
+    const state = r.deps.flowData.flowVars["__araState__"];
+    if (state && (JSON.parse(state) as AraState).phase === "confirming_ages") {
+      (r.deps as { input: string }).input = "1";
+      await handleAdvancedRoomAllocation(r.deps);
+      const raw = r.deps.flowData.flowVars["effectiveChildrenAges"];
+      return { ...r, ages: raw ? (JSON.parse(raw) as number[]) : null, echoed: true };
+    }
+    return { ...r, echoed: false };
+  }
+
+  /**
+   * Stand-in for the real AI parser: uses the childrenCount context exactly as
+   * the prompt instructs — discard a number that merely restates the count, then
+   * repeat the remaining age once per child.
+   */
+  const aiExpandsQuantifier = async (reply: string, childrenCount: number) => {
+    const nums = (reply.match(/\d+/g) ?? []).map(Number).filter((n) => n !== childrenCount);
+    const age  = nums.pop();
+    return age === undefined ? null : (Array(childrenCount).fill(age) as number[]);
+  };
+
+  it("CA8: 'all 5' for 3 children → [5,5,5] via the AI, which gets the count", async () => {
+    const { ages, extractChildrenAges } = await runAgeReplyConfirmed("all 5", 3, aiExpandsQuantifier);
+    expect(extractChildrenAges).toHaveBeenCalledWith("all 5", 3);
+    expect(ages).toEqual([5, 5, 5]);
+  });
+
+  it("CA9: 'everyone is 5' for 3 children → [5,5,5]", async () => {
+    const { ages, extractChildrenAges } = await runAgeReplyConfirmed("everyone is 5", 3, aiExpandsQuantifier);
+    expect(extractChildrenAges).toHaveBeenCalledTimes(1);
+    expect(ages).toEqual([5, 5, 5]);
+  });
+
+  it("CA10: 'each is 5' for 3 children → [5,5,5]", async () => {
+    const { ages } = await runAgeReplyConfirmed("each is 5", 3, aiExpandsQuantifier);
+    expect(ages).toEqual([5, 5, 5]);
+  });
+
+  it("CA11: 'all 3 are 5' → [5,5,5]; the 3 is a count, never an age", async () => {
+    const { ages } = await runAgeReplyConfirmed("all 3 are 5", 3, aiExpandsQuantifier);
+    expect(ages).toEqual([5, 5, 5]);
+    expect(ages).not.toEqual([3, 5, 0]);   // what the regex gate produced
+  });
+
+  it("CA12: '5, 8 and 12' is a bare list → regex only, no AI call", async () => {
+    const { ages, extractChildrenAges } = await runAgeReply("5, 8 and 12", 3, aiExpandsQuantifier);
+    expect(extractChildrenAges).not.toHaveBeenCalled();
+    expect(ages).toEqual([5, 8, 12]);
+  });
+
+  it("CA13: 'we have 2 rooms, kids are 5 and 8' → [5,8], not the regex's [2,5]", async () => {
+    const ai = async () => [5, 8];
+    const { ages, extractChildrenAges } = await runAgeReplyConfirmed("we have 2 rooms, kids are 5 and 8", 2, ai);
+    expect(extractChildrenAges).toHaveBeenCalledWith("we have 2 rooms, kids are 5 and 8", 2);
+    expect(ages).toEqual([5, 8]);
+    expect(ages).not.toEqual([2, 5]);      // the embedded room count as an age
+  });
+
+  it("CA14: AI returns null → falls back to the regex result, no throw", async () => {
+    const ai = vi.fn(async () => null);
+    const { ages, extractChildrenAges } = await runAgeReplyConfirmed("kids are 5 and 8 years old", 2, ai);
+    expect(extractChildrenAges).toHaveBeenCalledTimes(1);
+    expect(ages).toEqual([5, 8]);
+  });
+
+  it("CA15: AI throws → falls back to the regex result, no throw", async () => {
+    const ai = async () => { throw new Error("provider down"); };
+    const { ages } = await runAgeReplyConfirmed("kids are 5 and 8 years old", 2, ai);
+    expect(ages).toEqual([5, 8]);
+  });
+
+  it("CA16: no AI dep → unchanged regex behaviour (documented fallback)", async () => {
+    const { ages } = await runAgeReplyConfirmed("we have 2 rooms, kids are 5 and 8", 2);
+    expect(ages).toEqual([2, 5]);          // regex-only: the room count leaks in
+  });
+
+  // ── Fewer ages than children must stay short ────────────────────────────────
+  // The count given to the AI parser is context, not a quota (see the prompt in
+  // ai.service). A reply naming two children when three are expected has to come
+  // back as two ages and re-prompt — never be topped up to three.
+
+  it("CA17: bare '5 and 8' for 3 children → partial re-prompt, no third age", async () => {
+    // Bare list, so this never reaches the AI: the regex result stands as-is.
+    const { ages, deps, extractChildrenAges } = await runAgeReply("5 and 8", 3, async () => [5, 8, 8]);
+    expect(extractChildrenAges).not.toHaveBeenCalled();
+    expect(ages).toBeNull();                                   // did not proceed
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("collecting_ages");
+    expect(ara.ageCollection!.collectedAges).toEqual([5, 8]);   // exactly what was said
+    expect(ara.ageCollection!.collectedAges).toHaveLength(2);
+  });
+
+  it("CA18: AI returns 2 ages for 3 children → partial re-prompt, no zero-fill", async () => {
+    const ai = vi.fn(async () => [5, 8]);
+    const { ages, deps } = await runAgeReply("my kids are 5 and 8", 3, ai);
+    expect(ai).toHaveBeenCalledWith("my kids are 5 and 8", 3);
+    expect(ages).toBeNull();
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("collecting_ages");
+    expect(ara.ageCollection!.collectedAges).toEqual([5, 8]);
+    expect(ara.ageCollection!.rounds).toBe(1);                 // budget untouched
+  });
+
+  it("CA19: 'all 5' for 3 children still completes at [5,5,5]", async () => {
+    // The legitimate expansion the prompt must keep — the counterpart to CA17/18.
+    const { ages } = await runAgeReplyConfirmed("all 5", 3, aiExpandsQuantifier);
+    expect(ages).toEqual([5, 5, 5]);
+  });
+
+  // The padding gap is still undetectable at this boundary — number[] carries no
+  // provenance, so [5,8,8] and a legitimate [5,5,5] are the same shape. What
+  // changed is that it no longer reaches allocation unseen: the guest is shown
+  // the ages and can reject them. Prompt-side mitigation plus a human check.
+  it("CA20: a padded AI response is echoed to the guest, not allocated", async () => {
+    const padded = vi.fn(async () => [5, 8, 8]);   // third age was never stated
+    const { ages, deps } = await runAgeReply("my kids are 5 and 8", 3, padded);
+    expect(ages).toBeNull();                                    // did NOT allocate
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("confirming_ages");
+    expect(ara.ageConfirm!.ages).toEqual([5, 8, 8]);            // shown as-is
+  });
+
+  // ── Read-back sub-phase ─────────────────────────────────────────────────────
+
+  it("CA21: bare list at exactly childrenCount → allocates in one turn, no echo", async () => {
+    const { ages, deps, echoed } = await runAgeReplyConfirmed("5, 8 and 12", 3, aiExpandsQuantifier);
+    expect(echoed).toBe(false);                                 // no extra turn
+    expect(readAra(deps).phase).not.toBe("confirming_ages");
+    expect(ages).toEqual([5, 8, 12]);
+  });
+
+  it("CA22: an AI-parsed result is echoed with the ages before allocating", async () => {
+    const { deps } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("confirming_ages");
+    expect(ara.ageConfirm).toEqual({ ages: [5, 5, 5], corrections: 0 });
+    expect(deps.flowData.flowVars["effectiveChildrenAges"]).toBeUndefined();
+  });
+
+  it("CA23: an 'over' result is echoed even on the bare-list path", async () => {
+    // Bare list, no AI — but accumulateAges sliced the 15 off, so what we would
+    // allocate with is not what the guest typed.
+    const { deps, extractChildrenAges } = await runAgeReply("5, 8, 12, 15", 3, aiExpandsQuantifier);
+    expect(extractChildrenAges).not.toHaveBeenCalled();
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("confirming_ages");
+    expect(ara.ageConfirm!.ages).toEqual([5, 8, 12]);           // slice untouched
+  });
+
+  it("CA24: confirming the read-back allocates with exactly those ages", async () => {
+    const { deps } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+    (deps as { input: string }).input = "1";
+    await handleAdvancedRoomAllocation(deps);
+    expect(JSON.parse(deps.flowData.flowVars["effectiveChildrenAges"]!)).toEqual([5, 5, 5]);
+    expect(readAra(deps).phase).not.toBe("confirming_ages");
+  });
+  it("CA25: rejecting re-prompts once, then a second rejection proceeds", async () => {
+    const { deps } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+
+    // First rejection: clears the ages and asks for a plain list.
+    (deps as { input: string }).input = "2";
+    const reprompt = await handleAdvancedRoomAllocation(deps);
+    expect(reprompt).toMatch(/plain list/i);
+    let ara = readAra(deps);
+    expect(ara.phase).toBe("collecting_ages");
+    expect(ara.ageCollection!.collectedAges).toEqual([]);
+    expect(ara.ageConfirm!.corrections).toBe(1);
+
+    // Vague again: echoed again, but the correction budget is already spent.
+    (deps as { input: string }).input = "all 6";
+    await handleAdvancedRoomAllocation(deps);
+    ara = readAra(deps);
+    expect(ara.phase).toBe("confirming_ages");
+    expect(ara.ageConfirm).toEqual({ ages: [6, 6, 6], corrections: 1 });
+
+    // Second rejection must NOT loop: it proceeds with what we have.
+    (deps as { input: string }).input = "2";
+    await handleAdvancedRoomAllocation(deps);
+    expect(JSON.parse(deps.flowData.flowVars["effectiveChildrenAges"]!)).toEqual([6, 6, 6]);
+    expect(readAra(deps).phase).not.toBe("collecting_ages");
+  });
+
+  it("CA26: an unparsed reply re-shows the question without spending the budget", async () => {
+    const { deps } = await runAgeReply("all 5", 3, aiExpandsQuantifier);
+    (deps as { input: string }).input = "what time is check in?";
+    const again = await handleAdvancedRoomAllocation(deps);
+    expect(again).toMatch(/just to confirm/i);
+    const ara = readAra(deps);
+    expect(ara.phase).toBe("confirming_ages");
+    expect(ara.ageConfirm!.corrections).toBe(0);
+  });
+
+  it("CA27: old-shape AraState (no aiUsed, no ageConfirm) does not throw", async () => {
+    // Exactly what a session serialised before this sub-phase existed looks like.
+    const legacy = {
+      guests:          { adults: 2, children: 2 },
+      selectedRooms:   [],
+      remainingGuests: { adults: 0, children: 0 },
+      phase:           "collecting_ages",
+      ageCollection:   { adults: 2, children: 2, childrenCount: 2, collectedAges: [], rounds: 0 },
+    };
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(legacy) },
+      rooms: famRoom(),
+      input: "5, 8",
+      childAgeLimit: 12,
+    });
+    await expect(handleAdvancedRoomAllocation(deps)).resolves.not.toThrow();
+    // Bare list at the exact count: proceeds in one turn, as it always did.
+    expect(JSON.parse(deps.flowData.flowVars["effectiveChildrenAges"]!)).toEqual([5, 8]);
+  });
+
+  it("CA28: confirming_ages with no ageConfirm falls back, does not throw", async () => {
+    // Defensive: a truncated blob carrying the new phase but no pending ages.
+    const broken = {
+      guests:          { adults: 2, children: 2 },
+      selectedRooms:   [],
+      remainingGuests: { adults: 0, children: 0 },
+      phase:           "confirming_ages",
+      ageCollection:   { adults: 2, children: 2, childrenCount: 2, collectedAges: [], rounds: 0 },
+    };
+    const deps = makeDeps({
+      waitingFor: "answer",
+      flowVars: { __araState__: JSON.stringify(broken) },
+      rooms: famRoom(),
+      input: "5, 8",
+      childAgeLimit: 12,
+    });
+    await expect(handleAdvancedRoomAllocation(deps)).resolves.not.toThrow();
+    expect(JSON.parse(deps.flowData.flowVars["effectiveChildrenAges"]!)).toEqual([5, 8]);
   });
 });
 

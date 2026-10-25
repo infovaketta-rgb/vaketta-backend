@@ -23,11 +23,27 @@
  *    timezone (PlatformSettings.billingTimezone), using the same
  *    `Intl` + "en-CA" technique as automation/guestDate.ts `todayInTZ`.
  *
- * BILLING MODEL: calendar-aligned with a prorated first period.
- * The first period runs signup → start of next month and is invoiced pro rata;
- * every period after it is a whole calendar month. This keeps billing periods
- * exactly aligned with UsageRecord's "YYYY-MM" key, so overage math needs no
- * re-keying of the meter.
+ * BILLING MODEL: **anchored monthly periods** (replaced calendar-aligned).
+ * ---------------------------------------------------------------------
+ * A subscription is anchored to its billing start DAY, not to the calendar
+ * month. Anchor 15 gives 15 Aug → 15 Sep → 15 Oct …; anchor 1 gives the old
+ * calendar behaviour as a special case, which is why existing hotels are
+ * unaffected by the change.
+ *
+ * Periods are HALF-OPEN `[periodStart, periodEnd)`. `periodEnd` is the exact
+ * instant the next period begins — one shared boundary, so chained periods can
+ * neither gap nor overlap by construction. We never store a `23:59:59` end.
+ * A UI that wants to show an inclusive last day renders `periodEnd - 1ms`.
+ *
+ * THE ANCHOR IS STORED, NOT RE-DERIVED. `Subscription.billingAnchorDay` keeps
+ * the original day-of-month even when a short month clamps it, so
+ * 31 Jan → 28 Feb → 31 Mar → 30 Apr → 31 May. Re-deriving the anchor from each
+ * clamped period start would ratchet 31 → 28 permanently after one February.
+ *
+ * The previous model (`computeFirstPeriod` / `computeNextPeriod`: signup →
+ * start of next month, then whole calendar months) is GONE. It threw the anchor
+ * away after the first period, which is what produced "15 Aug 2026 → 01 Sep
+ * 2026" for a subscription that started on the 15th.
  */
 
 /** Fallback when PlatformSettings can't be read. Matches the schema default. */
@@ -151,29 +167,209 @@ export function startOfNextMonthInTZ(date: Date, timeZone: string = DEFAULT_BILL
     : zonedMidnightUTC(year, month + 1, 1, timeZone);
 }
 
-// ── Periods ──────────────────────────────────────────────────────────────────
+// ── Days ─────────────────────────────────────────────────────────────────────
+
+/** Local-midnight instant of the calendar day containing `date`, in `timeZone`. */
+export function startOfDayInTZ(date: Date, timeZone: string = DEFAULT_BILLING_TIMEZONE): Date {
+  const { year, month, day } = partsInTZ(date, timeZone);
+  return zonedMidnightUTC(year, month, day, timeZone);
+}
 
 /**
- * The first (partial) billing period: signup instant → start of next month.
+ * Local midnight `n` calendar days after the day containing `date`.
  *
- * This is the fix for the back-dating bug: the period no longer starts before
- * the hotel existed, so `billingEndDate < now` can't fire immediately.
+ * Calendar arithmetic, not `+ n * 86_400_000`: across a DST transition a day is
+ * 23 or 25 hours long, and a trial boundary must land on midnight regardless.
  */
-export function computeFirstPeriod(now: Date, timeZone: string = DEFAULT_BILLING_TIMEZONE): Period {
-  return { periodStart: now, periodEnd: startOfNextMonthInTZ(now, timeZone) };
+export function addDaysInTZ(date: Date, n: number, timeZone: string = DEFAULT_BILLING_TIMEZONE): Date {
+  const { year, month, day } = partsInTZ(date, timeZone);
+  // Date.UTC normalises overflow (day 32 → the 1st of the next month) for us.
+  const shifted = new Date(Date.UTC(year, month - 1, day + n));
+  return zonedMidnightUTC(shifted.getUTCFullYear(), shifted.getUTCMonth() + 1, shifted.getUTCDate(), timeZone);
 }
 
-/** The next whole calendar month following `periodEnd`. Used by renewal. */
-export function computeNextPeriod(periodEnd: Date, timeZone: string = DEFAULT_BILLING_TIMEZONE): Period {
-  return { periodStart: periodEnd, periodEnd: startOfNextMonthInTZ(periodEnd, timeZone) };
+// ── Anchored monthly periods ─────────────────────────────────────────────────
+
+/** Day-of-month a subscription recurs on: 1–31. */
+export type AnchorDay = number;
+
+/** Coerce anything to a usable anchor day. Junk → 1, the safest anchor. */
+export function clampAnchorDay(day: unknown): AnchorDay {
+  const n = typeof day === "number" ? Math.trunc(day) : Number.NaN;
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(31, Math.max(1, n));
 }
+
+/** The anchor day implied by an instant, read in `timeZone`. */
+export function anchorDayOf(date: Date, timeZone: string = DEFAULT_BILLING_TIMEZONE): AnchorDay {
+  return clampAnchorDay(partsInTZ(date, timeZone).day);
+}
+
+/** Whole days in a given 1-based calendar month. Handles leap years. */
+export function daysInYearMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+/** Shift a 1-based year/month pair by `n` months. Correct for negative `n`. */
+function shiftMonth(year: number, month: number, n: number): { year: number; month: number } {
+  const total = year * 12 + (month - 1) + n;
+  const m = ((total % 12) + 12) % 12;
+  return { year: Math.floor(total / 12), month: m + 1 };
+}
+
+/**
+ * Local midnight of the anchor day, `n` months from the month containing
+ * `date`, clamped to the target month's length.
+ *
+ * Clamping is per-month and never mutates the anchor, so an anchor of 31
+ * survives February: 31 Jan +1 → 28 Feb, 31 Jan +2 → 31 Mar.
+ */
+export function addMonthsAnchored(
+  date: Date,
+  n: number,
+  anchorDay: AnchorDay,
+  timeZone: string = DEFAULT_BILLING_TIMEZONE,
+): Date {
+  const { year, month } = partsInTZ(date, timeZone);
+  const target = shiftMonth(year, month, n);
+  const day = Math.min(clampAnchorDay(anchorDay), daysInYearMonth(target.year, target.month));
+  return zonedMidnightUTC(target.year, target.month, day, timeZone);
+}
+
+/**
+ * The first anchor boundary STRICTLY after `from`.
+ *
+ * For a period start that already sits on its anchor this is simply +1 month,
+ * which is the normal case. It matters when a start is OFF its anchor — after a
+ * goodwill extension, or on a legacy row — where "+1 month" can overshoot.
+ *
+ * Concretely: anchor 15, a period extended to end 5 Oct. `+1 month` reads 5 Oct
+ * as October and lands on 15 NOVEMBER, skipping straight past 15 October and
+ * handing the customer an extra free month (a measured 41-day period). Asking
+ * for the next anchor after 5 Oct correctly gives 15 Oct, so the schedule
+ * realigns with one short period instead.
+ */
+export function nextAnchorAfter(
+  from: Date,
+  anchorDay: AnchorDay,
+  timeZone: string = DEFAULT_BILLING_TIMEZONE,
+): Date {
+  // This month's own anchor occurrence — usable only if it is still ahead.
+  const thisMonth = addMonthsAnchored(from, 0, anchorDay, timeZone);
+  if (thisMonth.getTime() > from.getTime()) return thisMonth;
+  return addMonthsAnchored(from, 1, anchorDay, timeZone);
+}
+
+/**
+ * The billing period that begins at `periodStart`.
+ *
+ * `periodStart` is taken as given (so a legacy row's exact stored start is
+ * preserved); the end is the next anchor boundary after it — normally a whole
+ * month, and never an overshoot when the start is off-anchor.
+ */
+export function computeAnchoredPeriod(
+  periodStart: Date,
+  anchorDay: AnchorDay,
+  timeZone: string = DEFAULT_BILLING_TIMEZONE,
+): Period {
+  return { periodStart, periodEnd: nextAnchorAfter(periodStart, anchorDay, timeZone) };
+}
+
+/**
+ * The period following `period`. Starts exactly where the previous one ended —
+ * the shared boundary that makes gaps and overlaps structurally impossible.
+ */
+export function nextAnchoredPeriod(
+  period: Period,
+  anchorDay: AnchorDay,
+  timeZone: string = DEFAULT_BILLING_TIMEZONE,
+): Period {
+  return computeAnchoredPeriod(period.periodEnd, anchorDay, timeZone);
+}
+
+/**
+ * The period containing `at`, rolling forward from `anchorStart`.
+ *
+ * This is what makes access ZERO-DELAY: a subscription whose stored period
+ * ended while the cron was asleep still resolves to the period it is *actually*
+ * in, computed from the clock alone. `at` before `anchorStart` returns the
+ * first period — we never invent a period predating the subscription.
+ *
+ * O(1) in practice: it jumps by whole months first, then corrects by at most
+ * one step (the guards are defensive, not load-bearing).
+ */
+export function periodContaining(
+  anchorStart: Date,
+  anchorDay: AnchorDay,
+  at: Date,
+  timeZone: string = DEFAULT_BILLING_TIMEZONE,
+): Period {
+  let period = computeAnchoredPeriod(anchorStart, anchorDay, timeZone);
+  if (at.getTime() < period.periodEnd.getTime()) return period;
+
+  const from = partsInTZ(anchorStart, timeZone);
+  const to = partsInTZ(at, timeZone);
+  const monthsApart = (to.year * 12 + to.month - 1) - (from.year * 12 + from.month - 1);
+
+  // Land one month short of `at`'s month, then step forward at most once:
+  // `at` is either before this period's anchor day (already inside) or after it.
+  const jump = Math.max(1, monthsApart - 1);
+  period = computeAnchoredPeriod(addMonthsAnchored(anchorStart, jump, anchorDay, timeZone), anchorDay, timeZone);
+
+  let guard = 0;
+  while (at.getTime() >= period.periodEnd.getTime() && guard++ < 24) {
+    period = nextAnchoredPeriod(period, anchorDay, timeZone);
+  }
+  while (period.periodStart.getTime() > at.getTime() && guard++ < 24) {
+    const previousStart = addMonthsAnchored(period.periodStart, -1, anchorDay, timeZone);
+    if (previousStart.getTime() < anchorStart.getTime()) break;
+    period = computeAnchoredPeriod(previousStart, anchorDay, timeZone);
+  }
+  return period;
+}
+
+/**
+ * How many whole periods separate `anchorStart` from the period containing
+ * `at`. 0 while still in the first period. Used to bound catch-up work.
+ */
+export function periodsElapsed(
+  anchorStart: Date,
+  anchorDay: AnchorDay,
+  at: Date,
+  timeZone: string = DEFAULT_BILLING_TIMEZONE,
+): number {
+  let period = computeAnchoredPeriod(anchorStart, anchorDay, timeZone);
+  let n = 0;
+  while (at.getTime() >= period.periodEnd.getTime() && n < 600) {
+    period = nextAnchoredPeriod(period, anchorDay, timeZone);
+    n++;
+  }
+  return n;
+}
+
+/**
+ * The last instant belonging to a half-open period — what a UI should format
+ * when it wants to show an inclusive end date ("15 Aug → 14 Sep").
+ */
+export function inclusiveEnd(periodEnd: Date): Date {
+  return new Date(periodEnd.getTime() - 1);
+}
+
+// ── Proration ────────────────────────────────────────────────────────────────
 
 /**
  * Pro-rated charge for a partial period, in integer minor units.
  *
+ * RETAINED BUT NOT ON THE LIVE PATH. Under the anchored model every period —
+ * including the first — runs a whole anchored month, so there is nothing to
+ * prorate: `assignPlanToHotel` charges the full price. This stays because
+ * mid-period plan CHANGES will need it, and that commercial policy is a
+ * separate, deliberately deferred piece of work. Do not wire it back into the
+ * period math: on an anchored period like 31 Jan → 28 Feb it would under-charge
+ * a full month to 28/31.
+ *
  * Charged on **whole days remaining** (ceil, so any part of a day counts) over
- * days-in-month. A full period returns exactly `priceMinor` — never a rounding
- * artefact — because the day counts are equal. Always in [0, priceMinor].
+ * days-in-month. Always in [0, priceMinor].
  */
 export function proratePeriod(
   priceMinor: number,

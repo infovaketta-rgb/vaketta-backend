@@ -33,6 +33,8 @@ import {
   recordPaymentHandler,
   voidInvoiceHandler,
   listAuditLogHandler,
+  listPaymentsHandler,
+  transitionPaymentHandler,
 } from "../controllers/adminBilling.controller";
 import { getAnalytics, listHotelsWithBilling } from "../controllers/analytics.controller";
 import { getTrialConfigHandler, updateTrialConfigHandler } from "../controllers/trialConfig.controller";
@@ -101,6 +103,10 @@ router.patch("/hotels/:hotelId/max-stay", vakettaAdminAuth, requireBillingAdmin,
 router.get("/invoices",                 vakettaAdminAuth, listInvoicesHandler);
 router.post("/invoices/:id/payments",   vakettaAdminAuth, requireBillingAdmin, recordPaymentHandler);
 router.post("/invoices/:id/void",       vakettaAdminAuth, requireBillingAdmin, voidInvoiceHandler);
+// Reads open to any admin (SUPPORT answers "did this hotel pay?"); the status
+// transition moves money and is billing-admin only.
+router.get("/payments",                 vakettaAdminAuth, listPaymentsHandler);
+router.post("/payments/:id/transition", vakettaAdminAuth, requireBillingAdmin, transitionPaymentHandler);
 
 // Audit trail
 router.get("/audit-log",         vakettaAdminAuth, listAuditLogHandler);

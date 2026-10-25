@@ -93,7 +93,7 @@ export const renderInstagram: ChannelRenderer = async (ctx, payload) => {
         return { ok: false, reason: "unsupported" };
       }
       // No footer surface on IG — append it to the body so instructions like
-      // "Type MENU to cancel" survive the channel translation.
+      // "Type 'Hi' to cancel" survive the channel translation.
       const text = payload.footerText?.trim()
         ? `${payload.bodyText}\n\n${payload.footerText}`
         : payload.bodyText;

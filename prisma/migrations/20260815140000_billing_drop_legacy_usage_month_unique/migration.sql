@@ -1,0 +1,24 @@
+-- PHASE 2 of 2 — CONTRACT. Apply only AFTER the new code is deployed and healthy.
+--
+-- Retires the legacy `(hotelId, month)` uniqueness. `month` itself is untouched
+-- and still written — it remains the calendar label platform analytics group by.
+-- Only the CONSTRAINT goes; no data is read, changed or deleted.
+--
+-- WHY IT HAS TO GO: a trial and the paid period it converts into can both START
+-- in the same calendar month (trial 15 Aug → 29 Aug, paid from 29 Aug). Those
+-- are two distinct billing buckets and must be two rows — which this index
+-- forbids. Until it is dropped, `upsertUsageCounter` (usage.service.ts) absorbs
+-- the collision by relabelling the second row's `month`; that transitional
+-- fallback becomes dead once this runs and can then be deleted.
+--
+-- WHY IT MUST NOT RUN EARLIER: the previously-deployed code upserts on
+-- `(hotelId, month)`, which Prisma compiles to `INSERT ... ON CONFLICT
+-- (hotelId, month)`. That statement ERRORS without a matching unique index, so
+-- dropping this before the deploy would break metering outright rather than
+-- merely weakening it.
+--
+-- Reversible: `CREATE UNIQUE INDEX "UsageRecord_hotelId_month_key" ON
+-- "UsageRecord"("hotelId","month")` — though a rollback would first need any
+-- duplicate (hotelId, month) rows created since the deploy to be reconciled.
+
+DROP INDEX IF EXISTS "UsageRecord_hotelId_month_key";

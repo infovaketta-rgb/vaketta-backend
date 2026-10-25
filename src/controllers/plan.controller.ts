@@ -20,6 +20,7 @@ import { recordBillingEvent } from "../services/audit.service";
 import { serverError } from "../utils/serverError";
 import {
   collect,
+  parseBasisPoints,
   parseBoolean,
   parseCountry,
   parseCurrency,
@@ -54,11 +55,21 @@ export async function createPlanHandler(req: Request, res: Response) {
     aiReplyLimit: parseLimit(b.aiReplyLimit, "aiReplyLimit"),
     extraConversationCharge: parseMinorAmount(b.extraConversationCharge ?? 0, "extraConversationCharge"),
     extraAiReplyCharge: parseMinorAmount(b.extraAiReplyCharge ?? 0, "extraAiReplyCharge"),
+    // Defaults to 0 so an existing caller that never sends it creates an
+    // untaxed plan — identical behaviour to before the column existed.
+    taxRate: parseBasisPoints(b.taxRate ?? 0, "taxRate"),
   });
   if (!parsed.ok) return res.status(400).json({ error: parsed.error });
 
+  let taxLabel: string | undefined;
+  if (b.taxLabel != null) {
+    const label = parseNonEmptyString(b.taxLabel, "taxLabel", 40);
+    if (!label.ok) return res.status(400).json({ error: label.error });
+    taxLabel = label.value;
+  }
+
   try {
-    const plan = await createPlan(parsed.value);
+    const plan = await createPlan({ ...parsed.value, ...(taxLabel !== undefined ? { taxLabel } : {}) });
     await recordBillingEvent("plan.created", {
       actorId: adminId(req),
       data: { planId: plan.id, name: plan.name, price: plan.priceMonthly, currency: plan.currency },
@@ -86,6 +97,8 @@ export async function updatePlanHandler(req: Request, res: Response) {
     ["aiReplyLimit", () => parseLimit(b.aiReplyLimit, "aiReplyLimit")],
     ["extraConversationCharge", () => parseMinorAmount(b.extraConversationCharge, "extraConversationCharge")],
     ["extraAiReplyCharge", () => parseMinorAmount(b.extraAiReplyCharge, "extraAiReplyCharge")],
+    ["taxRate", () => parseBasisPoints(b.taxRate, "taxRate")],
+    ["taxLabel", () => parseNonEmptyString(b.taxLabel, "taxLabel", 40)],
     ["isActive", () => parseBoolean(b.isActive, "isActive")],
   ] as const;
 
@@ -126,9 +139,12 @@ export async function updatePlanHandler(req: Request, res: Response) {
 // PATCH /admin/hotels/:id/plan — assign plan to hotel
 export async function assignPlanHandler(req: Request, res: Response) {
   const hotelId = req.params["id"]!;
-  const { planId } = req.body ?? {};
+  const { planId, startAt } = req.body ?? {};
   if (!planId || typeof planId !== "string") {
     return res.status(400).json({ error: "planId required" });
+  }
+  if (startAt !== undefined && startAt !== "now" && startAt !== "trial_end") {
+    return res.status(400).json({ error: 'startAt must be "now" or "trial_end".' });
   }
 
   try {
@@ -137,13 +153,21 @@ export async function assignPlanHandler(req: Request, res: Response) {
     // Retired plans should not be assignable — this was never checked.
     if (!plan.isActive) return res.status(400).json({ error: "Cannot assign an inactive plan." });
 
-    const sub = await assignPlanToHotel(hotelId, planId, { actorId: adminId(req) });
+    // Omitting `startAt` defers to the trial boundary when the hotel is on a
+    // trial — never silently shortening a trial the customer was promised.
+    const sub = await assignPlanToHotel(hotelId, planId, {
+      actorId: adminId(req),
+      ...(startAt ? { startAt } : {}),
+    });
     res.json(sub);
   } catch (err) {
     // The service throws this for a hotel that doesn't exist; a 404 is the
     // honest answer rather than the 500 a raw Prisma error produced.
     if (err instanceof Error && err.message === "Hotel not found") {
       return res.status(404).json({ error: "Hotel not found" });
+    }
+    if (err instanceof Error && err.message === "Hotel is not on a trial") {
+      return res.status(400).json({ error: "Hotel is not on a trial, so the plan cannot start at trial end." });
     }
     return serverError(res, err, "Failed to assign plan");
   }

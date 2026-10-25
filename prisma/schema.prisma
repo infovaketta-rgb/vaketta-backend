@@ -59,6 +59,18 @@ model Plan {
   aiReplyLimit            Int // 0 = unlimited
   extraConversationCharge Int      @default(0) // minor units per extra conversation
   extraAiReplyCharge      Int      @default(0) // minor units per extra AI reply
+
+  /// Tax applied on top of the plan price, in BASIS POINTS (1800 = 18% GST).
+  ///
+  /// Basis points, not a Float percentage: `subtotal * 0.18` on integer minor
+  /// units reintroduces exactly the float drift the money columns were converted
+  /// to Int to eliminate. `Math.round(base * rateBp / 10_000)` stays in integers
+  /// the whole way. 0 = no tax, which is what every existing plan gets, so no
+  /// invoice total changes as a result of this column existing.
+  taxRate                 Int      @default(0)
+  /// Human-facing label for the tax line, e.g. "GST 18%". Null = "Tax".
+  taxLabel                String?
+
   isActive                Boolean  @default(true)
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
@@ -93,6 +105,13 @@ model Subscription {
   aiReplyLimit            Int
   extraConversationCharge Int    @default(0) // minor units
   extraAiReplyCharge      Int    @default(0) // minor units
+  /// Tax rate in basis points, snapshotted with the rest of the terms.
+  ///
+  /// Snapshotted for the same reason `price` is: a superadmin raising GST on a
+  /// Plan must not retroactively change what this hotel owes for the period it
+  /// is already inside. Renewal reads THIS, not the live Plan.
+  taxRate                 Int    @default(0)
+  taxLabel                String?
 
   /// Current period start (inclusive).
   startDate  DateTime
@@ -101,10 +120,32 @@ model Subscription {
   autoRenew  Boolean   @default(true)
   canceledAt DateTime?
 
+  /// Day-of-month this subscription recurs on (1–31), in PlatformSettings.billingTimezone.
+  ///
+  /// STORED, not re-derived from startDate: a short month clamps the period
+  /// start (31 Jan → 28 Feb) but must NOT clamp the anchor, or an anchor of 31
+  /// would ratchet down to 28 permanently after one February.
+  /// Null on pre-anchor rows → derived from the period boundaries at read time,
+  /// which reproduces the old calendar-aligned behaviour exactly.
+  billingAnchorDay Int?
+
+  /// Plan that takes effect at EXACTLY `endDate` when this is a trial.
+  ///
+  /// This is what makes trial → paid gapless: the paid period's start IS the
+  /// trial's exclusive end, so entitlement is continuous across the boundary
+  /// and no background job has to run for the customer to keep working.
+  /// Soft reference (like `planId`) — no FK, no second Plan relation.
+  scheduledPlanId String?
+
   // Gateway seam — null while billing is manual. A future Razorpay/Stripe
   // subscription is linked here without a schema change.
+  //
+  // `providerSubscriptionId` is UNIQUE so a redelivered gateway webhook cannot
+  // create a second subscription for the same remote object. Postgres treats
+  // NULLs as distinct, so every manually-billed row (all of them today) is
+  // exempt — same exemption `Message.wamid` relies on.
   provider               String?
-  providerSubscriptionId String?
+  providerSubscriptionId String? @unique
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -133,9 +174,21 @@ model Invoice {
   status InvoiceStatus @default(OPEN)
 
   currency     String
-  // Integer minor units. total = subtotal + overageTotal.
+  // Integer minor units. total = subtotal + overageTotal + taxTotal.
   subtotal     Int
   overageTotal Int    @default(0)
+  /// Tax charged on (subtotal + overageTotal), integer minor units.
+  ///
+  /// Defaults to 0, so `total` for every invoice issued before this column
+  /// existed remains exactly `subtotal + overageTotal` — the backfill is a
+  /// no-op by construction and no historical total is rewritten.
+  taxTotal     Int    @default(0)
+  /// The rate actually applied, in basis points, SNAPSHOTTED at issue time.
+  /// Editing Plan.taxRate must never re-tax an invoice that has already been
+  /// sent — same reasoning as the Subscription term snapshot.
+  taxRate      Int    @default(0)
+  /// Label shown on the tax line, snapshotted alongside the rate.
+  taxLabel     String?
   total        Int
   amountPaid   Int    @default(0)
 
@@ -150,8 +203,16 @@ model Invoice {
   notes     String?
 
   // Gateway seam — null while billing is manual.
+  //
+  // Both ids are UNIQUE: a gateway webhook is only idempotent if the remote id
+  // can appear at most once locally. `providerOrderId` is the id a checkout
+  // session is created against, and is what a `payment.captured` event carries
+  // back — without uniqueness, a redelivered event could open a second invoice
+  // for one order. NULLs stay distinct in Postgres, so manual invoices are
+  // unaffected.
   provider          String?
-  providerInvoiceId String?
+  providerInvoiceId String? @unique
+  providerOrderId   String? @unique
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -168,32 +229,85 @@ model Invoice {
 /// A payment against an invoice. Today every row is recorded by hand by a
 /// superadmin (`method: "manual_bank_transfer" | "cash"`); `providerPaymentId`
 /// is unique so a future gateway webhook is idempotent on retry.
+///
+/// STATUS IS A REAL LIFECYCLE, not a formality. It used to be hardcoded to
+/// SUCCEEDED at the single creation site, which made PENDING and FAILED
+/// unreachable enum members and meant "a Payment row exists" was synonymous
+/// with "the money arrived". A gateway payment is PENDING between checkout and
+/// the captured webhook, and an offline payment is PENDING until an admin
+/// verifies it — in both cases a row must exist that does NOT count as paid.
+/// Only SUCCEEDED rows are ever added to `Invoice.amountPaid`.
 model Payment {
   id        String @id @default(uuid())
   hotelId   String
   invoiceId String
 
-  status   PaymentStatus @default(SUCCEEDED)
+  /// Defaults to PENDING — the safe direction. A caller that forgets to set a
+  /// status now under-credits (visible, fixable) instead of silently marking
+  /// money received that never arrived.
+  status   PaymentStatus @default(PENDING)
   currency String
   amount   Int // minor units
   method   String        @default("manual_bank_transfer")
 
   provider          String?
   providerPaymentId String? @unique
+  /// The gateway order/checkout id this payment settles. Unique for the same
+  /// idempotency reason as `providerPaymentId`.
+  providerOrderId   String? @unique
+
+  /// Gateway or admin reason a payment moved to FAILED. Null otherwise.
+  failureReason String?
 
   /// VakettaAdmin.id for a manually recorded payment; null when gateway-driven.
   recordedByAdminId String?
   reference         String? // bank/UTR reference for manual reconciliation
   notes             String?
 
+  // ── Manual / offline payment claims ────────────────────────────────────────
+  // A hotel-submitted payment is a CLAIM, never evidence. It is created as
+  // PENDING, contributes nothing to Invoice.amountPaid, and only becomes money
+  // when a Vaketta admin approves it via transitionPayment.
+
+  /// User.id of the hotel staff member who submitted the claim. Null for
+  /// admin-created and gateway payments. Plain String with no FK, matching the
+  /// existing `recordedByAdminId` convention.
+  submittedByUserId String?
+
+  /// VakettaAdmin.id who APPROVED or REJECTED. Deliberately distinct from
+  /// `recordedByAdminId`, which only means "an admin created this row" — the
+  /// person who enters a claim and the person who verifies it may differ, and
+  /// conflating them would destroy the separation the review step exists for.
+  reviewedByAdminId String?
+  reviewedAt        DateTime?
+
+  /// The date the HOTEL says it paid. Not `receivedAt`, which is when Vaketta
+  /// credited it. Unverified input — a claim, shown to the reviewer as such.
+  claimedPaidAt DateTime?
+
+  /// Proof of payment (bank slip / UPI screenshot / PDF) mirrored into R2.
+  /// Evidence FOR A HUMAN REVIEWER — never machine-verified, never sufficient
+  /// on its own to settle anything.
+  proofUrl String?
+  proofKey String?
+
   receivedAt DateTime @default(now())
   createdAt  DateTime @default(now())
+  updatedAt  DateTime @default(now()) @updatedAt
 
   hotel   Hotel   @relation(fields: [hotelId], references: [id])
   invoice Invoice @relation(fields: [invoiceId], references: [id])
 
   @@index([hotelId, receivedAt])
   @@index([invoiceId])
+  // Drives the (future) admin verification queue and any "does this hotel still
+  // owe money" check, both of which filter on status.
+  @@index([hotelId, status])
+  @@index([status, receivedAt])
+  // The admin review queue: PENDING claims, oldest first. `receivedAt` is
+  // rewritten on approval, so it cannot order a queue of unapproved claims —
+  // `createdAt` is the submission time and never moves.
+  @@index([status, createdAt])
 }
 
 /// Server-side audit trail. Replaces `lib/adminAudit.ts`, which was a
@@ -220,17 +334,36 @@ model AuditLog {
   @@index([createdAt])
 }
 
+/// Metered usage for ONE billing period.
+///
+/// Buckets used to be calendar months, keyed by `month` — so a hotel billed
+/// 15 Aug → 14 Sep had its allowance reset on the 1st, halfway through its own
+/// cycle, and the renewal invoice read a month that included usage from before
+/// the period (trial traffic billed as paid overage). The bucket identity is now
+/// `periodStart`, which is exactly the subscription's period boundary.
+///
+/// `month` is RETAINED and still written (derived from periodStart) because
+/// platform-wide analytics genuinely want calendar months. It is no longer
+/// unique: a trial and the paid period it converts into can both start in the
+/// same calendar month (trial 15 Aug → 29 Aug, paid from 29 Aug), which the old
+/// `@@unique([hotelId, month])` would have rejected outright.
 model UsageRecord {
   id                String   @id @default(uuid())
   hotelId           String
-  month             String // "YYYY-MM", e.g. "2026-04"
+  month             String // "YYYY-MM" — calendar label for analytics, NOT the identity
+  /// Billing-period start (inclusive) — the bucket identity.
+  /// Nullable so the migration is additive; backfilled for every existing row.
+  periodStart       DateTime?
+  /// Billing-period end (exclusive).
+  periodEnd         DateTime?
   conversationsUsed Int      @default(0)
   aiRepliesUsed     Int      @default(0)
   updatedAt         DateTime @updatedAt
 
   hotel Hotel @relation(fields: [hotelId], references: [id])
 
-  @@unique([hotelId, month])
+  @@unique([hotelId, periodStart])
+  @@index([hotelId, month])
   @@index([month])
 }
 

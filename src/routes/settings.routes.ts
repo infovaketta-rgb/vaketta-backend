@@ -42,6 +42,27 @@ import {
   getToggleHandler,
   patchToggleHandler,
 } from "../controllers/availability.controller";
+import { requireBillingViewer } from "../middleware/requireHotelRole";
+import {
+  createInvoiceOrderHandler,
+  verifyRazorpayPaymentHandler,
+} from "../controllers/razorpay.controller";
+import {
+  submitManualPaymentHandler,
+  listMyPaymentsHandler,
+} from "../controllers/manualPayment.controller";
+import multer from "multer";
+
+/**
+ * Proof-of-payment upload. Memory storage + a hard 10 MB cap, matching the
+ * pattern in message.routes.ts. The cap is enforced here AND again by
+ * r2.service's per-MIME limits, which also sniff magic bytes — a file that
+ * lies about its type is rejected there regardless of what multer accepted.
+ */
+const proofUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+});
 
 const router = Router();
 
@@ -60,10 +81,36 @@ router.get("/instagram",                       getInstagramHandler);
 router.patch("/instagram",                     patchInstagramHandler);
 
 // Billing / subscription (hotel-side, JWT-protected via auth middleware in app.ts)
-router.get("/billing/subscription", getSubscription);
-router.get("/billing/usage",        getUsage);
-router.get("/billing/plans",        getAvailablePlans);
-router.get("/billing/invoices",     getInvoices);
+//
+// OWNER/ADMIN only. These expose what the hotel pays, owes and has been
+// invoiced; MANAGER and STAFF have no need for the commercial relationship and
+// previously could read all of it. `hotelId` still comes from the JWT in every
+// handler, so this narrows access within a hotel and cannot widen it across
+// hotels. Mounted BEFORE the handlers so no billing route can escape the gate.
+router.get("/billing/subscription", requireBillingViewer, getSubscription);
+router.get("/billing/usage",        requireBillingViewer, getUsage);
+router.get("/billing/plans",        requireBillingViewer, getAvailablePlans);
+router.get("/billing/invoices",     requireBillingViewer, getInvoices);
+
+// ── Razorpay (test mode) ─────────────────────────────────────────────────────
+// Deliberately under /billing/*: requireActiveSubscription exempts this prefix
+// from the 402 paywall for ALL methods, so a SUSPENDED hotel can still pay. Any
+// other mount point would 402 exactly the customer who needs to settle up.
+// requireBillingViewer keeps it OWNER/ADMIN, matching the reads above.
+router.post("/billing/invoices/:invoiceId/razorpay-order", requireBillingViewer, createInvoiceOrderHandler);
+router.post("/billing/razorpay/verify",                    requireBillingViewer, verifyRazorpayPaymentHandler);
+
+// ── Manual / offline payments ────────────────────────────────────────────────
+// Same /billing/* mount, same 402 exemption: a SUSPENDED hotel must be able to
+// report the bank transfer that will un-suspend it. Submission creates a
+// PENDING claim only — a Vaketta admin approves it, which is what settles.
+router.post(
+  "/billing/invoices/:invoiceId/manual-payment",
+  requireBillingViewer,
+  proofUpload.single("proof"),
+  submitManualPaymentHandler,
+);
+router.get("/billing/payments", requireBillingViewer, listMyPaymentsHandler);
 
 router.get("/menu",                 getMenuHandler);
 router.patch("/menu",               updateMenuTitleHandler);

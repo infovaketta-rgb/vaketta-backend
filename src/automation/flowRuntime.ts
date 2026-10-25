@@ -61,6 +61,12 @@ import { getWatchedFlowVarNames, pickWatchedFlowVars } from "../services/templat
 import { extractDateWithAI, classifyBookingIntent, interpretAllocationModification, extractChildrenAgesAI } from "../services/ai.service";
 import { handleAdvancedRoomAllocation, type AllocationRoomInput, type SendRoomCarouselFn } from "./nodes/advancedRoomAllocation";
 import { trySendPlanList } from "./nodes/planList";
+import {
+  buildConfirmButtonsPayload, buildMixItUpPayload, buildRoomTypeCarouselPayload,
+} from "./nodes/araSenderPayloads";
+import {
+  DEFAULT_RESOLVED, type CopyRejection, type CopyRejectionSink, type ResolvedAraCopy,
+} from "./nodes/ara/copy";
 import { trySendRoomMenuList, trySendMoveToRoomList, trySendManualModeList, trySendChangeRoomTypeList } from "./nodes/modifyLists";
 import { aggregateRoomQuantities } from "./bookingAllocation";
 import { nightsBetween, exceedsMaxStay, STAY_TOO_LONG_MESSAGE } from "./stayDuration";
@@ -73,7 +79,7 @@ const CAROUSEL_FALLBACK_IMAGE = "https://placehold.co/600x400/png?text=Room";
 
 const MAX_HOPS = 30;
 const DIVIDER  = "━━━━━━━━━━━━━━━━";
-const MENU_FALLBACK = "Reply *MENU* to see our options.";
+const MENU_FALLBACK = "Reply *Hi* to see our options.";
 
 const ACTION_TIMEOUT_MS = 10_000;
 function withActionTimeout<T>(promise: Promise<T>): Promise<T> {
@@ -355,7 +361,11 @@ async function trySendOptionsList(args: {
 // plan_selection handler can distinguish it from the show_rooms "room_{id}" buttons.
 
 async function trySendRoomTypeCarousel(
-  args: Parameters<SendRoomCarouselFn>[0] & { channel: MessageChannel },
+  args: Parameters<SendRoomCarouselFn>[0] & {
+    channel:   MessageChannel;
+    copy?:     ResolvedAraCopy | undefined;
+    onReject?: CopyRejectionSink | undefined;
+  },
 ): Promise<boolean> {
   const { hotelId, guestId, channel, roomInputs, adults } = args;
   try {
@@ -380,30 +390,19 @@ async function trySendRoomTypeCarousel(
       if (!photoByType.has(p.roomTypeId)) photoByType.set(p.roomTypeId, p.url);
     }
 
-    const inr = (n: number) => `₹${n.toLocaleString("en-IN")}`;
-    const cards: OutboundCard[] = eligible.slice(0, 10).map((r) => {
-      const baseA = r.baseAdults  ?? 2;
-      const maxA  = r.maxAdults   ?? baseA;
-      const maxC  = r.maxChildren ?? 0;
-      const cap   = maxC > 0 ? `Up to ${maxA} adults, ${maxC} children` : `Up to ${maxA} adults`;
-      const desc  = `${cap} · ${inr(r.basePrice)}/night`;
-      return {
-        imageUrl:    photoByType.get(r.roomTypeId) ?? CAROUSEL_FALLBACK_IMAGE,
-        title:       r.name,
-        price:       r.basePrice,
-        description: desc.slice(0, 60),
-        buttonId:    `room_TYPE:${r.roomTypeId}`,
-        buttonLabel: "Choose",
-      };
+    // Payload construction is pure and lives in ./nodes/araSenderPayloads so it
+    // can be tested against the copy registry without prisma or a network call.
+    const payload = buildRoomTypeCarouselPayload({
+      roomInputs:    eligible,
+      photoByType,
+      fallbackImage: CAROUSEL_FALLBACK_IMAGE,
+      copy:          args.copy,
+      onReject:      args.onReject,
     });
 
-    log.info({ cardsCount: cards.length }, "carousel: cards built");
+    log.info({ cardsCount: payload.cards.length }, "carousel: cards built");
 
-    const res = await sendOutbound({ hotelId, guestId, channel }, {
-      kind:     "cards",
-      bodyText: "🏨 *Choose a room type:*",
-      cards,
-    });
+    const res = await sendOutbound({ hotelId, guestId, channel }, payload);
     return res.sent;
   } catch (err) {
     log.warn({ err, hotelId, guestId }, "ARA room carousel send failed — skipping");
@@ -427,15 +426,14 @@ async function trySendOccupancyNotice(
 // MIX_IT_UP (the webhook collapses list_reply.id to a text body the ARA handler
 // matches). Returns true if sent. Never throws.
 async function trySendMixItUpList(
-  args: { hotelId: string; guestId: string; channel: MessageChannel },
+  args: {
+    hotelId: string; guestId: string; channel: MessageChannel;
+    copy?:     ResolvedAraCopy | undefined;
+    onReject?: CopyRejectionSink | undefined;
+  },
 ): Promise<boolean> {
   const { hotelId, guestId, channel } = args;
-  const res = await sendOutbound({ hotelId, guestId, channel }, {
-    kind:        "choice",
-    bodyText:    "_Not sure? Let us pick the best combination for you_ 👇",
-    buttonLabel: "Options",
-    sections:    [{ title: "Let us choose", rows: [{ id: "MIX_IT_UP", title: "Mix it up 🎲", description: "We'll pick the best room combination" }] }],
-  });
+  const res = await sendOutbound({ hotelId, guestId, channel }, buildMixItUpPayload(args.copy, args.onReject));
   return res.sent;
 }
 
@@ -445,18 +443,14 @@ async function trySendMixItUpList(
 // legacy "1"/"2"/"MENU" text replies (the webhook collapses button_reply.id to a
 // text body). Returns true if sent (→ "ALREADY_SENT"). Never throws.
 async function trySendConfirmButtons(
-  args: { hotelId: string; guestId: string; bodyText: string; channel: MessageChannel },
+  args: {
+    hotelId: string; guestId: string; bodyText: string; channel: MessageChannel;
+    copy?:     ResolvedAraCopy | undefined;
+    onReject?: CopyRejectionSink | undefined;
+  },
 ): Promise<boolean> {
   const { hotelId, guestId, bodyText, channel } = args;
-  const res = await sendOutbound({ hotelId, guestId, channel }, {
-    kind:     "buttons",
-    bodyText,
-    buttons: [
-      { id: "CONFIRM_BOOKING", title: "✅ Confirm" },
-      { id: "MODIFY_BOOKING",  title: "✏️ Modify" },
-      { id: "CANCEL_BOOKING",  title: "✖️ Cancel" },
-    ],
-  });
+  const res = await sendOutbound({ hotelId, guestId, channel }, buildConfirmButtonsPayload(bodyText, args.copy, args.onReject));
   return res.sent;
 }
 
@@ -1367,6 +1361,57 @@ export async function executeFlowStep(
         // The ARA node is channel-agnostic — every injected sender gets the
         // active channel bound here via closure, so the node's dep signatures
         // (and its tests) never mention channels.
+
+        // Guest-facing copy. The registry is threaded into the three extracted
+        // senders below, but TENANT OVERRIDES ARE DEFERRED TO STAGE 2G — this
+        // is the built-in bundle, so output is byte-identical to pre-registry
+        // behaviour for every hotel.
+        //
+        // 2G replaces this one line with
+        //   resolveAraCopy(araOverridesFromBotMessages(hotelCfg?.botMessages))
+        // plus a warn for `araCopy.rejected`. `hotelCfg` is already fetched at
+        // the top of executeFlowStep, so that needs no extra query. Two things
+        // must land first: a `maxLen` for `flowRuntime.carouselBody` and
+        // `flowRuntime.mixBody` (nothing caps them — sendCarouselMessage and
+        // sendListMessage pass `body.text` verbatim), and `onReject` passed at
+        // the three sender bindings so a late overflow is logged rather than
+        // silently falling back.
+        const araCopy = DEFAULT_RESOLVED;
+
+        // Per-turn sink for LATE copy overflow: an override that passed the
+        // resolve-time skeleton check but overran its cap once interpolated.
+        // fillKey falls back to the default rendering and reports here, so this
+        // is a diagnostic only — never a behaviour change.
+        //
+        // DEDUPLICATED BY KEY. fillKey runs once per list row, and the manual
+        // list renders one row per allocated room (up to MAX_ROOMS), so a
+        // single bad override would otherwise emit dozens of identical lines
+        // in one turn.
+        //
+        // THE try/catch IS LOAD-BEARING, not defensive habit:
+        // trySendMixItUpList and trySendConfirmButtons have no try/catch of
+        // their own, and the switch in executeFlowStep has none either (its
+        // only guard closes before the switch), so an exception raised here
+        // would propagate out through botEngine to the BullMQ job — three
+        // retries and NO REPLY to the guest, because a log line failed.
+        //
+        // Key and reason only. The values are the hotel's own copy and must
+        // never reach the log; `detail` is omitted for the same reason, even
+        // though a late-overflow detail carries only lengths.
+        const araCopyReported = new Set<string>();
+        const onAraCopyReject: CopyRejectionSink = (r: CopyRejection) => {
+          try {
+            if (araCopyReported.has(r.key)) return;
+            araCopyReported.add(r.key);
+            log.warn(
+              { hotelId, key: r.key, reason: r.reason },
+              "ARA copy: override too long after interpolation — using default",
+            );
+          } catch {
+            // Logging must never fail a guest turn.
+          }
+        };
+
         return handleAdvancedRoomAllocation({
           node,
           currentNodeId,
@@ -1386,18 +1431,18 @@ export async function executeFlowStep(
           getCalendarData,
           retryStep,
           interpretModification: interpretAllocationModification,
-          sendPlanList:     (a) => trySendPlanList({ ...a, channel }),
-          sendRoomCarousel: (a) => trySendRoomTypeCarousel({ ...a, channel }),
+          sendPlanList:     (a) => trySendPlanList({ ...a, channel, copy: araCopy, onReject: onAraCopyReject }),
+          sendRoomCarousel: (a) => trySendRoomTypeCarousel({ ...a, channel, copy: araCopy, onReject: onAraCopyReject }),
           childAgeLimit:        hotelCfg?.childAgeLimit ?? 12,
           extractChildrenAges:  extractChildrenAgesAI,
           sendOccupancyNotice:  (a) => trySendOccupancyNotice({ ...a, channel }),
           sendRoomDescriptions: (a) => trySendOccupancyNotice({ ...a, channel }), // generic text sender (same shape)
-          sendMixItUpList:      (a) => trySendMixItUpList({ ...a, channel }),
-          sendConfirmButtons:   (a) => trySendConfirmButtons({ ...a, channel }),
-          sendRoomMenuList:        (a) => trySendRoomMenuList({ ...a, channel }),
-          sendMoveToRoomList:      (a) => trySendMoveToRoomList({ ...a, channel }),
-          sendManualModeList:      (a) => trySendManualModeList({ ...a, channel }),
-          sendChangeRoomTypeList:  (a) => trySendChangeRoomTypeList({ ...a, channel }),
+          sendMixItUpList:      (a) => trySendMixItUpList({ ...a, channel, copy: araCopy, onReject: onAraCopyReject }),
+          sendConfirmButtons:   (a) => trySendConfirmButtons({ ...a, channel, copy: araCopy, onReject: onAraCopyReject }),
+          sendRoomMenuList:        (a) => trySendRoomMenuList({ ...a, channel, copy: araCopy, onReject: onAraCopyReject }),
+          sendMoveToRoomList:      (a) => trySendMoveToRoomList({ ...a, channel, copy: araCopy, onReject: onAraCopyReject }),
+          sendManualModeList:      (a) => trySendManualModeList({ ...a, channel, copy: araCopy, onReject: onAraCopyReject }),
+          sendChangeRoomTypeList:  (a) => trySendChangeRoomTypeList({ ...a, channel, copy: araCopy, onReject: onAraCopyReject }),
         });
       }
 
