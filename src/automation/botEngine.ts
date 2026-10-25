@@ -28,6 +28,8 @@ import { MessageChannel } from "@prisma/client";
 const RESET_KEYWORDS = new Set(["MENU", "0", "HI", "HELLO", "START", "RESTART", "BACK", "HOME"]);
 
 import { isZeroExempt } from "./zeroExempt";
+import { isGreeting } from "./greeting";
+import { isInteractivePayloadId } from "./interactivePayload";
 export { isZeroExempt } from "./zeroExempt";
 
 // ── Public entry point ─────────────────────────────────────────────────────────
@@ -136,6 +138,34 @@ async function showMenu(
   return buildMenuMessage(hotelId);
 }
 
+/**
+ * AI fallback for unmatched input, if enabled AND the hotel has AI replies
+ * left. `aiReplyLimit` was stored, snapshotted and displayed but never once
+ * compared against `aiRepliesUsed`, so any plan could burn unbounded LLM spend.
+ * Returns null when AI is off, over quota, or produced nothing — the caller then
+ * shows a menu rather than going silent.
+ */
+async function tryAIReply(hotelId: string, guestId: string, input: string): Promise<string | null> {
+  const cfg = await getHotelConfigCached(hotelId);
+  if (!(cfg as any)?.aiEnabled || (await isAIReplyOverQuota(hotelId))) return null;
+
+  const aiResult = await getAIReply(hotelId, guestId, input);
+  // Blank text is "no reply" — unless the model flagged a handoff, which must
+  // still happen. A token-only reply ("[HANDOFF_REQUIRED]") parses to text "".
+  // Returning "" (not null) keeps the old contract: message.service sends
+  // nothing for a falsy reply, so no empty WhatsApp message goes out.
+  if (!aiResult || (!aiResult.text.trim() && !aiResult.handoff)) return null;
+
+  incrementAIUsage(hotelId).catch(() => {});
+  if (aiResult.handoff) {
+    await prisma.guest.updateMany({ where: { id: guestId, hotelId }, data: { lastHandledByStaff: true } });
+    await updateSession(guestId, hotelId, "ENQUIRY_OPEN", {});
+  } else {
+    await updateSession(guestId, hotelId, "AWAITING_SELECTION", {});
+  }
+  return aiResult.text.trim() ? aiResult.text : "";
+}
+
 async function handleSelection(
   hotelId: string,
   guestId: string,
@@ -151,29 +181,28 @@ async function handleSelection(
   });
 
   if (!item) {
-    // First contact or reset keyword → show menu (flow-driven or hardcoded)
-    if (!input || isFirstContact || RESET_KEYWORDS.has(upper)) {
+    // Empty input, an explicit menu command, or (on first contact) a bare
+    // greeting or a stale tap on an old interactive message (its payload id
+    // arrives verbatim, e.g. "opt_2") → show menu (flow-driven or hardcoded).
+    if (
+      !input ||
+      RESET_KEYWORDS.has(upper) ||
+      (isFirstContact && (isGreeting(input) || isInteractivePayloadId(input)))
+    ) {
       return showMenu(hotelId, guestId, sessionData, input, channel);
     }
 
-    // Unknown input — try AI fallback if enabled AND the hotel has AI replies
-    // left. `aiReplyLimit` was stored, snapshotted and displayed but never once
-    // compared against `aiRepliesUsed`, so any plan could burn unbounded LLM
-    // spend. Over the limit we fall through to the menu below rather than going
-    // silent — the guest still gets a usable reply.
-    const cfg = await getHotelConfigCached(hotelId);
-    if ((cfg as any)?.aiEnabled && !(await isAIReplyOverQuota(hotelId))) {
-      const aiResult = await getAIReply(hotelId, guestId, input);
-      if (aiResult) {
-        incrementAIUsage(hotelId).catch(() => {});
-        if (aiResult.handoff) {
-          await prisma.guest.updateMany({ where: { id: guestId, hotelId }, data: { lastHandledByStaff: true } });
-          await updateSession(guestId, hotelId, "ENQUIRY_OPEN", {});
-        } else {
-          await updateSession(guestId, hotelId, "AWAITING_SELECTION", {});
-        }
-        return aiResult.text;
-      }
+    // A meaningful message — including the FIRST one from a guest. First
+    // contact used to return the menu here unconditionally, so a guest's opening
+    // question ("Can I talk to a staff") was dropped and only a repeat reached AI.
+    const aiText = await tryAIReply(hotelId, guestId, input);
+    if (aiText !== null) return aiText;
+
+    // AI off / over quota / no usable reply. On first contact nothing has been
+    // offered yet, so "that option isn't recognised" would be misleading — just
+    // show the welcome menu.
+    if (isFirstContact) {
+      return showMenu(hotelId, guestId, sessionData, input, channel);
     }
 
     // Fallback — re-show menu with preamble
