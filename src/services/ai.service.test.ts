@@ -38,12 +38,28 @@ vi.mock("../utils/logger", () => ({
   },
 }));
 
-// Import-chain stubs — this suite never touches the DB, Redis or availability.
-vi.mock("../db/connect", () => ({ default: {} }));
+// Import-chain stubs. Only the system-prompt suite reads the DB (hotel row +
+// empty history); Redis is a bare object, so the AI rate limit fails open.
+const hotelFindUnique = vi.fn();
+const messageFindMany = vi.fn();
+vi.mock("../db/connect", () => ({
+  default: {
+    hotel:   { findUnique: (...a: any[]) => hotelFindUnique(...a) },
+    message: { findMany:   (...a: any[]) => messageFindMany(...a) },
+  },
+}));
 vi.mock("../queue/redis", () => ({ redis: {} }));
 vi.mock("./availability.service", () => ({ getCalendarData: vi.fn() }));
 
-import { extractChildrenAgesAI, ageExtractionMaxTokens } from "./ai.service";
+import { MessageChannel } from "@prisma/client";
+import {
+  extractChildrenAgesAI,
+  ageExtractionMaxTokens,
+  getSystemPrompt,
+  getAIReply,
+  invalidatePromptCache,
+} from "./ai.service";
+import { toInstagramPlainText } from "./instagramFormat";
 
 /** An Anthropic reply that finished normally. */
 const anthropicOk = (text: string) => ({
@@ -168,5 +184,122 @@ describe("extractChildrenAgesAI token budget", () => {
     });
     expect(await extractChildrenAgesAI("kids are 5 and 8", 2)).toEqual([5, 8]);
     expect(logError).not.toHaveBeenCalled();
+  });
+});
+
+// ── Channel-aware system prompt + per-channel prompt cache ───────────────────
+// The prompt used to open "You are the WhatsApp assistant for *Hotel*" and ask
+// for WhatsApp markdown on every channel, so Instagram guests were told they
+// were talking to a WhatsApp bot and got literal asterisks.
+
+describe("channel-aware system prompt", () => {
+  const HOTEL_ROW = {
+    name:         "Maadathil Cottages & Beach Resort",
+    description:  "Beachfront cottages",
+    location:     "Varkala, Kerala",
+    website:      "https://maadathil.example/stay_here",
+    email:        "stay@maadathil.example",
+    checkInTime:  "14:00",
+    checkOutTime: "11:00",
+    config: { businessStartHour: 9, businessEndHour: 21, timezone: "Asia/Kolkata", aiInstructions: "Mention free parking." },
+    roomTypes: [{ name: "Deluxe Cottage", basePrice: 5000, capacity: 3, maxAdults: 2, maxChildren: 1, description: "Sea view" }],
+    menu: { items: [{ key: "1", label: "Book a room" }, { key: "2", label: "Talk to staff" }] },
+  };
+  const WA_RULE = "- Use WhatsApp formatting (*bold*, _italic_) only for key facts — do not overuse.";
+  const IG_RULE = "- Plain text only. Do not use *, _, ~ or ` for formatting. Emoji and line breaks are fine.";
+  const { WHATSAPP, INSTAGRAM } = MessageChannel;
+
+  // The cache is module-level, so every test uses its own hotel ids.
+  let n = 0;
+  const hotelId = () => `hotel_prompt_${++n}`;
+
+  beforeEach(() => {
+    hotelFindUnique.mockReset().mockResolvedValue(HOTEL_ROW);
+    messageFindMany.mockReset().mockResolvedValue([]);
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("CP1: INSTAGRAM and WHATSAPP prompts differ only in the formatting rule", async () => {
+    const id = hotelId();
+    const wa = (await getSystemPrompt(id, WHATSAPP)).split("\n");
+    const ig = (await getSystemPrompt(id, INSTAGRAM)).split("\n");
+    expect(ig.length).toBe(wa.length);
+    const diff = wa.map((_, i) => i).filter((i) => wa[i] !== ig[i]);
+    expect(diff).toHaveLength(1);
+    expect(wa[diff[0]!]).toBe(WA_RULE);
+    expect(ig[diff[0]!]).toBe(IG_RULE);
+  });
+
+  it("CP2: neither prompt says 'WhatsApp' outside the WhatsApp formatting rule; identity is neutral and unstarred", async () => {
+    const id = hotelId();
+    for (const channel of [WHATSAPP, INSTAGRAM]) {
+      const p = await getSystemPrompt(id, channel);
+      expect(p.replace(WA_RULE, "")).not.toMatch(/whatsapp/i);
+      expect(p).toContain("You are the virtual assistant for Maadathil Cottages & Beach Resort, located in Varkala, Kerala.");
+      expect(p).not.toContain("*Maadathil");
+      expect(p).toContain("If a guest asks who or what you are, say you are the hotel's virtual assistant. Never name a messaging platform.");
+      // Prompt wording carries no markdown of its own.
+      expect(p).toContain("  • Reply 1 for Book a room");
+      expect(p).toContain("- Always end by reminding the guest: reply MENU to see all options.");
+    }
+  });
+
+  it("CP3: the INSTAGRAM prompt contains no paired markdown", async () => {
+    const p = await getSystemPrompt(hotelId(), INSTAGRAM);
+    expect(toInstagramPlainText(p)).toBe(p);
+  });
+
+  it("CP4: WHATSAPP then INSTAGRAM within the TTL rebuilds instead of reusing; same channel is cached", async () => {
+    const id = hotelId();
+    await getSystemPrompt(id, WHATSAPP);
+    await getSystemPrompt(id, WHATSAPP);
+    expect(hotelFindUnique).toHaveBeenCalledTimes(1);
+
+    const ig = await getSystemPrompt(id, INSTAGRAM);
+    expect(hotelFindUnique).toHaveBeenCalledTimes(2);
+    expect(ig).toContain(IG_RULE);
+    expect(ig).not.toContain(WA_RULE);
+  });
+
+  it("CP5: invalidatePromptCache clears every channel of that hotel and leaves other hotels alone", async () => {
+    const a = hotelId();
+    const b = hotelId();
+    await getSystemPrompt(a, WHATSAPP);
+    await getSystemPrompt(a, INSTAGRAM);
+    await getSystemPrompt(b, WHATSAPP);
+    expect(hotelFindUnique).toHaveBeenCalledTimes(3);
+
+    invalidatePromptCache(a);
+
+    await getSystemPrompt(a, WHATSAPP);
+    await getSystemPrompt(a, INSTAGRAM);
+    await getSystemPrompt(b, WHATSAPP);
+    expect(hotelFindUnique).toHaveBeenCalledTimes(5); // a rebuilt twice, b still cached
+    const rebuiltFor = hotelFindUnique.mock.calls.slice(3).map((c) => c[0].where.id);
+    expect(rebuiltFor).toEqual([a, a]);
+  });
+
+  it("CP6: no channel argument behaves as WHATSAPP and shares its cache entry", async () => {
+    const id = hotelId();
+    const implicit = await getSystemPrompt(id);
+    const explicit = await getSystemPrompt(id, WHATSAPP);
+    expect(implicit).toBe(explicit);
+    expect(implicit).toContain(WA_RULE);
+    expect(hotelFindUnique).toHaveBeenCalledTimes(1);
+  });
+
+  it("CP7: getAIReply sends the channel's prompt to the provider; default is WHATSAPP", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "test-key");
+    vi.stubEnv("AI_PROVIDER", "anthropic");
+    anthropicCreate.mockReset().mockResolvedValue(anthropicOk("Yes, parking is free."));
+    const id = hotelId();
+    const systemText = (call: number) => anthropicCreate.mock.calls[call]![0].system[0].text as string;
+
+    await getAIReply(id, "guest_1", "Is parking free?", INSTAGRAM);
+    expect(systemText(0)).toContain(IG_RULE);
+    expect(systemText(0)).not.toMatch(/whatsapp/i);
+
+    await getAIReply(id, "guest_1", "Is parking free?");
+    expect(systemText(1)).toContain(WA_RULE);
   });
 });

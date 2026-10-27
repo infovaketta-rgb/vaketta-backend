@@ -18,7 +18,8 @@
  *   1. CACHED system prompt  — static hotel identity, room data, and behaviour
  *                              rules; marked with cache_control (Anthropic) so
  *                              Claude caches the prefix. Rebuilt from DB at most
- *                              once per 10 min per hotel via in-memory TTL cache.
+ *                              once per 10 min per hotel AND channel (the
+ *                              formatting rule differs) via in-memory TTL cache.
  *   2. DYNAMIC context       — live 30-day room availability; injected only when
  *                              the guest message contains availability-related
  *                              keywords. Never cached (changes per request).
@@ -37,6 +38,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI    from "openai";
+import { MessageChannel } from "@prisma/client";
 import prisma    from "../db/connect";
 import { redis } from "../queue/redis";
 import { logger } from "../utils/logger";
@@ -110,17 +112,36 @@ setInterval(() => {
   }
 }, 15 * 60 * 1000).unref();
 
-function cachePrompt(hotelId: string, prompt: string): void {
+/** The prompt differs per channel (formatting rule), so the cache must too —
+ *  keyed by hotel alone, whichever channel built it first would be served to
+ *  both for the whole TTL. */
+const promptCacheKey = (hotelId: string, channel: MessageChannel): string => `${hotelId}:${channel}`;
+
+function cachePrompt(key: string, prompt: string): void {
   if (promptCache.size >= CACHE_MAX) {
     // Evict the oldest entry (Map iteration order = insertion order)
     const oldestKey = promptCache.keys().next().value;
     if (oldestKey !== undefined) promptCache.delete(oldestKey);
   }
-  promptCache.set(hotelId, { prompt, builtAt: Date.now() });
+  promptCache.set(key, { prompt, builtAt: Date.now() });
 }
 
-async function getSystemPrompt(hotelId: string): Promise<string> {
-  const cached = promptCache.get(hotelId);
+/** Per-channel formatting rule — the ONLY line that differs between channels.
+ *  Instagram renders no markdown (the send layer also strips it, as a backstop). */
+function formattingRule(channel: MessageChannel): string {
+  return channel === MessageChannel.INSTAGRAM
+    ? "- Plain text only. Do not use *, _, ~ or ` for formatting. Emoji and line breaks are fine."
+    : "- Use WhatsApp formatting (*bold*, _italic_) only for key facts — do not overuse.";
+}
+
+/** Exported for tests. Default channel keeps any channel-less caller on the
+ *  original (WhatsApp) behaviour. */
+export async function getSystemPrompt(
+  hotelId: string,
+  channel: MessageChannel = MessageChannel.WHATSAPP,
+): Promise<string> {
+  const cacheKey = promptCacheKey(hotelId, channel);
+  const cached = promptCache.get(cacheKey);
   if (cached && Date.now() - cached.builtAt < CACHE_TTL_MS) return cached.prompt;
 
   const hotel = await prisma.hotel.findUnique({
@@ -165,7 +186,7 @@ async function getSystemPrompt(hotelId: string): Promise<string> {
 
   if (!hotel) {
     const fallback = "You are a hotel assistant. Answer guest questions helpfully and briefly.";
-    cachePrompt(hotelId, fallback);
+    cachePrompt(cacheKey, fallback);
     return fallback;
   }
 
@@ -185,11 +206,14 @@ async function getSystemPrompt(hotelId: string): Promise<string> {
     return `  • ${r.name}: ${parts.join(" · ")}`;
   });
 
+  // The prompt's own wording carries NO markdown (only the WhatsApp formatting
+  // rule shows an example), so it never models a markdown style on its own.
   const menuLines =
-    hotel.menu?.items.map((i) => `  • Reply *${i.key}* for ${i.label}`) ?? [];
+    hotel.menu?.items.map((i) => `  • Reply ${i.key} for ${i.label}`) ?? [];
 
   const lines: string[] = [
-    `You are the WhatsApp assistant for *${hotel.name}*${hotel.location ? `, located in ${hotel.location}` : ""}.`,
+    // Channel-neutral identity: never name a messaging platform.
+    `You are the virtual assistant for ${hotel.name}${hotel.location ? `, located in ${hotel.location}` : ""}.`,
     `You answer guest questions on behalf of the hotel.`,
     ``,
     `## Rules`,
@@ -198,8 +222,9 @@ async function getSystemPrompt(hotelId: string): Promise<string> {
     `- NEVER confirm a booking directly. Say "our team will confirm your reservation shortly."`,
     `- NEVER quote a price not listed in the hotel data below.`,
     `- If unsure about any fact, say "Let me connect you with our team" and nothing more.`,
-    `- Use WhatsApp formatting (*bold*, _italic_) only for key facts — do not overuse.`,
-    `- Always end by reminding the guest: reply *MENU* to see all options.`,
+    `- If a guest asks who or what you are, say you are the hotel's virtual assistant. Never name a messaging platform.`,
+    formattingRule(channel),
+    `- Always end by reminding the guest: reply MENU to see all options.`,
     `- If a guest expresses anger, frustration, or raises a sensitive complaint, end your reply with the exact token [HANDOFF_REQUIRED] on its own line. Do not explain the token.`,
     ``,
     `## Hotel details`,
@@ -223,13 +248,16 @@ async function getSystemPrompt(hotelId: string): Promise<string> {
   }
 
   const prompt = lines.join("\n");
-  cachePrompt(hotelId, prompt);
+  cachePrompt(cacheKey, prompt);
   return prompt;
 }
 
-/** Invalidate cached prompt — call when hotel config or room types change. */
+/** Invalidate cached prompts for EVERY channel of this hotel — call when hotel
+ *  config or room types change. Other hotels' entries are untouched. */
 export function invalidatePromptCache(hotelId: string): void {
-  promptCache.delete(hotelId);
+  for (const channel of Object.values(MessageChannel)) {
+    promptCache.delete(promptCacheKey(hotelId, channel));
+  }
 }
 
 // ── Layer 2: Dynamic availability context ─────────────────────────────────────
@@ -401,6 +429,7 @@ export async function getAIReply(
   hotelId:     string,
   guestId:     string,
   userMessage: string,
+  channel:     MessageChannel = MessageChannel.WHATSAPP,
 ): Promise<AIReplyResult | null> {
   const allowed = await checkAIRateLimit(hotelId, guestId);
   if (!allowed) return null;
@@ -409,7 +438,7 @@ export async function getAIReply(
   const needsAvailability = AVAILABILITY_KEYWORDS.test(userMessage);
 
   const [systemPrompt, history, availabilityContext] = await Promise.all([
-    getSystemPrompt(hotelId),
+    getSystemPrompt(hotelId, channel),
     buildHistory(hotelId, guestId),
     needsAvailability ? buildAvailabilityContext(hotelId) : Promise.resolve(null),
   ]);

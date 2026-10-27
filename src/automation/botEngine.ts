@@ -145,11 +145,17 @@ async function showMenu(
  * Returns null when AI is off, over quota, or produced nothing — the caller then
  * shows a menu rather than going silent.
  */
-async function tryAIReply(hotelId: string, guestId: string, input: string): Promise<string | null> {
+async function tryAIReply(
+  hotelId: string,
+  guestId: string,
+  input: string,
+  channel: MessageChannel = MessageChannel.WHATSAPP,
+): Promise<string | null> {
   const cfg = await getHotelConfigCached(hotelId);
   if (!(cfg as any)?.aiEnabled || (await isAIReplyOverQuota(hotelId))) return null;
 
-  const aiResult = await getAIReply(hotelId, guestId, input);
+  // The channel picks the prompt's formatting rule (plain text on Instagram).
+  const aiResult = await getAIReply(hotelId, guestId, input, channel);
   // Blank text is "no reply" — unless the model flagged a handoff, which must
   // still happen. A token-only reply ("[HANDOFF_REQUIRED]") parses to text "".
   // Returning "" (not null) keeps the old contract: message.service sends
@@ -195,7 +201,7 @@ async function handleSelection(
     // A meaningful message — including the FIRST one from a guest. First
     // contact used to return the menu here unconditionally, so a guest's opening
     // question ("Can I talk to a staff") was dropped and only a repeat reached AI.
-    const aiText = await tryAIReply(hotelId, guestId, input);
+    const aiText = await tryAIReply(hotelId, guestId, input, channel);
     if (aiText !== null) return aiText;
 
     // AI off / over quota / no usable reply. On first contact nothing has been

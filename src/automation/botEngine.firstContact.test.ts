@@ -67,6 +67,7 @@ vi.mock("../services/outbound/outbound.service", () => ({
   sendOutbound: (...a: any[]) => m.sendOutbound(...a),
 }));
 
+import { MessageChannel } from "@prisma/client";
 import { processMessage } from "./botEngine";
 import { isGreeting } from "./greeting";
 import { isInteractivePayloadId } from "./interactivePayload";
@@ -122,7 +123,7 @@ describe("isGreeting", () => {
 describe("first contact routes meaningful messages to AI", () => {
   it("FC1: first-contact staff request reaches the AI, not the menu", async () => {
     const reply = await processMessage(HOTEL, GUEST, "Can I talk to a staff");
-    expect(m.getAIReply).toHaveBeenCalledWith(HOTEL, GUEST, "Can I talk to a staff");
+    expect(m.getAIReply).toHaveBeenCalledWith(HOTEL, GUEST, "Can I talk to a staff", "WHATSAPP");
     expect(reply).toBe("AI answer");
     expect(menuShown()).toBe(false);
     expect(m.updateSession).toHaveBeenCalledWith(GUEST, HOTEL, "AWAITING_SELECTION", {});
@@ -310,7 +311,7 @@ describe("tenant isolation", () => {
     expect(await processMessage("hotel_b", "guest_b", "Is the pool open?")).toBe(MENU);
     expect(await processMessage("hotel_a", "guest_a", "Is the pool open?")).toBe("AI answer");
     expect(m.getAIReply).toHaveBeenCalledTimes(1);
-    expect(m.getAIReply).toHaveBeenCalledWith("hotel_a", "guest_a", "Is the pool open?");
+    expect(m.getAIReply).toHaveBeenCalledWith("hotel_a", "guest_a", "Is the pool open?", "WHATSAPP");
   });
 });
 
@@ -410,7 +411,14 @@ describe("stale interactive payload ids on an IDLE session", () => {
 it("FC12: 'Hi, can I talk to a staff?' on first contact is intent, not a greeting", async () => {
   expect(isGreeting("Hi, can I talk to a staff?")).toBe(false);
   const reply = await processMessage(HOTEL, GUEST, "Hi, can I talk to a staff?");
-  expect(m.getAIReply).toHaveBeenCalledWith(HOTEL, GUEST, "Hi, can I talk to a staff?");
+  expect(m.getAIReply).toHaveBeenCalledWith(HOTEL, GUEST, "Hi, can I talk to a staff?", "WHATSAPP");
   expect(reply).toBe("AI answer");
   expect(menuShown()).toBe(false);
+});
+
+// ── Channel reaches the AI ────────────────────────────────────────────────────
+it("FC13: an Instagram guest's AI reply calls getAIReply with INSTAGRAM", async () => {
+  const reply = await processMessage(HOTEL, GUEST, "Do you have parking?", MessageChannel.INSTAGRAM);
+  expect(reply).toBe("AI answer");
+  expect(m.getAIReply).toHaveBeenCalledWith(HOTEL, GUEST, "Do you have parking?", "INSTAGRAM");
 });
