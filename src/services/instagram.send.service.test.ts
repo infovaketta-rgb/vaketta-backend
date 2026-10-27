@@ -38,6 +38,7 @@ import {
   sendInstagramGenericTemplate,
   sendInstagramMediaMessage,
 } from "./instagram.send.service";
+import { toInstagramPlainText } from "./instagramFormat";
 
 const fetchMock = vi.fn();
 
@@ -302,5 +303,122 @@ describe("Instagram interactive senders — wire shapes", () => {
       sendInstagramQuickReplies({ toPhone: "x", hotelId: "hotel_1", text: "t", quickReplies: [] }),
     ).rejects.toThrow("Instagram outbound disabled");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── Plain text at the send layer ─────────────────────────────────────────────
+// Every guest-visible text field is passed through toInstagramPlainText before
+// its split / .slice() cap. Ids, recipient and URLs are never touched.
+
+describe("Instagram senders — WhatsApp markdown is removed from guest-visible text", () => {
+  const bodyOf = (call = 0) => JSON.parse(fetchMock.mock.calls[call]![1].body);
+  /** A string has no paired markdown iff the formatter leaves it unchanged. */
+  const isPlain = (s: string) => toInstagramPlainText(s) === s;
+  // Ids that LOOK like markdown, to prove they are never formatted.
+  const ROOM_ID = "room_3f2b8c1e-9a4d-4e7b-8c2a-1d5e6f7a8b9c";
+  const ODD_ID  = "*keep_this*";
+
+  beforeEach(() => {
+    fetchMock.mockResolvedValue(graphOk({ message_id: "mid.FMT" }));
+  });
+
+  it("text: markdown removed; recipient id untouched", async () => {
+    await sendInstagramTextMessage({
+      toPhone: "_996345286534670_", hotelId: "hotel_1",
+      text: "*Total: ₹24,000*\n_Reply *MENU* to see all options._",
+    });
+    const body = bodyOf();
+    expect(body.message.text).toBe("Total: ₹24,000\nReply MENU to see all options.");
+    expect(isPlain(body.message.text)).toBe(true);
+    expect(body.recipient.id).toBe("_996345286534670_");
+  });
+
+  it("quick replies: body and every title plain; payloads byte-identical", async () => {
+    await sendInstagramQuickReplies({
+      toPhone: "996345286534670", hotelId: "hotel_1",
+      text: "🏨 *Choose your room plan:*\n_Tap one below_",
+      quickReplies: [
+        { title: "*Plan 1*", payload: "plan_0" },
+        { title: "_Mix it up_", payload: ODD_ID },
+      ],
+    });
+    const msg = bodyOf().message;
+    expect(msg.text).toBe("🏨 Choose your room plan:\nTap one below");
+    expect(msg.quick_replies.map((q: any) => q.title)).toEqual(["Plan 1", "Mix it up"]);
+    expect(msg.quick_replies.map((q: any) => q.payload)).toEqual(["plan_0", ODD_ID]);
+    expect([msg.text, ...msg.quick_replies.map((q: any) => q.title)].every(isPlain)).toBe(true);
+  });
+
+  it("quick replies: the 20-char title cap is measured on the plain text", async () => {
+    // 21 chars raw, 19 plain — formatting first means nothing is cut off.
+    await sendInstagramQuickReplies({
+      toPhone: "996345286534670", hotelId: "hotel_1", text: "Pick:",
+      quickReplies: [{ title: "*Deluxe Cottage Room*", payload: "opt_0" }],
+    });
+    expect(bodyOf().message.quick_replies[0].title).toBe("Deluxe Cottage Room");
+  });
+
+  it("button template: body and every button title plain; payloads byte-identical", async () => {
+    await sendInstagramButtonTemplate({
+      toPhone: "996345286534670", hotelId: "hotel_1",
+      text: "*Total: ₹24,000*\n_Note: Children above 12 years are charged as adults._",
+      buttons: [
+        { title: "*✅ Confirm*", payload: "CONFIRM_BOOKING" },
+        { title: "_Modify_", payload: ODD_ID },
+      ],
+    });
+    const p = bodyOf().message.attachment.payload;
+    expect(p.text).toBe("Total: ₹24,000\nNote: Children above 12 years are charged as adults.");
+    expect(p.buttons.map((b: any) => b.title)).toEqual(["✅ Confirm", "Modify"]);
+    expect(p.buttons.map((b: any) => b.payload)).toEqual(["CONFIRM_BOOKING", ODD_ID]);
+    expect([p.text, ...p.buttons.map((b: any) => b.title)].every(isPlain)).toBe(true);
+  });
+
+  it("generic template: title, subtitle and button titles plain; payloads and image_url untouched", async () => {
+    await sendInstagramGenericTemplate({
+      toPhone: "996345286534670", hotelId: "hotel_1",
+      elements: [{
+        title: "*Deluxe Cottage*",
+        subtitle: "₹5,000/night — _Sea view_",
+        imageUrl: "https://media.vaketta.com/rooms/*a_b_*.jpg",
+        buttons: [
+          { title: "*Choose*", payload: ROOM_ID },
+          { title: "View Photos", payload: ODD_ID },
+        ],
+      }],
+    });
+    const el = bodyOf().message.attachment.payload.elements[0];
+    expect(el.title).toBe("Deluxe Cottage");
+    expect(el.subtitle).toBe("₹5,000/night — Sea view");
+    expect(el.image_url).toBe("https://media.vaketta.com/rooms/*a_b_*.jpg");
+    expect(el.buttons.map((b: any) => b.title)).toEqual(["Choose", "View Photos"]);
+    expect(el.buttons.map((b: any) => b.payload)).toEqual([ROOM_ID, ODD_ID]);
+    expect([el.title, el.subtitle].every(isPlain)).toBe(true);
+  });
+
+  it("media: the media URL is never formatted", async () => {
+    const url = "https://media.vaketta.com/u/_x_/*y*.jpg";
+    await sendInstagramMediaMessage({ toPhone: "996345286534670", hotelId: "hotel_1", mediaType: "image", mediaUrl: url });
+    expect(bodyOf().message.attachment.payload.url).toBe(url);
+  });
+
+  it("chunking uses the post-format length: ~1000 raw chars that are ≤950 plain send once", async () => {
+    const raw = Array(140).fill("*bold*").join(" "); // 979 chars raw, 699 plain
+    expect(raw.length).toBeGreaterThan(950);
+    await sendInstagramTextMessage({ ...INPUT, text: raw });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(bodyOf().message.text).toBe(Array(140).fill("bold").join(" "));
+  });
+
+  it("chunking over 950 plain chars: chunks are plain, ≤950 each, and rejoin to the plain text", async () => {
+    const raw   = Array(200).fill("*word*").join(" "); // 1399 raw
+    const plain = Array(200).fill("word").join(" ");   // 999 plain → 2 chunks
+    await sendInstagramTextMessage({ ...INPUT, text: raw });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [c1, c2] = [bodyOf(0).message.text, bodyOf(1).message.text];
+    expect(c1.length).toBeLessThanOrEqual(950);
+    expect(c2.length).toBeLessThanOrEqual(950);
+    expect(isPlain(c1) && isPlain(c2)).toBe(true);
+    expect(`${c1} ${c2}`).toBe(plain);
   });
 });

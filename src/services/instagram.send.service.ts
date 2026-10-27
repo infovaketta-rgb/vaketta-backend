@@ -5,8 +5,18 @@ import { decryptInstagramToken } from "../utils/encryption.utils";
 import { logger } from "../utils/logger";
 import { getMetaVersion, withRetry } from "../utils/metaApi.utils";
 import { splitInstagramMessage } from "./instagramMessageSplitter";
+import { toInstagramPlainText } from "./instagramFormat";
 
 const log = logger.child({ service: "instagram-send" });
+
+// ── Plain text at the send layer ──────────────────────────────────────────────
+// Instagram renders no markdown, but every bot string (menus, flow prompts, the
+// ARA card, AI replies, saved replies) is written in WhatsApp markdown, so a
+// raw `*Total: ₹24,000*` would reach the guest with its asterisks. Every
+// guest-visible TEXT field below goes through `plain` BEFORE its split or
+// `.slice()` cap, so Meta's limits are measured on what is actually sent.
+// Never applied to payload ids, the recipient id, or media/image URLs.
+const plain = toInstagramPlainText;
 
 // Exported for reuse by instagram.profile.service.ts — one decrypt path.
 export async function resolveInstagramCredentials(hotelId:string){
@@ -126,7 +136,8 @@ export async function sendInstagramTextMessage(
  }
 ){
  const { toPhone, text, hotelId } = input;
- const chunks = splitInstagramMessage(text);
+ // Format first: chunk boundaries are measured on the plain text.
+ const chunks = splitInstagramMessage(plain(text));
 
  let result;
  for(const chunk of chunks){
@@ -159,10 +170,10 @@ export async function sendInstagramQuickReplies(
  return dispatchInstagramMessage(
    hotelId, toPhone,
    {
-     text,
+     text: plain(text),
      quick_replies: quickReplies.map((q)=>({
        content_type: "text",
-       title:        q.title.slice(0, 20),
+       title:        plain(q.title).slice(0, 20),
        payload:      q.payload,
      })),
    },
@@ -187,10 +198,10 @@ export async function sendInstagramButtonTemplate(
        type:"template",
        payload:{
          template_type:"button",
-         text,
+         text: plain(text),
          buttons: buttons.map((b)=>({
            type:    "postback",
-           title:   b.title.slice(0, 20),
+           title:   plain(b.title).slice(0, 20),
            payload: b.payload,
          })),
        },
@@ -224,12 +235,12 @@ export async function sendInstagramGenericTemplate(
        payload:{
          template_type:"generic",
          elements: elements.map((el)=>({
-           title: el.title.slice(0, 80),
-           ...(el.subtitle ? { subtitle: el.subtitle.slice(0, 80) } : {}),
+           title: plain(el.title).slice(0, 80),
+           ...(el.subtitle ? { subtitle: plain(el.subtitle).slice(0, 80) } : {}),
            ...(el.imageUrl ? { image_url: el.imageUrl } : {}),
            buttons: el.buttons.slice(0, 3).map((b)=>({
              type:    "postback",
-             title:   b.title.slice(0, 20),
+             title:   plain(b.title).slice(0, 20),
              payload: b.payload,
            })),
          })),
