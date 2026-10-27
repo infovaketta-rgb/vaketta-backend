@@ -64,6 +64,15 @@ const CASES: Array<[string, string]> = [
   ["_open\nclose_", "_open\nclose_"],
   ["**double**", "**double**"],
   ["", ""],
+  // Markers wrapping a URL / email
+  ["*https://x.com*", "https://x.com"],
+  ["_https://g.page/r/abc_def_", "https://g.page/r/abc_def"],
+  ["Review us: *https://x.com/a_b*!", "Review us: https://x.com/a_b!"],
+  ["https://x.com/a_b_", "https://x.com/a_b_"],
+  ["*mail@x.com*", "mail@x.com"],
+  ["_mail@x.com_", "mail@x.com"],
+  ["_*https://x.com/a_b*_", "https://x.com/a_b"],
+  ["*https://x.com_", "*https://x.com_"],
 ];
 
 describe("toInstagramPlainText", () => {
@@ -122,6 +131,37 @@ describe("toInstagramPlainText", () => {
 
     it.each(["*bold\nacross lines*", "_open\nclose_"])("markers split by a newline %j", (s) => {
       expect(toInstagramPlainText(s)).toBe(s);
+    });
+  });
+
+  describe("markers wrapping a URL or email are stripped; the URL itself is not", () => {
+    it("bold URL", () => {
+      expect(toInstagramPlainText("*https://x.com*")).toBe("https://x.com");
+    });
+
+    it("italic URL keeps the underscore inside it", () => {
+      expect(toInstagramPlainText("_https://g.page/r/abc_def_")).toBe("https://g.page/r/abc_def");
+    });
+
+    it("punctuation after the closing marker stays after the URL", () => {
+      expect(toInstagramPlainText("Review us: *https://x.com/a_b*!")).toBe("Review us: https://x.com/a_b!");
+    });
+
+    it("a trailing underscore with no opener before the URL is part of the URL", () => {
+      expect(toInstagramPlainText("https://x.com/a_b_")).toBe("https://x.com/a_b_");
+    });
+
+    it("bold and italic emails", () => {
+      expect(toInstagramPlainText("*mail@x.com*")).toBe("mail@x.com");
+      expect(toInstagramPlainText("_mail@x.com_")).toBe("mail@x.com");
+    });
+
+    it("nested markers around a URL unwrap innermost first", () => {
+      expect(toInstagramPlainText("_*https://x.com/a_b*_")).toBe("https://x.com/a_b");
+    });
+
+    it("a trailing marker that does not close the opener is left in the URL", () => {
+      expect(toInstagramPlainText("*https://x.com_")).toBe("*https://x.com_");
     });
   });
 
