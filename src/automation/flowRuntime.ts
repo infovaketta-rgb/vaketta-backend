@@ -70,6 +70,7 @@ import {
 import { trySendRoomMenuList, trySendMoveToRoomList, trySendManualModeList, trySendChangeRoomTypeList } from "./nodes/modifyLists";
 import { aggregateRoomQuantities } from "./bookingAllocation";
 import { nightsBetween, exceedsMaxStay, STAY_TOO_LONG_MESSAGE } from "./stayDuration";
+import { DEFAULT_CHILD_AGE_LIMIT } from "./childAgeLimit";
 import { interpolate } from "./interpolate";
 // randomUUID removed — no longer needed after multi-room booking refactor
 
@@ -1433,7 +1434,7 @@ export async function executeFlowStep(
           interpretModification: interpretAllocationModification,
           sendPlanList:     (a) => trySendPlanList({ ...a, channel, copy: araCopy, onReject: onAraCopyReject }),
           sendRoomCarousel: (a) => trySendRoomTypeCarousel({ ...a, channel, copy: araCopy, onReject: onAraCopyReject }),
-          childAgeLimit:        hotelCfg?.childAgeLimit ?? 12,
+          childAgeLimit:        hotelCfg?.childAgeLimit ?? DEFAULT_CHILD_AGE_LIMIT,
           extractChildrenAges:  extractChildrenAgesAI,
           sendOccupancyNotice:  (a) => trySendOccupancyNotice({ ...a, channel }),
           sendRoomDescriptions: (a) => trySendOccupancyNotice({ ...a, channel }), // generic text sender (same shape)

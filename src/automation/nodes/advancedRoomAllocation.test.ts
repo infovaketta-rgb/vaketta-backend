@@ -2031,6 +2031,51 @@ describe("reclassifyGuests", () => {
   });
 });
 
+// ── childAgeLimit boundary: applied as age > limit → adult ────────────────────
+// HotelConfig.childAgeLimit is per-hotel (0–17). An age EQUAL to the limit is
+// still a child; one year above it is an adult. Ages within 0–17 only.
+describe("reclassifyGuests — childAgeLimit boundary (age > limit → adult)", () => {
+  it.each([
+    // [limit, age that stays a child, age that becomes an adult]
+    [12, 12, 13],
+    [0, 0, 1],
+    [8, 8, 9],
+  ])("RB1: limit %i — age %i stays a child, age %i becomes an adult", (limit, childAge, adultAge) => {
+    const r = reclassifyGuests(2, 2, [childAge, adultAge], limit);
+    expect(r.promotedToAdult).toBe(1);
+    expect(r.effectiveAdults).toBe(3);
+    expect(r.effectiveChildren).toBe(1);
+    expect(r.effectiveChildrenAges).toEqual([childAge]);
+  });
+
+  it("RB2: limit 17 — every age 0–17 stays a child", () => {
+    const ages = Array.from({ length: 18 }, (_, i) => i); // 0..17
+    const r = reclassifyGuests(2, ages.length, ages, 17);
+    expect(r.promotedToAdult).toBe(0);
+    expect(r.effectiveAdults).toBe(2);
+    expect(r.effectiveChildren).toBe(18);
+    expect(r.effectiveChildrenAges).toEqual(ages);
+  });
+});
+
+// ── Settings → ARA: a non-default hotel limit reaches the guest-facing text ───
+describe("childAgeLimit — a non-default limit reaches the occupancy notice and summary note", () => {
+  it("RB3: limit 8 appears in buildOccupancyNotice and in the allocation summary note", () => {
+    const notice = buildOccupancyNotice(3, 1, 1, 8);
+    expect(notice).toContain("above 8 years");
+    expect(notice).not.toContain("above 12");
+
+    const room: AllocationRoom = {
+      roomTypeId: "rt_a", roomTypeName: "Deluxe", adults: 3, children: 1, extraBed: false,
+      basePrice: 5000, extraAdultCost: 0, extraBedCost: 0, childAgeLimit: 8,
+      pricePerNight: 5000, nights: 2, totalPrice: 10000,
+    };
+    const summary = renderAllocationSummary([room]);
+    expect(summary).toContain("above 8 years");
+    expect(summary).not.toContain("above 12");
+  });
+});
+
 // ── Task 4: occupancy-notice wording ──────────────────────────────────────────
 describe("buildOccupancyNotice", () => {
   it("ON1: singular wording when one child promoted", () => {
