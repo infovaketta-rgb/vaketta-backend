@@ -176,6 +176,30 @@ describe("flowResumeWorker — sends via the guest's channel", () => {
     expect(m.sendInstagram).not.toHaveBeenCalled();
   });
 
+  it.each([MessageChannel.INSTAGRAM, MessageChannel.WHATSAPP])(
+    "FR8: %s — a resumed flow that already sent an interactive message (\"ALREADY_SENT\") sends nothing more, and no apology",
+    async (channel) => {
+      lastMessageOn(channel);
+      m.executeFlowStep.mockResolvedValue("ALREADY_SENT");
+
+      await expect(run()).resolves.toBeUndefined();
+
+      expect(m.executeFlowStep.mock.calls[0]![5]).toBe(channel);
+      expect(sendChannelMessage).not.toHaveBeenCalled();
+      expect(m.sendInstagram).not.toHaveBeenCalled();
+      expect(m.sendTextMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it("FR8b: a normal text reply is still sent after the sentinel check", async () => {
+    lastMessageOn(MessageChannel.INSTAGRAM);
+    m.executeFlowStep.mockResolvedValue("Already sent you the menu above 👆");
+    await run();
+    expect(m.sendInstagram).toHaveBeenCalledWith({
+      toPhone: "996345286534670", text: "Already sent you the menu above 👆", hotelId: "hotel_1",
+    });
+  });
+
   it("FR7: no reply → nothing is sent; a missing PausedFlow is skipped without a lookup", async () => {
     lastMessageOn(MessageChannel.INSTAGRAM);
     m.executeFlowStep.mockResolvedValue(null);

@@ -10,6 +10,13 @@ import { updateSession } from "../services/session.service";
 
 const log = logger.child({ service: "flow-resume-worker" });
 
+// Sentinel executeFlowStep returns when the node already dispatched its own
+// reply (interactive list / buttons / carousel). Same literal the live path
+// checks in message.service.ts (function-local BOT_ALREADY_SENT) — there is no
+// exported constant. Sending it as text would put "ALREADY_SENT" in front of
+// the guest.
+const BOT_ALREADY_SENT = "ALREADY_SENT";
+
 const worker = new Worker(
   "flow-resume",
   async (job) => {
@@ -58,7 +65,8 @@ const worker = new Worker(
         channel,
       );
 
-      if (reply) {
+      // Already sent by the node itself → nothing more to send; job completes.
+      if (reply && reply !== BOT_ALREADY_SENT) {
         await sendChannelMessage({
           channel,
           toPhone:   paused.guest.phone,
