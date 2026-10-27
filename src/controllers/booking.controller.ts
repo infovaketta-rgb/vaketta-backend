@@ -6,6 +6,7 @@ import { logger } from "../utils/logger";
 import { emitToHotel } from "../realtime/emit";
 import { sendTemplateMessage } from "../services/templates.service";
 import { sendChannelMessage } from "../services/channel.send.service";
+import { getGuestChannel } from "../services/guestChannel.service";
 import { interpolate } from "../automation/interpolate";
 import { resolveConfirmationSequence } from "../services/confirmationSequence.service";
 import { confirmationSequenceQueue } from "../queue/confirmationSequence.queue";
@@ -209,15 +210,6 @@ export async function bulkUpdateBookingStatus(req: Request, res: Response) {
 
 function formatDateShort(d: Date): string {
   return d.toISOString().slice(0, 10);
-}
-
-async function getGuestChannel(guestId: string, hotelId: string): Promise<MessageChannel> {
-  const latest = await prisma.message.findFirst({
-    where:   { guestId, hotelId },
-    orderBy: { timestamp: "desc" },
-    select:  { channel: true },
-  });
-  return latest?.channel ?? MessageChannel.WHATSAPP;
 }
 
 function buildVars(booking: any): Record<string, string> {
