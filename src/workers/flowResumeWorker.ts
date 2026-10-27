@@ -2,8 +2,10 @@ import { Worker } from "bullmq";
 import prisma from "../db/connect";
 import { redis } from "../queue/redis";
 import { logger } from "../utils/logger";
+import { MessageChannel } from "@prisma/client";
 import { executeFlowStep } from "../automation/flowRuntime";
-import { sendTextMessage } from "../services/whatsapp.send.service";
+import { sendChannelMessage } from "../services/channel.send.service";
+import { getGuestChannel } from "../services/guestChannel.service";
 import { updateSession } from "../services/session.service";
 
 const log = logger.child({ service: "flow-resume-worker" });
@@ -13,7 +15,7 @@ const worker = new Worker(
   async (job) => {
     const { pausedFlowId } = job.data as { pausedFlowId: string };
 
-    // Load with guest + hotel for phone numbers needed by sendTextMessage
+    // Load with guest + hotel for phone numbers needed by sendChannelMessage
     const paused = await prisma.pausedFlow.findUnique({
       where:   { id: pausedFlowId },
       include: { guest: true, hotel: true },
@@ -36,17 +38,29 @@ const worker = new Worker(
     // upsert just ensures the DB row matches in case of a concurrent lookup.
     await updateSession(paused.guestId, paused.hotelId, state, sessionData);
 
+    // The guest's channel, resolved ONCE per job and used for the flow step AND
+    // both sends — so an Instagram guest's resumed flow (text, lists, buttons,
+    // carousels) goes out over Instagram, not WhatsApp. Starts as WHATSAPP and
+    // is resolved inside the try: if the lookup itself fails, the job still
+    // completes (the PausedFlow row is already deleted, so a retry would find
+    // nothing) and the apology goes out over WhatsApp, exactly as before.
+    let channel: MessageChannel = MessageChannel.WHATSAPP;
+
     try {
+      channel = await getGuestChannel(paused.guestId, paused.hotelId);
+
       const reply = await executeFlowStep(
         paused.hotelId,
         paused.guestId,
         state,
         sessionData,
         "", // empty input — BullMQ timer fired, not a guest message
+        channel,
       );
 
       if (reply) {
-        await sendTextMessage({
+        await sendChannelMessage({
+          channel,
           toPhone:   paused.guest.phone,
           fromPhone: paused.hotel.phone,
           hotelId:   paused.hotelId,
@@ -57,7 +71,8 @@ const worker = new Worker(
     } catch (err: any) {
       log.error({ err, pausedFlowId, guestId: paused.guestId }, "flow resume execution failed");
       // Best-effort apology so the guest isn't left hanging silently
-      await sendTextMessage({
+      await sendChannelMessage({
+        channel,
         toPhone:   paused.guest.phone,
         fromPhone: paused.hotel.phone,
         hotelId:   paused.hotelId,
