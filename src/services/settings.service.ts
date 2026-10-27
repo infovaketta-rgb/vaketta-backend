@@ -99,6 +99,8 @@ export async function updateHotelConfig(
     nightMessage?: string;
     messageDelayEnabled?: boolean;
     messageDelaySeconds?: number;
+    // Validated by parseChildAgeLimit (integer 0–17) in patchSettings.
+    childAgeLimit?: number;
   }
 ) {
   const config = await prisma.hotelConfig.upsert({

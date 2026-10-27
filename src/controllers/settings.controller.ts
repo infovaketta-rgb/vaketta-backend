@@ -23,6 +23,7 @@ import {
   setHotelMaxStayNights,
 } from "../services/settings.service";
 import { invalidatePromptCache } from "../services/ai.service";
+import { parseChildAgeLimit } from "../automation/childAgeLimit";
 import prisma from "../db/connect";
 
 function hotelId(req: Request): string {
@@ -52,7 +53,18 @@ export async function patchSettings(req: Request, res: Response) {
       welcomeMessage, nightMessage,
       messageDelayEnabled, messageDelaySeconds,
       allDay, aiInstructions,
+      childAgeLimit,
     } = req.body;
+
+    // Validate BEFORE any write: an invalid value rejects the whole request, so
+    // the other fields in the same PATCH are not saved either. Absent → the
+    // field is simply not touched (existing behaviour for every other field).
+    let parsedChildAgeLimit: number | undefined;
+    if (childAgeLimit !== undefined) {
+      const parsed = parseChildAgeLimit(childAgeLimit);
+      if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+      parsedChildAgeLimit = parsed.value;
+    }
 
     const config = await updateHotelConfig(hotelId(req), {
       ...(autoReplyEnabled     !== undefined && { autoReplyEnabled }),
@@ -70,6 +82,7 @@ export async function patchSettings(req: Request, res: Response) {
       ...(messageDelaySeconds  !== undefined && { messageDelaySeconds: Number(messageDelaySeconds) }),
       ...(allDay               !== undefined && { allDay }),
       ...(aiInstructions       !== undefined && { aiInstructions: aiInstructions || null }),
+      ...(parsedChildAgeLimit  !== undefined && { childAgeLimit: parsedChildAgeLimit }),
     });
 
     invalidateHotelConfigCache(hotelId(req));
